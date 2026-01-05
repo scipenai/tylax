@@ -1,0 +1,17 @@
+{
+  "name": "tylax-web",
+  "version": "0.1.0",
+  "description": "Web interface for Tylax LaTeX ↔ Typst converter",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "build:wasm": "cd .. && wasm-pack build --target web --out-dir web/src/pkg --features wasm --no-default-features"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0"
+  },
+  "keywords": ["latex", "typst", "converter", "wasm"],
+  "license": "Apache-2.0"
+}

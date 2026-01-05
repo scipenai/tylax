@@ -1,0 +1,25 @@
+# Rust
+/target
+*.pdb
+
+# Web
+/web/node_modules
+/web/dist
+/web/src/pkg
+/web/.vite
+
+# Test artifacts
+test_outputs/*
+
+# System
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# IDEs & Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*.log

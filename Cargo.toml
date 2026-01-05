@@ -1,0 +1,93 @@
+[package]
+name = "tylax"
+version = "0.1.0"
+edition = "2021"
+description = "Tylax - High-performance bidirectional LaTeX ↔ Typst converter"
+license = "Apache-2.0"
+repository = "https://github.com/scipenai/tylax"
+readme = "README.md"
+keywords = ["latex", "typst", "converter", "math", "wasm"]
+categories = ["text-processing", "wasm", "command-line-utilities"]
+exclude = [
+    "web/**/*",
+    "tools/**/*",
+    ".github/**/*",
+    "pkg/**/*",
+    "examples/**/*",
+    "Dockerfile",
+    "docker-compose.yml"
+]
+
+[lib]
+name = "tylax"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "t2l"
+path = "src/bin/t2l.rs"
+
+[dependencies]
+# Mitex dependencies (from crates.io)
+mitex = "0.2"
+mitex-parser = "0.2"
+mitex-spec = "0.2"
+mitex-spec-gen = "0.2"
+
+# Typst dependencies
+typst-syntax = "0.11"
+
+# Utilities
+clap = { version = "4.4", features = ["derive"], optional = true }
+fxhash = "0.2"
+lazy_static = "1.4"
+phf = { version = "0.11", features = ["macros"] }
+regex = "1.10"
+rowan = "0.15"
+
+# WASM dependencies
+wasm-bindgen = { version = "0.2", optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+
+[features]
+default = ["cli"]
+cli = ["dep:clap"]
+wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook", "dep:serde", "dep:serde-wasm-bindgen"]
+
+[dev-dependencies]
+pretty_assertions = "1.4"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# For development builds
+[profile.dev]
+opt-level = 0
+debug = true
+
+# For production WASM builds
+[profile.release-wasm]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[package.metadata.wasm-pack.profile.dev]
+wasm-opt = false

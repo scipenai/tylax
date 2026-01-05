@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tylax - LaTeX ↔ Typst Converter</title>
+    <meta name="description" content="Tylax - High-performance bidirectional LaTeX ↔ Typst converter powered by Rust and WebAssembly">
+    <meta name="keywords" content="LaTeX, Typst, converter, math, formula, WASM">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>∑</text></svg>">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="src/style.css">
+</head>
+<body>
+    <div class="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <div class="logo">
+                    <img src="logo.svg" alt="Tylax" class="logo-img">
+                    <span class="version-badge">v0.1.0</span>
+                </div>
+                <nav class="nav">
+                    <button class="lang-toggle" id="langToggle" title="Switch Language">
+                        <span class="lang-text">EN</span>
+                    </button>
+                    <button class="theme-toggle" id="themeToggle" title="切换主题">
+                        <svg class="icon sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="5"/>
+                            <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                        </svg>
+                        <svg class="icon moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+                        </svg>
+                    </button>
+                </nav>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main">
+            <!-- Mode Toggle -->
+            <div class="mode-container">
+                <div class="mode-toggle" id="modeToggle">
+                    <button class="mode-btn active" id="modeMath" title="数学公式模式">
+                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4z"/>
+                            <path d="M17 14v3h3M14 17h3v3"/>
+                        </svg>
+                        <span>公式</span>
+                    </button>
+                    <button class="mode-btn" id="modeDocument" title="完整文档模式">
+                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                            <polyline points="14 2 14 8 20 8"/>
+                            <line x1="16" y1="13" x2="8" y2="13"/>
+                            <line x1="16" y1="17" x2="8" y2="17"/>
+                            <polyline points="10 9 9 9 8 9"/>
+                        </svg>
+                        <span>文档</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Direction Toggle -->
+            <div class="direction-container">
+                <button class="direction-toggle" id="directionToggle">
+                    <span class="direction-label left" id="leftLabel">LaTeX</span>
+                    <span class="direction-arrow" id="directionArrow">→</span>
+                    <span class="direction-label right" id="rightLabel">Typst</span>
+                </button>
+                <button class="swap-btn" id="swapBtn" title="交换方向">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M7 16V4M7 4L3 8M7 4l4 4M17 8v12M17 20l4-4M17 20l-4-4"/>
+                    </svg>
+                </button>
+            </div>
+
+            <!-- Editor Container -->
+            <div class="editor-container">
+                <!-- Input Panel -->
+                <div class="editor-panel input-panel">
+                    <div class="panel-header">
+                        <span class="panel-title" id="inputTitle">LaTeX 输入</span>
+                        <div class="panel-actions">
+                            <button class="action-btn" id="clearInputBtn" title="清空">
+                                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                                </svg>
+                            </button>
+                            <button class="action-btn" id="pasteBtn" title="粘贴">
+                                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>
+                                    <rect x="8" y="2" width="8" height="4" rx="1" ry="1"/>
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+                    <textarea 
+                        id="inputEditor" 
+                        class="editor" 
+                        placeholder="在此输入 LaTeX 公式...&#10;&#10;例如：\frac{1}{2} + \alpha^2"
+                        spellcheck="false"
+                    ></textarea>
+                </div>
+
+                <!-- Output Panel -->
+                <div class="editor-panel output-panel">
+                    <div class="panel-header">
+                        <span class="panel-title" id="outputTitle">Typst 输出</span>
+                        <div class="panel-actions">
+                            <button class="action-btn" id="copyBtn" title="复制">
+                                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+                    <textarea 
+                        id="outputEditor" 
+                        class="editor output" 
+                        readonly 
+                        placeholder="转换结果将显示在这里..."
+                    ></textarea>
+                </div>
+            </div>
+
+            <!-- Feature Hint -->
+            <div class="feature-hint">
+                <span class="hint-icon">💡</span>
+                <span class="hint-text">支持 <strong>TikZ ↔ CeTZ</strong> 图形互转！直接输入 TikZ 或 CeTZ 代码即可自动识别转换</span>
+            </div>
+
+            <!-- Status Bar -->
+            <div class="status-bar">
+                <div class="status-left">
+                    <span class="status-item" id="charCount">0 字符</span>
+                    <span class="status-divider">|</span>
+                    <span class="status-item" id="convertTime">就绪</span>
+                </div>
+                <div class="status-right">
+                    <span class="status-item powered-by">
+                        Powered by 
+                        <a href="https://github.com/mitex-rs/mitex" target="_blank">Mitex</a> + 
+                        <a href="https://github.com/qwinsi/tex2typst" target="_blank">tex2typst</a>
+                    </span>
+                </div>
+            </div>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <div class="footer-content">
+                <p>
+                    <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">浙ICP备2024137660号-1</a>
+                </p>
+            </div>
+        </footer>
+
+        <!-- Toast Notification -->
+        <div class="toast" id="toast">
+            <span class="toast-message" id="toastMessage"></span>
+        </div>
+    </div>
+
+    <script type="module" src="src/app.js"></script>
+</body>
+</html>
+
