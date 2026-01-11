@@ -7,7 +7,11 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "lint": "eslint src",
     "build:wasm": "cd .. && wasm-pack build --target web --out-dir web/src/pkg --features wasm --no-default-features"
+  },
+  "dependencies": {
+    "katex": "^0.16.9"
   },
   "devDependencies": {
     "vite": "^5.0.0"

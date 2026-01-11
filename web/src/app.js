@@ -3,6 +3,13 @@
  * LaTeX ↔ Typst bidirectional converter
  */
 
+// Import KaTeX for math rendering
+import katex from 'katex';
+import 'katex/dist/katex.min.css';
+
+// Import CeTZ renderer for graphics preview
+import { renderGraphicsToSVG, hasRenderableGraphics } from './cetz-renderer.js';
+
 // State
 const state = {
     direction: 't2l', // 'l2t' = LaTeX to Typst, 't2l' = Typst to LaTeX (默认 Typst → LaTeX)
@@ -10,6 +17,8 @@ const state = {
     lang: 'zh', // 'zh' or 'en'
     wasmReady: false,
     wasm: null,
+    previewEnabled: true, // Preview panel state
+    previewType: 'math', // 'math', 'table', 'graphics', 'document', 'none'
 };
 
 const translations = {
@@ -47,6 +56,16 @@ const translations = {
         pasted: '已粘贴',
         pasteFailed: '粘贴失败',
         noContent: '没有内容可复制',
+        preview: '预览',
+        previewPlaceholder: '输入内容后，预览将显示在这里',
+        previewError: '预览渲染失败',
+        previewToggle: '切换预览',
+        previewInputLabel: '输入预览 (INPUT)',
+        previewOutputLabel: '输出预览 (OUTPUT)',
+        betaBadge: '(实验功能)',
+        typstNotPreviewable: '无法直接预览 Typst 输出',
+        typstNotPreviewableHint: '请查看输出框中的 Typst 代码',
+        previewNotAvailable: '无法预览',
     },
     en: {
         title: 'Tylax - LaTeX ↔ Typst Converter',
@@ -82,6 +101,16 @@ const translations = {
         pasted: 'Pasted',
         pasteFailed: 'Paste failed',
         noContent: 'No content to copy',
+        preview: 'Preview',
+        previewPlaceholder: 'Preview will appear here after entering content',
+        previewError: 'Preview rendering failed',
+        previewToggle: 'Toggle Preview',
+        previewInputLabel: 'Input Preview (INPUT)',
+        previewOutputLabel: 'Output Preview (OUTPUT)',
+        betaBadge: '(Experimental)',
+        typstNotPreviewable: 'Cannot preview Typst output directly',
+        typstNotPreviewableHint: 'Please check the Typst code in the output box',
+        previewNotAvailable: 'Preview not available',
     }
 };
 
@@ -111,23 +140,40 @@ const elements = {
     modeToggle: document.getElementById('modeToggle'),
     modeMath: document.getElementById('modeMath'),
     modeDocument: document.getElementById('modeDocument'),
+    // Preview elements
+    previewPanel: document.getElementById('previewPanel'),
+    previewTitle: document.getElementById('previewTitle'),
+    previewToggleBtn: document.getElementById('previewToggleBtn'),
+    previewContent: document.getElementById('previewContent'),
+    previewPlaceholder: document.getElementById('previewPlaceholder'),
+    previewSplitView: document.getElementById('previewSplitView'),
+    // Split view elements
+    previewMathInput: document.getElementById('previewMathInput'),
+    previewTableInput: document.getElementById('previewTableInput'),
+    previewMathOutput: document.getElementById('previewMathOutput'),
+    previewTableOutput: document.getElementById('previewTableOutput'),
+    previewInputLabel: document.getElementById('previewInputLabel'),
+    previewOutputLabel: document.getElementById('previewOutputLabel'),
+    betaBadge: document.querySelector('.badge-beta'),
+    
+    previewError: document.getElementById('previewError'),
 };
+
+// ===== Debug Mode =====
+// Set to true to enable debug logging (or use import.meta.env.DEV in Vite)
+const DEBUG = import.meta.env?.DEV || false;
 
 // ===== WASM Loading =====
 async function initWasm() {
     try {
-        // Dynamic import the WASM module
         const wasm = await import(/* @vite-ignore */ './pkg/tylax.js');
-        // Initialize the WASM module
         await wasm.default();
         state.wasm = wasm;
         state.wasmReady = true;
-        console.log('WASM module loaded successfully');
-        console.log('Available functions:', Object.keys(wasm));
+        if (DEBUG) console.log('WASM loaded:', Object.keys(wasm));
         showToast(translations[state.lang].wasmLoaded);
     } catch (e) {
         console.error('WASM loading failed:', e);
-        console.log('WASM not available, using JavaScript fallback');
         showToast(translations[state.lang].useJsMode, 3000);
     }
 }
@@ -570,6 +616,839 @@ ${result.trim()}
     return doc;
 }
 
+// ===== Preview Functions =====
+
+/**
+ * Detect if input is a LaTeX table environment
+ */
+function isLatexTable(input) {
+    return input.includes('\\begin{tabular}') ||
+           input.includes('\\begin{table}') ||
+           input.includes('\\begin{longtable}') ||
+           input.includes('\\begin{tabularx}') ||
+           input.includes('\\begin{array}');
+}
+
+/**
+ * Detect if input is a Typst table
+ */
+function isTypstTable(input) {
+    return input.includes('#table(') || 
+           input.includes('table(') ||
+           /^\s*table\s*\(/.test(input);
+}
+
+/**
+ * Detect if input is TikZ graphics (LaTeX)
+ */
+function isLatexGraphics(input) {
+    return input.includes('\\begin{tikzpicture}') ||
+           input.includes('\\begin{pgfpicture}') ||
+           input.includes('\\tikz') ||
+           input.includes('\\draw') ||
+           input.includes('\\fill') ||
+           input.includes('\\node') ||
+           input.includes('\\path');
+}
+
+/**
+ * Detect if input is CeTZ graphics (Typst)
+ */
+function isTypstGraphics(input) {
+    return input.includes('#canvas(') ||
+           input.includes('canvas(') ||
+           input.includes('#import "@preview/cetz') ||
+           input.includes('draw.line(') ||
+           input.includes('draw.circle(') ||
+           input.includes('draw.rect(') ||
+           input.includes('line(') && input.includes('stroke:');
+}
+
+/**
+ * Detect if input is a full LaTeX document
+ */
+function isLatexDocument(input) {
+    return input.includes('\\documentclass') ||
+           input.includes('\\begin{document}') ||
+           input.includes('\\usepackage') ||
+           input.includes('\\section') ||
+           input.includes('\\chapter') ||
+           input.includes('\\title{') ||
+           input.includes('\\maketitle');
+}
+
+/**
+ * Detect if input is a full Typst document
+ * EXCLUDES CeTZ graphics imports to avoid misclassification
+ */
+function isTypstDocument(input) {
+    // First check: if it's pure CeTZ graphics, it's NOT a document
+    if (isPureCeTZ(input) || isTypstGraphics(input)) {
+        return false;
+    }
+    
+    return input.includes('#set document') ||
+           input.includes('#set page') ||
+           input.includes('#set text') ||
+           /^=\s+\w/.test(input) || // Heading like "= Title"
+           (input.includes('#import') && !input.includes('cetz')) || // Import but not CeTZ
+           input.includes('#show:') ||
+           input.includes('#let ');
+}
+
+/**
+ * Detect the type of content for preview
+ * Priority: Graphics > Table > Document > Math
+ * 
+ * Note: Graphics (TikZ/CeTZ) is checked FIRST because:
+ * - CeTZ uses #import which could be confused with document
+ * - TikZ is often standalone and should render as graphics
+ * 
+ * @returns 'graphics' | 'table' | 'document' | 'math' | 'none'
+ */
+function detectPreviewType(input) {
+    if (!input || input.trim() === '') {
+        return 'none';
+    }
+    
+    const isLatexInput = state.direction === 'l2t';
+
+    // 1. Check for graphics FIRST (TikZ/CeTZ)
+    // Must be before document check because CeTZ uses #import
+    if (isLatexInput) {
+        if (isLatexGraphics(input)) return 'graphics';
+    } else {
+        if (isTypstGraphics(input)) return 'graphics';
+    }
+    
+    // 2. Check for tables
+    if (isLatexInput) {
+        if (isLatexTable(input)) return 'table';
+    } else {
+        if (isTypstTable(input)) return 'table';
+    }
+    
+    // 3. Check for full documents
+    if (isLatexInput) {
+        if (isLatexDocument(input)) return 'document';
+    } else {
+        if (isTypstDocument(input)) return 'document';
+    }
+    
+    // 4. Default to math preview for formula mode
+    if (state.mode === 'math') {
+        return 'math';
+    }
+    
+    // 5. Fallback for document mode without clear structure
+    if (state.mode === 'document') {
+        return 'document';
+    }
+    
+    return 'none';
+}
+
+// ===== Math Preprocessing Functions =====
+
+/**
+ * Smart wrap LaTeX to fix KaTeX alignment errors
+ * Detects bare alignment characters (&, \\) and wraps in aligned environment
+ * @param {string} latex - Raw LaTeX string
+ * @returns {string} - Properly wrapped LaTeX
+ */
+function smartWrapLatex(latex) {
+    if (!latex || typeof latex !== 'string') return latex;
+    
+    const trimmed = latex.trim();
+    
+    // Check if already wrapped in an environment
+    const hasEnvironment = /\\begin\{(aligned|align|array|matrix|pmatrix|bmatrix|cases|gather|equation|eqnarray|split)\}/i.test(trimmed);
+    if (hasEnvironment) {
+        return trimmed;
+    }
+    
+    // Check if contains alignment characters that need wrapping
+    const hasAlignment = trimmed.includes('&');
+    const hasLineBreak = /\\\\/.test(trimmed);
+    
+    // If has alignment or line breaks, wrap in aligned environment
+    if (hasAlignment || hasLineBreak) {
+        return `\\begin{aligned} ${trimmed} \\end{aligned}`;
+    }
+    
+    return trimmed;
+}
+
+/**
+ * Render math formula preview using KaTeX (Split View)
+ * @param {string} inputLatex - LaTeX for input pane
+ * @param {string} outputLatex - LaTeX for output pane
+ * @param {boolean} inputConvertFailed - If true, show "cannot preview" message for input
+ * @param {boolean} outputConvertFailed - If true, show "cannot preview" message for output
+ */
+function renderMathPreview(inputLatex, outputLatex, inputConvertFailed = false, outputConvertFailed = false) {
+    const t = translations[state.lang];
+    const previewSplitView = elements.previewSplitView;
+    const previewMathInput = elements.previewMathInput;
+    const previewMathOutput = elements.previewMathOutput;
+    const previewTableInput = elements.previewTableInput;
+    const previewTableOutput = elements.previewTableOutput;
+    const previewError = elements.previewError;
+    const previewPlaceholder = elements.previewPlaceholder;
+    
+    // If nothing to preview and no conversion happened
+    const hasInput = inputLatex && inputLatex.trim() !== '';
+    const hasOutput = outputLatex && outputLatex.trim() !== '';
+    if (!hasInput && !hasOutput && !inputConvertFailed && !outputConvertFailed) {
+        showPreviewPlaceholder();
+        return;
+    }
+    
+    // Setup UI for Math Split View
+    previewPlaceholder.style.display = 'none';
+    previewError.classList.remove('active');
+    previewSplitView.classList.add('active');
+    
+    // Show Math containers, hide Table containers
+    previewMathInput.style.display = 'flex';
+    previewMathOutput.style.display = 'flex';
+    previewTableInput.style.display = 'none';
+    previewTableOutput.style.display = 'none';
+    
+    // Message for when preview is not available
+    const cannotPreviewMsg = (isTypst) => `
+        <div style="color: var(--text-muted); font-size: 0.85rem; text-align: center; padding: 1rem;">
+            <div>${isTypst ? t.typstNotPreviewable : t.previewNotAvailable}</div>
+            <div style="font-size: 0.75rem; opacity: 0.7; margin-top: 0.3rem;">${isTypst ? t.typstNotPreviewableHint : ''}</div>
+        </div>
+    `;
+    
+    // Helper to render to a specific container
+    const renderToContainer = (latex, container, convertFailed = false) => {
+        if (convertFailed) {
+            container.innerHTML = cannotPreviewMsg(state.direction === 'l2t');
+            return;
+        }
+        if (!latex) {
+            container.innerHTML = '';
+            return;
+        }
+        try {
+            // Clean up the LaTeX for KaTeX
+            let cleanLatex = latex.trim();
+            // Remove display math delimiters if present
+            cleanLatex = cleanLatex.replace(/^\$\$/, '').replace(/\$\$$/, '');
+            cleanLatex = cleanLatex.replace(/^\\\[/, '').replace(/\\\]$/, '');
+            cleanLatex = cleanLatex.replace(/^\$/, '').replace(/\$$/, '');
+            
+            // Smart wrap: auto-add aligned environment for bare alignments
+            cleanLatex = smartWrapLatex(cleanLatex);
+            
+            katex.render(cleanLatex, container, {
+                displayMode: true,
+                throwOnError: false,
+                errorColor: '#f85149',
+                trust: true,
+                strict: false,
+                macros: {
+                    "\\RR": "\\mathbb{R}",
+                    "\\NN": "\\mathbb{N}",
+                    "\\ZZ": "\\mathbb{Z}",
+                    "\\QQ": "\\mathbb{Q}",
+                    "\\CC": "\\mathbb{C}",
+                }
+            });
+        } catch (e) {
+            console.error('KaTeX render error:', e);
+            container.innerHTML = `<span style="color: var(--error); font-size: 0.8rem;">Render Error</span>`;
+        }
+    };
+
+    // Render Input (Left)
+    renderToContainer(inputLatex, previewMathInput, inputConvertFailed);
+    
+    // Render Output (Right)
+    renderToContainer(outputLatex, previewMathOutput, outputConvertFailed);
+    
+    state.previewType = 'math';
+}
+
+/**
+ * Render table preview from structured data (Split View)
+ */
+function renderTablePreview(tableData) {
+    const previewSplitView = elements.previewSplitView;
+    const previewTableInput = elements.previewTableInput;
+    const previewTableOutput = elements.previewTableOutput;
+    const previewMathInput = elements.previewMathInput;
+    const previewMathOutput = elements.previewMathOutput;
+    const previewPlaceholder = elements.previewPlaceholder;
+    const previewError = elements.previewError;
+    
+    // Handle error response from WASM
+    if (tableData && tableData.error) {
+        showPreviewError(tableData.error);
+        return;
+    }
+    
+    if (!tableData || !tableData.rows) {
+        showPreviewPlaceholder();
+        return;
+    }
+    
+    previewPlaceholder.style.display = 'none';
+    previewError.classList.remove('active');
+    previewSplitView.classList.add('active');
+    
+    // Show Table containers, hide Math
+    previewTableInput.style.display = 'block';
+    previewTableOutput.style.display = 'block';
+    previewMathInput.style.display = 'none';
+    previewMathOutput.style.display = 'none';
+    
+    try {
+        const tableHtml = generateTableHtml(tableData);
+        previewTableInput.innerHTML = tableHtml;
+        
+        // Show source format indicator in right pane
+        const direction = state.direction === 'l2t' ? 'Typst' : 'LaTeX';
+        previewTableOutput.innerHTML = `
+            <div style="text-align: center; color: var(--text-muted); padding: 20px; font-size: 0.8rem;">
+                <p style="margin-bottom: 8px;">表格结构已解析</p>
+                <p>${tableData.column_count} 列 × ${tableData.rows.length} 行</p>
+            </div>
+        `;
+        
+        state.previewType = 'table';
+        
+    } catch (e) {
+        console.error('Table render error:', e);
+        showPreviewError(e.message || 'Table render failed');
+    }
+}
+
+/**
+ * Generate HTML table from WASM TablePreviewData
+ * Structure: { rows: [{ cells: [{ content, colspan, rowspan, align, is_header }], has_bottom_border }], has_header, column_count, default_alignments }
+ */
+function generateTableHtml(tableData) {
+    if (!tableData || !tableData.rows || tableData.rows.length === 0) {
+        return '<p style="color: var(--text-muted);">Empty table</p>';
+    }
+    
+    let html = '<table class="preview-table-content">';
+    
+    for (let rowIdx = 0; rowIdx < tableData.rows.length; rowIdx++) {
+        const row = tableData.rows[rowIdx];
+        const rowHasBottomBorder = row.has_bottom_border;
+        
+        html += `<tr${rowHasBottomBorder ? ' class="border-bottom"' : ''}>`;
+        
+        for (let cellIdx = 0; cellIdx < row.cells.length; cellIdx++) {
+            const cell = row.cells[cellIdx];
+            const tag = cell.is_header ? 'th' : 'td';
+            
+            // Map alignment - handle enum values from Rust
+            let alignClass = '';
+            if (cell.align) {
+                const alignStr = typeof cell.align === 'string' ? cell.align : cell.align.toString();
+                if (alignStr === 'Left' || alignStr === 'left') alignClass = 'align-left';
+                else if (alignStr === 'Center' || alignStr === 'center') alignClass = 'align-center';
+                else if (alignStr === 'Right' || alignStr === 'right') alignClass = 'align-right';
+            } else if (tableData.default_alignments && tableData.default_alignments[cellIdx]) {
+                // Use default column alignment
+                const defaultAlign = tableData.default_alignments[cellIdx];
+                const alignStr = typeof defaultAlign === 'string' ? defaultAlign : defaultAlign.toString();
+                if (alignStr === 'Left' || alignStr === 'left') alignClass = 'align-left';
+                else if (alignStr === 'Center' || alignStr === 'center') alignClass = 'align-center';
+                else if (alignStr === 'Right' || alignStr === 'right') alignClass = 'align-right';
+            }
+            
+            const colspanAttr = cell.colspan > 1 ? ` colspan="${cell.colspan}"` : '';
+            const rowspanAttr = cell.rowspan > 1 ? ` rowspan="${cell.rowspan}"` : '';
+            
+            // Render cell content with rich text support
+            const content = renderCellContent(cell.content || '');
+            
+            html += `<${tag} class="${alignClass}"${colspanAttr}${rowspanAttr}>${content}</${tag}>`;
+        }
+        html += '</tr>';
+    }
+    
+    html += '</table>';
+    return html;
+}
+
+/**
+ * Render cell content with rich text (math, bold, italic, symbols)
+ * Supports both LaTeX and Typst syntax
+ * @param {string} content - Raw cell content
+ * @returns {string} - HTML rendered content
+ */
+function renderCellContent(content) {
+    if (!content) return '';
+    
+    let result = content;
+    
+    // 1. Convert Typst symbols to Unicode/HTML (before other processing)
+    const typstSymbols = {
+        'arrow.b': '↓',
+        'arrow.t': '↑',
+        'arrow.l': '←',
+        'arrow.r': '→',
+        'arrow.lr': '↔',
+        'arrow.tb': '↕',
+        'checkmark': '✓',
+        'times': '×',
+        'plus.minus': '±',
+        'minus.plus': '∓',
+        'dots': '…',
+        'dots.h': '⋯',
+        'dots.v': '⋮',
+        'infinity': '∞',
+        'approx': '≈',
+        'neq': '≠',
+        'leq': '≤',
+        'geq': '≥',
+        'sum': '∑',
+        'product': '∏',
+        'integral': '∫',
+    };
+    
+    // Replace Typst symbols (inside $ or standalone)
+    for (const [symbol, replacement] of Object.entries(typstSymbols)) {
+        // Replace $symbol$ pattern
+        result = result.replace(new RegExp(`\\$${symbol.replace('.', '\\.')}\\$`, 'g'), replacement);
+        // Replace standalone symbol (word boundary)
+        result = result.replace(new RegExp(`\\b${symbol.replace('.', '\\.')}\\b`, 'g'), replacement);
+    }
+    
+    // 2. Render LaTeX math: $...$
+    if (result.includes('$') && typeof katex !== 'undefined') {
+        result = result.replace(/\$([^$]+)\$/g, (match, math) => {
+            try {
+                return katex.renderToString(math, { 
+                    throwOnError: false,
+                    displayMode: false 
+                });
+            } catch {
+                return match;
+            }
+        });
+    }
+    
+    // 3. Handle LaTeX text formatting
+    // \textbf{...} -> <b>...</b>
+    result = result.replace(/\\textbf\{([^}]+)\}/g, '<b>$1</b>');
+    // \textit{...} -> <i>...</i>
+    result = result.replace(/\\textit\{([^}]+)\}/g, '<i>$1</i>');
+    // \emph{...} -> <em>...</em>
+    result = result.replace(/\\emph\{([^}]+)\}/g, '<em>$1</em>');
+    // \underline{...} -> <u>...</u>
+    result = result.replace(/\\underline\{([^}]+)\}/g, '<u>$1</u>');
+    
+    // 4. Handle Typst text formatting
+    // *text* -> <b>text</b> (bold)
+    // Must not match ** which could be empty or escaped
+    result = result.replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, '<b>$1</b>');
+    // _text_ -> <i>text</i> (italic) - be careful not to match underscores in words
+    result = result.replace(/(?<![a-zA-Z0-9])_([^_]+)_(?![a-zA-Z0-9])/g, '<i>$1</i>');
+    
+    // 5. Escape any remaining HTML-unsafe characters (except our tags)
+    // This is a simplified version - we preserve our generated tags
+    result = result.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // Restore our HTML tags
+    result = result.replace(/&lt;(\/?(b|i|em|u|span)[^&]*)&gt;/g, '<$1>');
+    // Restore KaTeX output (which contains lots of HTML)
+    result = result.replace(/&lt;(span class="katex[^&]*)&gt;/g, '<$1>');
+    
+    return result;
+}
+
+// ===== Document Outline Functions =====
+
+/**
+ * Extract document outline (headings) from LaTeX or Typst content
+ * @param {string} input - Document content
+ * @param {string} format - 'latex' or 'typst'
+ * @returns {Array} Array of { level, title, type } objects
+ */
+function extractDocumentOutline(input, format) {
+    const outline = [];
+    
+    if (format === 'latex') {
+        // LaTeX heading patterns
+        const patterns = [
+            { regex: /\\chapter\{([^}]+)\}/g, level: 1, type: 'chapter' },
+            { regex: /\\section\{([^}]+)\}/g, level: 2, type: 'section' },
+            { regex: /\\subsection\{([^}]+)\}/g, level: 3, type: 'subsection' },
+            { regex: /\\subsubsection\{([^}]+)\}/g, level: 4, type: 'subsubsection' },
+            { regex: /\\paragraph\{([^}]+)\}/g, level: 5, type: 'paragraph' },
+        ];
+        
+        // Also extract document info
+        const titleMatch = input.match(/\\title\{([^}]+)\}/);
+        if (titleMatch) {
+            outline.push({ level: 0, title: titleMatch[1], type: 'title' });
+        }
+        
+        const authorMatch = input.match(/\\author\{([^}]+)\}/);
+        if (authorMatch) {
+            outline.push({ level: 0, title: `Author: ${authorMatch[1]}`, type: 'author' });
+        }
+        
+        // Extract all headings in order
+        const allMatches = [];
+        for (const pattern of patterns) {
+            let match;
+            while ((match = pattern.regex.exec(input)) !== null) {
+                allMatches.push({
+                    index: match.index,
+                    level: pattern.level,
+                    title: match[1],
+                    type: pattern.type
+                });
+            }
+        }
+        
+        // Sort by position in document
+        allMatches.sort((a, b) => a.index - b.index);
+        outline.push(...allMatches);
+        
+    } else if (format === 'typst') {
+        // Typst heading patterns: = Heading, == Subheading, etc.
+        const lines = input.split('\n');
+        
+        for (const line of lines) {
+            // Match headings: = Title, == Section, === Subsection, etc.
+            const headingMatch = line.match(/^(=+)\s+(.+)$/);
+            if (headingMatch) {
+                const level = headingMatch[1].length;
+                outline.push({
+                    level,
+                    title: headingMatch[2].trim(),
+                    type: level === 1 ? 'title' : `heading-${level}`
+                });
+            }
+            
+            // Match #set document(title: "...")
+            const docTitleMatch = line.match(/#set\s+document\s*\(\s*title\s*:\s*"([^"]+)"/);
+            if (docTitleMatch) {
+                outline.unshift({ level: 0, title: docTitleMatch[1], type: 'title' });
+            }
+        }
+    }
+    
+    return outline;
+}
+
+/**
+ * Render document outline as HTML
+ * @param {Array} outline - Array of { level, title, type } objects
+ * @returns {string} HTML string
+ */
+function renderDocumentOutlineHtml(outline) {
+    if (!outline || outline.length === 0) {
+        return '<div class="outline-empty">No structure detected</div>';
+    }
+    
+    let html = '<div class="document-outline">';
+    html += '<h4 class="outline-title">📄 Document Structure</h4>';
+    html += '<ul class="outline-list">';
+    
+    for (const item of outline) {
+        const indent = item.level * 16;
+        const typeClass = `outline-${item.type}`;
+        const icon = getOutlineIcon(item.type);
+        
+        html += `<li class="outline-item ${typeClass}" style="padding-left: ${indent}px">`;
+        html += `<span class="outline-icon">${icon}</span>`;
+        html += `<span class="outline-text">${escapeHtml(item.title)}</span>`;
+        html += '</li>';
+    }
+    
+    html += '</ul></div>';
+    return html;
+}
+
+/**
+ * Get icon for outline item type
+ */
+function getOutlineIcon(type) {
+    switch (type) {
+        case 'title': return '📖';
+        case 'author': return '👤';
+        case 'chapter': return '📑';
+        case 'section': return '§';
+        case 'subsection': return '•';
+        case 'subsubsection': return '◦';
+        case 'paragraph': return '¶';
+        default: return '•';
+    }
+}
+
+/**
+ * Escape HTML special characters
+ */
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+/**
+ * Render document preview (outline mode)
+ */
+function renderDocumentPreview(input, output) {
+    const previewSplitView = elements.previewSplitView;
+    const previewMathInput = elements.previewMathInput;
+    const previewMathOutput = elements.previewMathOutput;
+    const previewTableInput = elements.previewTableInput;
+    const previewTableOutput = elements.previewTableOutput;
+    const previewPlaceholder = elements.previewPlaceholder;
+    const previewError = elements.previewError;
+    
+    if (!input || input.trim() === '') {
+        showPreviewPlaceholder();
+        return;
+    }
+    
+    // Setup UI for Document Preview (reuse table containers for outline)
+    previewPlaceholder.style.display = 'none';
+    previewError.classList.remove('active');
+    previewSplitView.classList.add('active');
+    
+    // Use table containers for document outline
+    previewTableInput.style.display = 'block';
+    previewTableOutput.style.display = 'block';
+    previewMathInput.style.display = 'none';
+    previewMathOutput.style.display = 'none';
+    
+    // Extract and render input outline
+    const inputFormat = state.direction === 'l2t' ? 'latex' : 'typst';
+    const inputOutline = extractDocumentOutline(input, inputFormat);
+    previewTableInput.innerHTML = renderDocumentOutlineHtml(inputOutline);
+    
+    // Extract and render output outline
+    if (output && output.trim()) {
+        const outputFormat = state.direction === 'l2t' ? 'typst' : 'latex';
+        const outputOutline = extractDocumentOutline(output, outputFormat);
+        previewTableOutput.innerHTML = renderDocumentOutlineHtml(outputOutline);
+    } else {
+        previewTableOutput.innerHTML = '<div class="outline-empty">Waiting for conversion...</div>';
+    }
+    
+    state.previewType = 'document';
+}
+
+// ===== Graphics Preview Functions =====
+
+/**
+ * Render graphics preview using SVG
+ * Handles TikZ (LaTeX) and CeTZ (Typst) graphics
+ */
+function renderGraphicsPreview(input, output) {
+    const previewSplitView = elements.previewSplitView;
+    const previewMathInput = elements.previewMathInput;
+    const previewMathOutput = elements.previewMathOutput;
+    const previewTableInput = elements.previewTableInput;
+    const previewTableOutput = elements.previewTableOutput;
+    const previewPlaceholder = elements.previewPlaceholder;
+    const previewError = elements.previewError;
+    
+    if (!input || input.trim() === '') {
+        showPreviewPlaceholder();
+        return;
+    }
+    
+    // Setup UI for Graphics Preview (reuse table containers for SVG)
+    previewPlaceholder.style.display = 'none';
+    previewError.classList.remove('active');
+    previewSplitView.classList.add('active');
+    
+    // Use table containers for graphics
+    previewTableInput.style.display = 'block';
+    previewTableOutput.style.display = 'block';
+    previewMathInput.style.display = 'none';
+    previewMathOutput.style.display = 'none';
+    
+    try {
+        // Render input graphics
+        const inputSvg = renderGraphicsToSVG(input);
+        previewTableInput.innerHTML = `
+            <div class="graphics-preview">
+                <div class="graphics-label">🎨 Input Graphics</div>
+                ${inputSvg}
+            </div>
+        `;
+        
+        // Render output graphics if available
+        if (output && output.trim()) {
+            const outputSvg = renderGraphicsToSVG(output);
+            previewTableOutput.innerHTML = `
+                <div class="graphics-preview">
+                    <div class="graphics-label">🎨 Output Graphics</div>
+                    ${outputSvg}
+                </div>
+            `;
+        } else {
+            previewTableOutput.innerHTML = `
+                <div class="graphics-preview">
+                    <div class="graphics-label">🎨 Output Graphics</div>
+                    <div class="graphics-placeholder">Waiting for conversion...</div>
+                </div>
+            `;
+        }
+        
+        state.previewType = 'graphics';
+        
+    } catch (e) {
+        console.error('Graphics render error:', e);
+        showPreviewError('Graphics render failed: ' + e.message);
+    }
+}
+
+/**
+ * Show placeholder when there's nothing to preview
+ */
+function showPreviewPlaceholder() {
+    if (!elements.previewPlaceholder) return;
+    
+    elements.previewPlaceholder.style.display = 'block';
+    elements.previewSplitView.classList.remove('active');
+    if (elements.previewError) {
+        elements.previewError.classList.remove('active');
+    }
+    
+    // Clear all preview content
+    if (elements.previewMathInput) elements.previewMathInput.innerHTML = '';
+    if (elements.previewMathOutput) elements.previewMathOutput.innerHTML = '';
+    if (elements.previewTableInput) elements.previewTableInput.innerHTML = '';
+    if (elements.previewTableOutput) elements.previewTableOutput.innerHTML = '';
+    
+    state.previewType = 'none';
+}
+
+/**
+ * Show preview error message
+ */
+function showPreviewError(message) {
+    if (!elements.previewError) return;
+    
+    elements.previewPlaceholder.style.display = 'none';
+    elements.previewSplitView.classList.remove('active');
+    elements.previewError.textContent = message;
+    elements.previewError.classList.add('active');
+}
+
+/**
+ * Update preview based on current input/output
+ */
+function updatePreview() {
+    if (!state.previewEnabled) return;
+    
+    const input = elements.inputEditor.value.trim();
+    const output = elements.outputEditor.value.trim();
+    
+    if (!input) {
+        showPreviewPlaceholder();
+        return;
+    }
+    
+    const previewType = detectPreviewType(input);
+    
+    switch (previewType) {
+        case 'graphics':
+            // Graphics preview using SVG renderer
+            renderGraphicsPreview(input, output);
+            break;
+            
+        case 'table':
+            // Table preview using WASM parsed data
+            if (state.wasmReady && state.wasm && state.wasm.previewTable) {
+                try {
+                    const format = state.direction === 'l2t' ? 'latex' : 'typst';
+                    const tableData = state.wasm.previewTable(input, format);
+                    renderTablePreview(tableData);
+                } catch (e) {
+                    if (DEBUG) console.log('Table preview not available:', e);
+                    showPreviewPlaceholder();
+                }
+            } else {
+                // Fallback: show placeholder for tables until backend is ready
+                showPreviewPlaceholder();
+            }
+            break;
+            
+        case 'document':
+            // Document preview using outline extraction
+            renderDocumentPreview(input, output);
+            break;
+            
+        case 'math':
+            let inputLatex, outputLatex;
+            let inputConvertFailed = false;
+            let outputConvertFailed = false;
+            
+            if (state.direction === 'l2t') {
+                // LaTeX -> Typst
+                inputLatex = input; // Left: Input LaTeX (direct)
+                
+                // Right: Output Typst -> show as-is (can't render Typst with KaTeX)
+                // Mark as "typst" to show special message
+                outputLatex = null;
+                outputConvertFailed = true; // Typst output can't be previewed with KaTeX
+            } else {
+                // Typst -> LaTeX
+                // Left: Input Typst -> converted to LaTeX for preview
+                if (input && state.wasmReady && state.wasm && state.wasm.typstToLatex) {
+                     try {
+                         inputLatex = state.wasm.typstToLatex(input);
+                     } catch(e) {
+                         inputLatex = null;
+                         inputConvertFailed = true;
+                     }
+                } else {
+                    inputLatex = null;
+                    inputConvertFailed = true;
+                }
+                outputLatex = output; // Right: Output LaTeX (direct)
+            }
+            
+            renderMathPreview(inputLatex, outputLatex, inputConvertFailed, outputConvertFailed);
+            break;
+            
+        default:
+            showPreviewPlaceholder();
+    }
+}
+
+/**
+ * Update preview UI language
+ */
+function updatePreviewLanguage() {
+    const t = translations[state.lang];
+    
+    if (elements.previewTitle) {
+        elements.previewTitle.textContent = t.preview;
+    }
+    if (elements.previewPlaceholder) {
+        elements.previewPlaceholder.textContent = t.previewPlaceholder;
+    }
+    if (elements.previewToggleBtn) {
+        elements.previewToggleBtn.title = t.previewToggle;
+    }
+    if (elements.previewInputLabel) {
+        elements.previewInputLabel.textContent = t.previewInputLabel;
+    }
+    if (elements.previewOutputLabel) {
+        elements.previewOutputLabel.textContent = t.previewOutputLabel;
+    }
+    if (elements.betaBadge) {
+        elements.betaBadge.textContent = t.betaBadge;
+    }
+}
+
 // ===== UI Functions =====
 
 function updateDirection() {
@@ -654,6 +1533,7 @@ function convert() {
         elements.outputEditor.value = '';
         elements.charCount.textContent = `0 ${t.chars}`;
         elements.convertTime.textContent = t.ready;
+        showPreviewPlaceholder();
         return;
     }
 
@@ -684,9 +1564,13 @@ function convert() {
 
         elements.charCount.textContent = `${input.length} ${t.chars}`;
         elements.convertTime.textContent = `${t.time}: ${duration}ms`;
+        
+        // Update preview
+        updatePreview();
     } catch (e) {
         elements.outputEditor.value = `Error: ${e.message}`;
         elements.convertTime.textContent = t.failed;
+        showPreviewError(e.message);
     }
 }
 
@@ -733,6 +1617,9 @@ function clearInput() {
     elements.outputEditor.value = '';
     elements.charCount.textContent = `0 ${t.chars}`;
     elements.convertTime.textContent = t.ready;
+    
+    // Clear preview
+    showPreviewPlaceholder();
 }
 
 function toggleTheme() {
@@ -742,6 +1629,22 @@ function toggleTheme() {
 
     html.setAttribute('data-theme', newTheme);
     localStorage.setItem('theme', newTheme);
+}
+
+function togglePreview() {
+    if (elements.previewPanel) {
+        elements.previewPanel.classList.toggle('collapsed');
+        state.previewEnabled = !elements.previewPanel.classList.contains('collapsed');
+        localStorage.setItem('previewCollapsed', !state.previewEnabled);
+    }
+}
+
+function loadPreviewState() {
+    const collapsed = localStorage.getItem('previewCollapsed') === 'true';
+    if (collapsed && elements.previewPanel) {
+        elements.previewPanel.classList.add('collapsed');
+        state.previewEnabled = false;
+    }
 }
 
 function loadTheme() {
@@ -803,6 +1706,9 @@ function updateLanguageUI() {
 
     // Trigger title update
     updateTitles();
+    
+    // Update preview language
+    updatePreviewLanguage();
 }
 
 function loadExample(latex) {
@@ -863,7 +1769,12 @@ function setupEventListeners() {
     elements.pasteBtn.addEventListener('click', pasteInput);
     elements.copyBtn.addEventListener('click', copyOutput);
     elements.themeToggle.addEventListener('click', toggleTheme);
-    elements.langToggle.addEventListener('click', toggleLanguage); // Add this
+    elements.langToggle.addEventListener('click', toggleLanguage);
+    
+    // Preview toggle
+    if (elements.previewToggleBtn) {
+        elements.previewToggleBtn.addEventListener('click', togglePreview);
+    }
 
     // Example cards (math)
     document.querySelectorAll('.example-card[data-latex]').forEach(card => {
@@ -903,16 +1814,77 @@ function setupEventListeners() {
             setMode(state.mode === 'math' ? 'document' : 'math');
         }
     });
+    
+    // Scroll synchronization between editor and preview
+    setupScrollSync();
+}
+
+/**
+ * Setup scroll synchronization between input editor and preview panes
+ * Uses percentage-based scrolling for approximate sync
+ */
+function setupScrollSync() {
+    const inputEditor = elements.inputEditor;
+    const previewPanes = document.querySelectorAll('.preview-pane');
+    
+    let isScrolling = false;
+    let scrollTimeout;
+    
+    // Sync from input editor to preview
+    inputEditor.addEventListener('scroll', () => {
+        if (isScrolling) return;
+        
+        clearTimeout(scrollTimeout);
+        scrollTimeout = setTimeout(() => {
+            const scrollPercentage = inputEditor.scrollTop / (inputEditor.scrollHeight - inputEditor.clientHeight);
+            
+            previewPanes.forEach(pane => {
+                if (pane.scrollHeight > pane.clientHeight) {
+                    isScrolling = true;
+                    pane.scrollTop = scrollPercentage * (pane.scrollHeight - pane.clientHeight);
+                    setTimeout(() => { isScrolling = false; }, 50);
+                }
+            });
+        }, 16); // ~60fps throttle
+    });
+    
+    // Sync from preview to input (bidirectional)
+    previewPanes.forEach(pane => {
+        pane.addEventListener('scroll', () => {
+            if (isScrolling) return;
+            
+            clearTimeout(scrollTimeout);
+            scrollTimeout = setTimeout(() => {
+                if (pane.scrollHeight <= pane.clientHeight) return;
+                
+                const scrollPercentage = pane.scrollTop / (pane.scrollHeight - pane.clientHeight);
+                
+                isScrolling = true;
+                inputEditor.scrollTop = scrollPercentage * (inputEditor.scrollHeight - inputEditor.clientHeight);
+                
+                // Also sync other preview panes
+                previewPanes.forEach(otherPane => {
+                    if (otherPane !== pane && otherPane.scrollHeight > otherPane.clientHeight) {
+                        otherPane.scrollTop = scrollPercentage * (otherPane.scrollHeight - otherPane.clientHeight);
+                    }
+                });
+                
+                setTimeout(() => { isScrolling = false; }, 50);
+            }, 16);
+        });
+    });
 }
 
 // ===== Initialization =====
 
 async function init() {
     loadTheme();
-    loadLanguage(); // Add this
+    loadLanguage();
+    loadPreviewState();
     updateDirection();
     updateMode();
     setupEventListeners();
+    updatePreviewLanguage();
 
     // Load WASM
     await initWasm();
