@@ -192,9 +192,7 @@ impl From<ConversionWarning> for crate::utils::error::CliDiagnostic {
             _ => DiagnosticSeverity::Info,
         };
 
-        let location = warning
-            .span
-            .map(|s| format!("{}..{}", s.start, s.end));
+        let location = warning.span.map(|s| format!("{}..{}", s.start, s.end));
 
         let mut diag = CliDiagnostic::new(severity, warning.kind.to_string(), warning.message);
         if let Some(loc) = location {

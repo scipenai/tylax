@@ -10,8 +10,8 @@ use tylax::{
     diagnostics::{check_latex, format_diagnostics},
     latex_document_to_typst, latex_to_typst, latex_to_typst_with_diagnostics,
     tikz::{convert_cetz_to_tikz, convert_tikz_to_cetz, is_cetz_code},
-    typst_document_to_latex, typst_to_latex, typst_to_latex_with_diagnostics, T2LOptions,
-    CliDiagnostic,
+    typst_document_to_latex, typst_to_latex, typst_to_latex_with_diagnostics, CliDiagnostic,
+    T2LOptions,
 };
 
 #[cfg(feature = "cli")]
@@ -651,7 +651,10 @@ fn print_diagnostics_to_stderr(diagnostics: &[CliDiagnostic], use_color: bool) {
         let reset = if use_color { "\x1b[0m" } else { "" };
 
         if let Some(ref loc) = diag.location {
-            eprintln!("  {}[{}]{} {}: {}", color, diag.kind, reset, loc, diag.message);
+            eprintln!(
+                "  {}[{}]{} {}: {}",
+                color, diag.kind, reset, loc, diag.message
+            );
         } else {
             eprintln!("  {}[{}]{} {}", color, diag.kind, reset, diag.message);
         }

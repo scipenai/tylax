@@ -71,8 +71,7 @@ pub use core::typst2latex;
 pub use core::typst2latex::T2LOptions;
 pub use core::typst2latex::{
     typst_document_to_latex, typst_to_latex, typst_to_latex_with_diagnostics,
-    typst_to_latex_with_eval, typst_to_latex_with_options,
-    ConversionResult as T2LConversionResult,
+    typst_to_latex_with_eval, typst_to_latex_with_options, ConversionResult as T2LConversionResult,
 };
 
 pub use core::latex2typst::{
