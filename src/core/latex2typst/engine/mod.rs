@@ -203,20 +203,10 @@ pub fn expand_latex_with_warnings(input: &str, math_mode: bool) -> ExpandResult 
     // Collect structured warnings
     let warnings = engine.take_structured_warnings();
 
-    // If infinite recursion or token explosion was detected, return original input for safety
-    // This is more predictable than returning a partially-expanded mess
-    let has_critical_error = warnings.iter().any(|w| {
-        matches!(
-            w,
-            EngineWarning::DepthExceeded { .. } | EngineWarning::TokenLimitExceeded { .. }
-        )
-    });
-
-    let output = if has_critical_error {
-        input.to_string()
-    } else {
-        detokenize(&expanded)
-    };
+    // Always use the detokenized output from the engine.
+    // DO NOT return original input on error - it contains \newcommand/\renewcommand
+    // which causes MiTeX parser to hang!
+    let output = detokenize(&expanded);
 
     ExpandResult { output, warnings }
 }

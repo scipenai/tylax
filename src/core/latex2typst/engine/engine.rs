@@ -531,6 +531,18 @@ impl Engine {
                     if let Some(macro_def) = self.state.db.get(&merged_name).cloned() {
                         match self.parse_arguments(&mut iter, &macro_def) {
                             Ok(args) => {
+                                // Check depth limit BEFORE recursing - output args directly if exceeded
+                                if depth + 1 > self.config.max_depth {
+                                    self.push_warning(EngineWarning::DepthExceeded {
+                                        max_depth: self.config.max_depth,
+                                    });
+                                    // Output arguments directly to preserve content (e.g., "x")
+                                    for arg in args {
+                                        result.extend(arg.into_inner());
+                                    }
+                                    continue;
+                                }
+
                                 let expanded_body = self.substitute_args(&macro_def.body, &args);
                                 // TeX semantics: insert expanded tokens at front of input stream
                                 // and continue processing. This is crucial for macros that expand
