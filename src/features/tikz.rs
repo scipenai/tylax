@@ -908,17 +908,18 @@ impl DrawOptions {
 
         // Generate stroke attribute
         if !stroke_parts.is_empty() {
-            if stroke_parts.len() == 1
-                && self.color.is_some()
+            // Simple color-only stroke (no width, no dash pattern)
+            let is_simple = stroke_parts.len() == 1
                 && self.line_width.is_none()
                 && !self.dashed
-                && !self.dotted
-            {
-                // Simple color-only stroke
-                parts.push(format!(
-                    "stroke: {}",
-                    convert_color(self.color.as_ref().unwrap())
-                ));
+                && !self.dotted;
+
+            if is_simple {
+                if let Some(ref color) = self.color {
+                    parts.push(format!("stroke: {}", convert_color(color)));
+                } else {
+                    parts.push(format!("stroke: ({})", stroke_parts.join(", ")));
+                }
             } else {
                 parts.push(format!("stroke: ({})", stroke_parts.join(", ")));
             }

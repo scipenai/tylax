@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-01-25
+
+### Fixed
+- **Infinite Recursion**: Fixed a nasty browser freeze when macros call each other infinitely (like `\foo` ↔ `\bar`).
+  - Added a hard step limit to kill the loop before it kills the browser.
+  - If it hits the limit, we now just dump the text (e.g., `x`) instead of choking.
+  - Fixed the real culprit: raw `\newcommand` definitions were leaking into the parser when things went wrong.
+
 ## [0.2.0] - 2026-01-16
 
 This release is a major overhaul of the core conversion logic, introducing proper macro expansion engines for both directions.
@@ -46,6 +54,7 @@ This release is a major overhaul of the core conversion logic, introducing prope
 - CLI tool (`t2l`)
 - Structured error handling with warnings
 
-[Unreleased]: https://github.com/scipenai/tylax/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/scipenai/tylax/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/scipenai/tylax/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/scipenai/tylax/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/scipenai/tylax/releases/tag/v0.1.0
