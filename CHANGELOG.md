@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-02-23
+
+### Fixed
+- **Math Spacing**: `\,`, `\;`, `\quad`, `\qquad` now convert to Typst math spacing keywords (`thin`, `thick`, `quad`, `wide`) instead of plain spaces when in math mode. Reverse mapping (`wide` → `\qquad`) also added for T2L.
+- **Array Environment**: `\begin{array}` now converts to `mat(delim: #none, ...)` instead of being incorrectly treated as a `table()`.
+
 ## [0.2.1] - 2026-01-25
 
 ### Fixed
@@ -54,7 +60,8 @@ This release is a major overhaul of the core conversion logic, introducing prope
 - CLI tool (`t2l`)
 - Structured error handling with warnings
 
-[Unreleased]: https://github.com/scipenai/tylax/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/scipenai/tylax/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/scipenai/tylax/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/scipenai/tylax/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/scipenai/tylax/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/scipenai/tylax/releases/tag/v0.1.0
