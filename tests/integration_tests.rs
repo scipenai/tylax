@@ -87,6 +87,30 @@ mod l2t_math {
     }
 
     #[test]
+    fn test_array_environment() {
+        // Simple array -> mat(delim: #none, ...)
+        let result = latex_to_typst(r"\begin{array}{cc} a & b \\ c & d \end{array}");
+        assert!(
+            result.contains("mat("),
+            "array should become mat(), got: {}",
+            result
+        );
+        assert!(
+            !result.contains("table"),
+            "array should NOT become a table, got: {}",
+            result
+        );
+
+        // array with \left( ... \right) wrapping (issue #6 example)
+        let result = latex_to_typst(r"\left(\begin{array}{l} x \\ y \\ 1 \end{array}\right)");
+        assert!(
+            result.contains("mat("),
+            "array inside \\left...\\right should become mat(), got: {}",
+            result
+        );
+    }
+
+    #[test]
     fn test_comparison_operators() {
         let tests = [(r"\leq", "leq"), (r"\geq", "geq"), (r"\neq", "neq")];
 
@@ -112,6 +136,49 @@ mod l2t_math {
         let expr = r"\frac{d}{dx}\left(\int_0^x f(t) dt\right) = f(x)";
         let result = latex_to_typst(expr);
         assert!(!result.contains("Error"));
+    }
+
+    #[test]
+    fn test_math_spacing() {
+        // \, -> thin
+        let result = latex_to_typst(r"a \, b");
+        assert!(
+            result.contains("thin"),
+            "\\, should become 'thin' in math mode, got: {}",
+            result
+        );
+
+        // \: -> med (handled by TEX_COMMAND_SPEC alias)
+        let result = latex_to_typst(r"a \: b");
+        assert!(
+            result.contains("med"),
+            "\\: should become 'med' in math mode, got: {}",
+            result
+        );
+
+        // \; -> thick
+        let result = latex_to_typst(r"a \; b");
+        assert!(
+            result.contains("thick"),
+            "\\; should become 'thick' in math mode, got: {}",
+            result
+        );
+
+        // \quad -> quad
+        let result = latex_to_typst(r"a \quad b");
+        assert!(
+            result.contains("quad"),
+            "\\quad should become 'quad' in math mode, got: {}",
+            result
+        );
+
+        // \qquad -> wide
+        let result = latex_to_typst(r"a \qquad b");
+        assert!(
+            result.contains("wide"),
+            "\\qquad should become 'wide' in math mode, got: {}",
+            result
+        );
     }
 
     #[test]
@@ -199,6 +266,49 @@ mod t2l_math {
         assert!(result.contains("+"));
         assert!(result.contains("-"));
         assert!(result.contains("="));
+    }
+
+    #[test]
+    fn test_math_spacing() {
+        // thin -> \,
+        let result = typst_to_latex("$a thin b$");
+        assert!(
+            result.contains("\\,"),
+            "thin should become \\, , got: {}",
+            result
+        );
+
+        // med -> \:
+        let result = typst_to_latex("$a med b$");
+        assert!(
+            result.contains("\\:"),
+            "med should become \\: , got: {}",
+            result
+        );
+
+        // thick -> \;
+        let result = typst_to_latex("$a thick b$");
+        assert!(
+            result.contains("\\;"),
+            "thick should become \\; , got: {}",
+            result
+        );
+
+        // quad -> \quad
+        let result = typst_to_latex("$a quad b$");
+        assert!(
+            result.contains("\\quad"),
+            "quad should become \\quad, got: {}",
+            result
+        );
+
+        // wide -> \qquad
+        let result = typst_to_latex("$a wide b$");
+        assert!(
+            result.contains("\\qquad"),
+            "wide should become \\qquad, got: {}",
+            result
+        );
     }
 }
 

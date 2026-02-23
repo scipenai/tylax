@@ -53,6 +53,11 @@ pub fn convert_math_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
                     ctx.last_token = TokenType::Command;
                     return;
                 }
+                "wide" => {
+                    ctx.push("\\qquad ");
+                    ctx.last_token = TokenType::Command;
+                    return;
+                }
                 // Basic arithmetic operators (Typst keywords)
                 "plus" => {
                     ctx.push_with_spacing("+", TokenType::Operator);

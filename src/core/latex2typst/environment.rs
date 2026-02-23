@@ -44,8 +44,13 @@ pub fn convert_environment(conv: &mut LatexConverter, elem: SyntaxElement, outpu
         }
 
         // Tabular environment
-        "tabular" | "tabular*" | "tabularx" | "longtable" | "longtabu" | "array" => {
+        "tabular" | "tabular*" | "tabularx" | "longtable" | "longtabu" => {
             convert_tabular(conv, &node, output);
+        }
+
+        // Array environment (math-mode matrix with column alignment spec)
+        "array" => {
+            convert_array(conv, &node, output);
         }
 
         // List environments
@@ -618,6 +623,32 @@ fn convert_matrix(
             let _ = write!(output, "mat(delim: #none, {}) ", content);
         }
     }
+}
+
+/// Convert a \begin{array}{colspec}...\end{array} environment to Typst mat()
+///
+/// `array` is a math-mode environment that behaves like `matrix` but with an
+/// explicit column alignment specification (e.g. `{ccc}`, `{l}`).
+/// The delimiter is always `#none` because `array` is typically wrapped by
+/// `\left...\right` which handles delimiters separately.
+fn convert_array(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut String) {
+    conv.state.push_env(EnvironmentContext::Matrix);
+    let prev_mode = conv.state.mode;
+    conv.state.mode = ConversionMode::Math;
+
+    let mut content = String::new();
+    conv.visit_env_content(node, &mut content);
+
+    conv.state.mode = prev_mode;
+    conv.state.pop_env();
+
+    let content = content
+        .replace("zws ;", ";")
+        .replace("zws, ", ", ")
+        .trim()
+        .to_string();
+
+    let _ = write!(output, "mat(delim: #none, {}) ", content);
 }
 
 /// Convert a cases environment

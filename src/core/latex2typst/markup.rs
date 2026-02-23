@@ -573,13 +573,22 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
 
             // Try to get the argument (if parsed as part of the command)
             if let Some(content) = conv.convert_required_arg(&cmd, 0) {
-                // Clean up: remove spaces
+                // Preserve original behavior for generic operator names:
+                // only remove whitespace from the converted argument.
                 let clean_content: String =
                     content.chars().filter(|c| !c.is_whitespace()).collect();
+                // For argmin/argmax detection, ignore spacing keywords that may
+                // appear when \, \: \; \quad \qquad are converted to Typst.
+                let normalized = clean_content
+                    .replace("thin", "")
+                    .replace("med", "")
+                    .replace("thick", "")
+                    .replace("quad", "")
+                    .replace("wide", "");
 
-                let op_name = if clean_content == "argmin" {
+                let op_name = if normalized == "argmin" {
                     "argmin"
-                } else if clean_content == "argmax" {
+                } else if normalized == "argmax" {
                     "argmax"
                 } else {
                     &clean_content
@@ -975,10 +984,34 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             let dim = conv.get_required_arg(&cmd, 0).unwrap_or_default();
             let _ = write!(output, "#v({})", convert_dimension(&dim));
         }
-        "quad" => output.push_str("  "),
-        "qquad" => output.push_str("    "),
-        "," | "thinspace" => output.push(' '),
-        ";" | "thickspace" => output.push_str("  "),
+        "quad" => {
+            if matches!(conv.state.mode, ConversionMode::Math) {
+                output.push_str("quad ");
+            } else {
+                output.push_str("  ");
+            }
+        }
+        "qquad" => {
+            if matches!(conv.state.mode, ConversionMode::Math) {
+                output.push_str("wide ");
+            } else {
+                output.push_str("    ");
+            }
+        }
+        "," | "thinspace" => {
+            if matches!(conv.state.mode, ConversionMode::Math) {
+                output.push_str("thin ");
+            } else {
+                output.push(' ');
+            }
+        }
+        ";" | "thickspace" => {
+            if matches!(conv.state.mode, ConversionMode::Math) {
+                output.push_str("thick ");
+            } else {
+                output.push_str("  ");
+            }
+        }
         "!" | "negthinspace" => {}
         "enspace" => output.push(' '),
 
