@@ -68,7 +68,7 @@ t2l tikz input.tex -o output.typ
 Add to `Cargo.toml`:
 ```toml
 [dependencies]
-tylax = "0.2.0"
+tylax = "0.3.0"
 ```
 
 ```rust

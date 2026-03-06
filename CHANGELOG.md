@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-07
+
+### Added
+- **Physics Package Support**: Added initial support for common `physics` package commands in LaTeX to Typst conversion.
+  - Automatic bracing helpers such as `\pqty`, `\bqty`, `\Bqty`, `\vqty`, `\abs`, and `\norm`
+  - Derivative helpers such as `\dd`, `\dv`, `\pdv`, and `\fdv`
+  - Dirac notation such as `\bra`, `\ket`, `\braket`, `\dyad`, `\expval`, `\mel`, and `\vev`
+  - Matrix helpers such as `\mqty`, `\pmqty`, `\bmqty`, `\vmqty`, `\dmat`, and `\zmat`
+  - Quick-quad text helpers such as `\qq`, `\qif`, `\qthen`, and related variants
+
+### Fixed
+- **Mixed Partial Derivatives**: Preserved argument order for mixed partial derivative forms such as `\pdv{f}{x}{y}`.
+
 ## [0.2.2] - 2026-02-23
 
 ### Fixed
@@ -60,7 +73,8 @@ This release is a major overhaul of the core conversion logic, introducing prope
 - CLI tool (`t2l`)
 - Structured error handling with warnings
 
-[Unreleased]: https://github.com/scipenai/tylax/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/scipenai/tylax/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/scipenai/tylax/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/scipenai/tylax/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/scipenai/tylax/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/scipenai/tylax/compare/v0.1.0...v0.2.0
