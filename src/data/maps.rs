@@ -1643,6 +1643,214 @@ lazy_static! {
             alias: None,
         }));
 
+        // =====================================================================
+        // physics package commands
+        // =====================================================================
+
+        // Helper closures for conciseness
+        let cmd0 = |alias: Option<&str>| CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: alias.map(|s| s.to_string()),
+        });
+        let cmd1 = || CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
+            alias: None,
+        });
+        let cmd2 = || CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
+            alias: None,
+        });
+        let cmd3 = || CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 3 } },
+            alias: None,
+        });
+        let cmd1_opt = || CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right {
+                pattern: ArgPattern::Glob {
+                    pattern: GlobStr::from("{,b}t"),
+                },
+            },
+            alias: None,
+        });
+        let cmd2_opt = || CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right {
+                pattern: ArgPattern::Glob {
+                    pattern: GlobStr::from("{,b}tt"),
+                },
+            },
+            alias: None,
+        });
+        let cmd3_opt = || CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right {
+                pattern: ArgPattern::Glob {
+                    pattern: GlobStr::from("{,b}ttt"),
+                },
+            },
+            alias: None,
+        });
+
+        // -- Automatic bracing (1 arg) + star variants --
+        m.insert("pqty".to_string(), cmd1());
+        m.insert("bqty".to_string(), cmd1());
+        m.insert("Bqty".to_string(), cmd1());
+        m.insert("vqty".to_string(), cmd1());
+        m.insert("abs".to_string(), cmd1());
+        m.insert("abs*".to_string(), cmd1());
+        m.insert("absolutevalue".to_string(), cmd1());
+        m.insert("norm".to_string(), cmd1());
+        m.insert("norm*".to_string(), cmd1());
+        m.insert("eval".to_string(), cmd1());
+        m.insert("eval*".to_string(), cmd1());
+        m.insert("evaluated".to_string(), cmd1());
+        m.insert("order".to_string(), cmd1());
+        m.insert("order*".to_string(), cmd1());
+
+        // -- Commutators (2 args) + star variants --
+        m.insert("comm".to_string(), cmd2());
+        m.insert("comm*".to_string(), cmd2());
+        m.insert("commutator".to_string(), cmd2());
+        m.insert("acomm".to_string(), cmd2());
+        m.insert("acomm*".to_string(), cmd2());
+        m.insert("acommutator".to_string(), cmd2());
+        m.insert("anticommutator".to_string(), cmd2());
+        m.insert("pb".to_string(), cmd2());
+        m.insert("pb*".to_string(), cmd2());
+        m.insert("poissonbracket".to_string(), cmd2());
+
+        // -- Vector notation (1 arg) --
+        m.insert("vb".to_string(), cmd1());
+        m.insert("vectorbold".to_string(), cmd1());
+        m.insert("va".to_string(), cmd1());
+        m.insert("vectorarrow".to_string(), cmd1());
+        m.insert("vu".to_string(), cmd1());
+        m.insert("vectorunit".to_string(), cmd1());
+
+        // -- Derivatives + star variants --
+        m.insert("dd".to_string(), cmd1_opt());
+        m.insert("differential".to_string(), cmd1_opt());
+        m.insert("dv".to_string(), cmd2_opt());
+        m.insert("dv*".to_string(), cmd2_opt());
+        m.insert("derivative".to_string(), cmd2_opt());
+        m.insert("pdv".to_string(), cmd3_opt());
+        m.insert("pdv*".to_string(), cmd3_opt());
+        m.insert("pderivative".to_string(), cmd3_opt());
+        m.insert("partialderivative".to_string(), cmd3_opt());
+        m.insert("fdv".to_string(), cmd2_opt());
+        m.insert("fdv*".to_string(), cmd2_opt());
+        m.insert("fderivative".to_string(), cmd2_opt());
+        m.insert("functionalderivative".to_string(), cmd2_opt());
+        m.insert("var".to_string(), cmd1());
+        m.insert("variation".to_string(), cmd1());
+
+        // -- Dirac notation + star variants --
+        m.insert("ket".to_string(), cmd1());
+        m.insert("ket*".to_string(), cmd1());
+        m.insert("bra".to_string(), cmd1());
+        m.insert("bra*".to_string(), cmd1());
+        m.insert("braket".to_string(), cmd2());
+        m.insert("braket*".to_string(), cmd2());
+        m.insert("innerproduct".to_string(), cmd2());
+        m.insert("ip".to_string(), cmd2());
+        m.insert("dyad".to_string(), cmd2());
+        m.insert("dyad*".to_string(), cmd2());
+        m.insert("outerproduct".to_string(), cmd2());
+        m.insert("ketbra".to_string(), cmd2());
+        m.insert("op".to_string(), cmd2());
+        m.insert("expval".to_string(), cmd2());
+        m.insert("expval*".to_string(), cmd2());
+        m.insert("expectationvalue".to_string(), cmd2());
+        m.insert("ev".to_string(), cmd2());
+        m.insert("ev*".to_string(), cmd2());
+        m.insert("vev".to_string(), cmd1());
+        m.insert("mel".to_string(), cmd3());
+        m.insert("mel*".to_string(), cmd3());
+        m.insert("matrixelement".to_string(), cmd3());
+        m.insert("matrixel".to_string(), cmd3());
+
+        // -- Quick quad text --
+        m.insert("qq".to_string(), cmd1());
+        m.insert("qqtext".to_string(), cmd1());
+        // Zero-arg qq variants
+        m.insert("qc".to_string(), cmd0(None));
+        m.insert("qcomma".to_string(), cmd0(None));
+        m.insert("qcc".to_string(), cmd0(None));
+        m.insert("qif".to_string(), cmd0(None));
+        m.insert("qthen".to_string(), cmd0(None));
+        m.insert("qelse".to_string(), cmd0(None));
+        m.insert("qotherwise".to_string(), cmd0(None));
+        m.insert("qunless".to_string(), cmd0(None));
+        m.insert("qgiven".to_string(), cmd0(None));
+        m.insert("qusing".to_string(), cmd0(None));
+        m.insert("qassume".to_string(), cmd0(None));
+        m.insert("qsince".to_string(), cmd0(None));
+        m.insert("qlet".to_string(), cmd0(None));
+        m.insert("qfor".to_string(), cmd0(None));
+        m.insert("qall".to_string(), cmd0(None));
+        m.insert("qeven".to_string(), cmd0(None));
+        m.insert("qodd".to_string(), cmd0(None));
+        m.insert("qinteger".to_string(), cmd0(None));
+        m.insert("qand".to_string(), cmd0(None));
+        m.insert("qor".to_string(), cmd0(None));
+        m.insert("qas".to_string(), cmd0(None));
+        m.insert("qin".to_string(), cmd0(None));
+
+        // -- Matrix macros (1 arg) --
+        m.insert("mqty".to_string(), cmd1());
+        m.insert("matrixquantity".to_string(), cmd1());
+        m.insert("pmqty".to_string(), cmd1());
+        m.insert("bmqty".to_string(), cmd1());
+        m.insert("vmqty".to_string(), cmd1());
+        m.insert("Pmqty".to_string(), cmd1());
+        m.insert("smqty".to_string(), cmd1());
+        m.insert("smallmatrixquantity".to_string(), cmd1());
+        m.insert("spmqty".to_string(), cmd1());
+        m.insert("sPmqty".to_string(), cmd1());
+        m.insert("sbmqty".to_string(), cmd1());
+        m.insert("svmqty".to_string(), cmd1());
+        m.insert("mdet".to_string(), cmd1());
+        m.insert("matrixdeterminant".to_string(), cmd1());
+        m.insert("smdet".to_string(), cmd1());
+        m.insert("smallmatrixdeterminant".to_string(), cmd1());
+
+        // -- Matrix generators --
+        m.insert("imat".to_string(), cmd1());          // \imat{n} → n×n identity
+        m.insert("identitymatrix".to_string(), cmd1());
+        m.insert("xmat".to_string(), cmd3());          // \xmat{x}{n}{m}
+        m.insert("xmatrix".to_string(), cmd3());
+        m.insert("zmat".to_string(), cmd2());          // \zmat{n}{m}
+        m.insert("zeromatrix".to_string(), cmd2());
+        m.insert("pmat".to_string(), cmd1());          // \pmat{n} → Pauli matrix
+        m.insert("paulimatrix".to_string(), cmd1());
+        m.insert("dmat".to_string(), cmd1());          // \dmat{a,b,c} → diagonal
+        m.insert("diagonalmatrix".to_string(), cmd1());
+        m.insert("admat".to_string(), cmd1());         // \admat{a,b,c} → anti-diagonal
+        m.insert("antidiagonalmatrix".to_string(), cmd1());
+
+        // -- Operators with optional bracing (1 arg) --
+        m.insert("Res".to_string(), cmd1());
+        m.insert("Residue".to_string(), cmd1());
+        m.insert("pv".to_string(), cmd1());
+        m.insert("principalvalue".to_string(), cmd1());
+        m.insert("PV".to_string(), cmd1());
+
+        // -- Vector calculus operators (0 or 1 arg, handled in markup.rs) --
+        m.insert("grad".to_string(), cmd1());
+        m.insert("gradient".to_string(), cmd1());
+        m.insert("divergence".to_string(), cmd1());
+        m.insert("curl".to_string(), cmd1());
+        m.insert("laplacian".to_string(), cmd1());
+
+        // -- Zero-arg symbols (handled via extended_symbols.rs) --
+        m.insert("dotproduct".to_string(), cmd0(None));
+        m.insert("vdot".to_string(), cmd0(None));
+        m.insert("crossproduct".to_string(), cmd0(None));
+        m.insert("cross".to_string(), cmd0(None));
+        m.insert("cp".to_string(), cmd0(None));
+        m.insert("divisionsymbol".to_string(), cmd0(None));
+
+        // -- flatfrac (2 args) --
+        m.insert("flatfrac".to_string(), cmd2());
+
         CommandSpec::new(m)
     };
 }
@@ -1740,8 +1948,8 @@ pub static TYPST_TO_TEX: phf::Map<&'static str, &'static str> = phf_map! {
     "harpoon.rb" => "rightharpoondown",
     "harpoon.lt" => "leftharpoonup",
     "harpoon.lb" => "leftharpoondown",
-    "harpoons.ltrb" => "rightleftharpoons",
-    "harpoons.rtlb" => "leftrightharpoons",
+    "harpoons.ltrb" => "leftrightharpoons",
+    "harpoons.rtlb" => "rightleftharpoons",
     "arrows.rr" => "rightrightarrows",
     "arrows.ll" => "leftleftarrows",
     "arrows.lr" => "leftrightarrows",
@@ -2128,6 +2336,163 @@ pub static TYPST_TO_TEX: phf::Map<&'static str, &'static str> = phf_map! {
 
     // Additional unique symbols
     "star.op" => "*",
+
+    // =========================================================================
+    // Extended symbol mappings (from official Typst symbol table diff)
+    // =========================================================================
+
+    // Greek uppercase (trivial — rendered as Roman letters in LaTeX)
+    "Alpha" => "A",
+    "Beta" => "B",
+    "Chi" => "X",
+    "Digamma" => "\\Digamma",
+    "Epsilon" => "E",
+    "Eta" => "H",
+    "Iota" => "I",
+    "Kappa" => "K",
+    "Mu" => "M",
+    "Nu" => "N",
+    "Omicron" => "O",
+    "Rho" => "P",
+    "Tau" => "T",
+    "Zeta" => "Z",
+    "digamma" => "\\digamma",
+
+    // Blackboard bold (missing letters)
+    "BB" => "\\mathbb{B}",
+    "DD" => "\\mathbb{D}",
+    "FF" => "\\mathbb{F}",
+    "GG" => "\\mathbb{G}",
+    "HH" => "\\mathbb{H}",
+    "II" => "\\mathbb{I}",
+    "JJ" => "\\mathbb{J}",
+    "KK" => "\\mathbb{K}",
+    "LL" => "\\mathbb{L}",
+    "MM" => "\\mathbb{M}",
+    "OO" => "\\mathbb{O}",
+    "PP" => "\\mathbb{P}",
+    "SS" => "\\mathbb{S}",
+    "TT" => "\\mathbb{T}",
+    "UU" => "\\mathbb{U}",
+    "VV" => "\\mathbb{V}",
+    "WW" => "\\mathbb{W}",
+    "XX" => "\\mathbb{X}",
+    "YY" => "\\mathbb{Y}",
+
+    // Arrows (negated/curved variants)
+    "arrow.r.not" => "\\nrightarrow",
+    "arrow.l.not" => "\\nleftarrow",
+    "arrow.r.double.not" => "\\nRightarrow",
+    "arrow.l.double.not" => "\\nLeftarrow",
+    "arrow.l.r.not" => "\\nleftrightarrow",
+    "arrow.l.r.double.not" => "\\nLeftrightarrow",
+    "arrow.l.r.wave" => "\\leftrightsquigarrow",
+    "arrow.ccw" => "\\curvearrowleft",
+    "arrow.cw" => "\\curvearrowright",
+
+    // Comparison variants
+    "lt.approx" => "\\lessapprox",
+    "lt.equiv" => "\\leqq",
+    "lt.gt" => "\\lessgtr",
+    "lt.tilde" => "\\lesssim",
+    "lt.tri" => "\\vartriangleleft",
+    "lt.tri.eq" => "\\trianglelefteq",
+    "lt.tri.not" => "\\ntriangleleft",
+    "lt.tri.eq.not" => "\\ntrianglelefteq",
+    "gt.approx" => "\\gtrapprox",
+    "gt.equiv" => "\\geqq",
+    "gt.lt" => "\\gtrless",
+    "gt.tilde" => "\\gtrsim",
+    "gt.tri" => "\\vartriangleright",
+    "gt.tri.eq" => "\\trianglerighteq",
+    "gt.tri.not" => "\\ntriangleright",
+    "gt.tri.eq.not" => "\\ntrianglerighteq",
+
+    // Precedence / Succession variants
+    "prec.approx" => "\\precapprox",
+    "prec.curly.eq" => "\\preccurlyeq",
+    "prec.curly.eq.not" => "\\npreccurlyeq",
+    "prec.tilde" => "\\precsim",
+    "succ.approx" => "\\succapprox",
+    "succ.curly.eq" => "\\succcurlyeq",
+    "succ.curly.eq.not" => "\\nsucccurlyeq",
+    "succ.tilde" => "\\succsim",
+
+    // Tilde / Approx variants
+    "tilde.not" => "\\nsim",
+    "tilde.rev" => "\\backsim",
+    "tilde.rev.equiv" => "\\backcong",
+    "approx.eq" => "\\approxeq",
+    "forces.not" => "\\nVdash",
+
+    // Set operation variants
+    "subset.double" => "\\Subset",
+    "subset.neq" => "\\subsetneq",
+    "supset.double" => "\\Supset",
+    "supset.neq" => "\\supsetneq",
+    "union.dot" => "\\cupdot",
+    "union.double" => "\\Cup",
+    "union.plus" => "\\uplus",
+    "inter" => "\\cap",
+    "inter.big" => "\\bigcap",
+    "inter.double" => "\\Cap",
+    "inter.sq" => "\\sqcap",
+    "without" => "\\setminus",
+
+    // Binary operator variants
+    "plus" => "+",
+    "plus.square" => "\\boxplus",
+    "minus" => "-",
+    "minus.circle" => "\\ominus",
+    "minus.square" => "\\boxminus",
+    "times.square" => "\\boxtimes",
+    "dot.circle" => "\\odot",
+    "ast.op" => "\\ast",
+    "xor" => "\\oplus",
+    "xor.big" => "\\bigoplus",
+    "product.co" => "\\coprod",
+    "dots.h.c" => "\\cdots",
+
+    // Triangle variants
+    "triangle.stroked.t" => "\\triangle",
+    "triangle.stroked.b" => "\\triangledown",
+    "triangle.stroked.r" => "\\triangleright",
+    "triangle.stroked.l" => "\\triangleleft",
+    "triangle.stroked.small.t" => "\\vartriangle",
+    "triangle.filled.t" => "\\blacktriangle",
+    "triangle.filled.b" => "\\blacktriangledown",
+    "triangle.filled.r" => "\\blacktriangleright",
+    "triangle.filled.l" => "\\blacktriangleleft",
+
+    // Delimiter variants
+    "angle.l.double" => "\\lAngle",
+    "angle.r.double" => "\\rAngle",
+    "shell.l" => "\\lgroup",
+    "shell.r" => "\\rgroup",
+
+    // Shapes
+    "circle.stroked" => "\\circ",
+    "circle.stroked.small" => "\\circ",
+    "diamond.stroked" => "\\diamond",
+    "diamond.stroked.small" => "\\diamond",
+
+    // Dotless letters
+    "dotless.i" => "\\imath",
+    "dotless.j" => "\\jmath",
+
+    // Suits
+    "suit.club.filled" => "\\clubsuit",
+    "suit.spade.filled" => "\\spadesuit",
+    "suit.heart.stroked" => "\\heartsuit",
+    "suit.diamond.stroked" => "\\diamondsuit",
+
+    // Misc
+    "join" => "\\bowtie",
+    "maltese" => "\\maltese",
+    "pilcrow" => "\\P",
+    "prime.double" => "\\prime\\prime",
+    "harpoons.rtlt" => "\\upharpoonright\\!\\upharpoonleft",
+    "space.en" => "\\;",
 };
 
 // =============================================================================

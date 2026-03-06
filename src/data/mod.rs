@@ -10,6 +10,7 @@ pub mod colors;
 pub mod constants;
 pub mod extended_symbols;
 pub mod maps;
+pub mod physics;
 pub mod shorthands;
 pub mod siunitx;
 pub mod symbols;

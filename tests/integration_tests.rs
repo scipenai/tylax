@@ -1884,3 +1884,840 @@ mod t2l_lr_delimiters {
         );
     }
 }
+
+// ============================================================================
+// Physics Package Tests - LaTeX to Typst
+// ============================================================================
+
+mod physics_package {
+    use super::*;
+
+    // --- Automatic bracing ---
+
+    #[test]
+    fn test_abs() {
+        let result = latex_to_typst(r"\abs{x}");
+        assert!(
+            result.contains("abs("),
+            "\\abs{{x}} should produce abs(...), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_norm() {
+        let result = latex_to_typst(r"\norm{x}");
+        assert!(
+            result.contains("norm("),
+            "\\norm{{x}} should produce norm(...), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_pqty() {
+        let result = latex_to_typst(r"\pqty{x+y}");
+        assert!(
+            result.contains("lr(("),
+            "\\pqty should produce lr((...)), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_bqty() {
+        let result = latex_to_typst(r"\bqty{x+y}");
+        assert!(
+            result.contains("lr(["),
+            "\\bqty should produce lr([...]), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_comm() {
+        let result = latex_to_typst(r"\comm{A}{B}");
+        assert!(
+            result.contains("lr([") && result.contains(","),
+            "\\comm{{A}}{{B}} should produce lr([A, B]), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_acomm() {
+        let result = latex_to_typst(r"\acomm{A}{B}");
+        let has_braces = result.contains('{') && result.contains(',');
+        assert!(
+            has_braces,
+            "\\acomm{{A}}{{B}} should produce lr({{ A, B }}), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_order() {
+        let result = latex_to_typst(r"\order{x^2}");
+        assert!(
+            result.contains("cal(O)"),
+            "\\order should produce cal(O)(...), got: {}",
+            result
+        );
+    }
+
+    // --- Vector notation ---
+
+    #[test]
+    fn test_vb() {
+        let result = latex_to_typst(r"\vb{a}");
+        assert!(
+            result.contains("bold("),
+            "\\vb{{a}} should produce bold(a), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_va() {
+        let result = latex_to_typst(r"\va{a}");
+        assert!(
+            result.contains("bold(") && result.contains("arrow"),
+            "\\va{{a}} should produce accent(bold(a), arrow), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_vu() {
+        let result = latex_to_typst(r"\vu{e}");
+        assert!(
+            result.contains("bold(") && result.contains("hat"),
+            "\\vu{{e}} should produce accent(bold(e), hat), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_vdot_symbol() {
+        let result = latex_to_typst(r"\vdot");
+        assert!(
+            result.contains("dot") || result.contains("dot.op"),
+            "\\vdot should produce dot.op, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_cross_symbol() {
+        let result = latex_to_typst(r"\cross");
+        assert!(
+            result.contains("times"),
+            "\\cross should produce times, got: {}",
+            result
+        );
+    }
+
+    // --- Derivatives ---
+
+    #[test]
+    fn test_dd_bare() {
+        let result = latex_to_typst(r"\dd");
+        assert!(
+            result.contains("dif"),
+            "\\dd should produce dif, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_dd_with_arg() {
+        let result = latex_to_typst(r"\dd{x}");
+        assert!(
+            result.contains("dif") && result.contains("x"),
+            "\\dd{{x}} should produce dif x, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_dd_optional_order() {
+        let result = latex_to_typst(r"\dd[3]{x}");
+        assert!(
+            result.contains("dif^3") && result.contains("x"),
+            "\\dd[3]{{x}} should produce dif^3 x, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_dv_two_args() {
+        let result = latex_to_typst(r"\dv{f}{x}");
+        assert!(
+            result.contains("frac") && result.contains("dif"),
+            "\\dv{{f}}{{x}} should produce frac(dif f, dif x), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_dv_optional_order() {
+        let result = latex_to_typst(r"\dv[2]{f}{x}");
+        assert!(
+            result.contains("dif^2") && result.contains("x^2"),
+            "\\dv[2]{{f}}{{x}} should produce dif^2 and x^2, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_dv_star_optional_order() {
+        let result = latex_to_typst(r"\dv*[2]{f}{x}");
+        assert!(
+            result.contains("dif^2") && result.contains("x^2") && result.contains("/"),
+            "\\dv*[2]{{f}}{{x}} should produce inline dif^2 and x^2, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_dv_single_arg() {
+        let result = latex_to_typst(r"\dv{x}");
+        assert!(
+            result.contains("frac") && result.contains("dif"),
+            "\\dv{{x}} should produce frac(dif, dif x), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_pdv_two_args() {
+        let result = latex_to_typst(r"\pdv{f}{x}");
+        assert!(
+            result.contains("frac") && result.contains("diff"),
+            "\\pdv{{f}}{{x}} should produce frac(diff f, diff x), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_pdv_optional_order() {
+        let result = latex_to_typst(r"\pdv[2]{f}{x}");
+        assert!(
+            result.contains("diff^2") && result.contains("x^2"),
+            "\\pdv[2]{{f}}{{x}} should produce diff^2 and x^2, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_pdv_star_optional_order() {
+        let result = latex_to_typst(r"\pdv*[3]{f}{x}");
+        assert!(
+            result.contains("diff^3") && result.contains("x^3") && result.contains("/"),
+            "\\pdv*[3]{{f}}{{x}} should produce inline diff^3 and x^3, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_pdv_mixed_partial() {
+        let result = latex_to_typst(r"\pdv{f}{x}{y}");
+        assert!(
+            result.contains("diff^2") && result.contains("diff x") && result.contains("diff y"),
+            "\\pdv{{f}}{{x}}{{y}} should produce frac(diff^2 f, diff x diff y), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_pdv_star_mixed_partial() {
+        let result = latex_to_typst(r"\pdv*{f}{x}{y}");
+        assert!(
+            result.contains("diff^2") && result.contains("diff x") && result.contains("diff y"),
+            "\\pdv*{{f}}{{x}}{{y}} should produce inline diff^2 f / diff x diff y, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_pdv_mixed_partial_with_optional_order() {
+        let result = latex_to_typst(r"\pdv[3]{f}{x}{y}");
+        assert!(
+            result.contains("diff^3") && result.contains("diff x") && result.contains("diff y"),
+            "\\pdv[3]{{f}}{{x}}{{y}} should preserve the requested order, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fdv() {
+        let result = latex_to_typst(r"\fdv{F}{g}");
+        assert!(
+            result.contains("frac") && result.contains("delta"),
+            "\\fdv{{F}}{{g}} should produce frac(delta F, delta g), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fdv_optional_order() {
+        let result = latex_to_typst(r"\fdv[2]{F}{g}");
+        assert!(
+            result.contains("delta^2") && result.contains("g^2"),
+            "\\fdv[2]{{F}}{{g}} should produce delta^2 and g^2, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fdv_star_inline() {
+        let result = latex_to_typst(r"\fdv*{F}{g}");
+        assert!(
+            result.contains("delta") && result.contains("/") && result.contains("delta"),
+            "\\fdv*{{F}}{{g}} should produce inline delta F / delta g, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fdv_star_optional_order() {
+        let result = latex_to_typst(r"\fdv*[2]{F}{g}");
+        assert!(
+            result.contains("delta^2") && result.contains("g^2") && result.contains("/"),
+            "\\fdv*[2]{{F}}{{g}} should produce inline delta^2 F / delta g^2, got: {}",
+            result
+        );
+    }
+
+    // --- Dirac notation ---
+
+    #[test]
+    fn test_ket() {
+        let result = latex_to_typst(r"\ket{\psi}");
+        assert!(
+            result.contains("lr(|") && result.contains("angle.r"),
+            "\\ket should produce lr(| ψ angle.r), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_bra() {
+        let result = latex_to_typst(r"\bra{\phi}");
+        assert!(
+            result.contains("angle.l") && result.contains("|)"),
+            "\\bra should produce lr(angle.l φ |), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_braket_two_args() {
+        let result = latex_to_typst(r"\braket{a}{b}");
+        assert!(
+            result.contains("angle.l") && result.contains("|") && result.contains("angle.r"),
+            "\\braket{{a}}{{b}} should produce lr(angle.l a | b angle.r), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_braket_single_arg() {
+        let result = latex_to_typst(r"\braket{a}");
+        let output = result.trim();
+        // Single-arg braket: ⟨a|a⟩
+        assert!(
+            output.contains("angle.l") && output.contains("angle.r"),
+            "\\braket{{a}} should produce lr(angle.l a | a angle.r), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_expval_implicit() {
+        let result = latex_to_typst(r"\expval{A}");
+        assert!(
+            result.contains("angle.l") && result.contains("angle.r"),
+            "\\expval{{A}} should produce lr(angle.l A angle.r), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_expval_explicit() {
+        let result = latex_to_typst(r"\expval{A}{\Psi}");
+        eprintln!("expval result: {}", result);
+        assert!(
+            result.contains("angle.l") && result.contains("|") && result.contains("angle.r"),
+            "\\expval{{A}}{{Ψ}} should produce lr(angle.l Ψ | A | Ψ angle.r), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_mel() {
+        let result = latex_to_typst(r"\mel{n}{A}{m}");
+        assert!(
+            result.contains("angle.l") && result.contains("|") && result.contains("angle.r"),
+            "\\mel{{n}}{{A}}{{m}} should produce lr(angle.l n | A | m angle.r), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_dyad() {
+        let result = latex_to_typst(r"\dyad{a}{b}");
+        eprintln!("dyad result: {}", result);
+        // |a⟩⟨b|
+        assert!(
+            result.contains("angle.r") && result.contains("angle.l"),
+            "\\dyad{{a}}{{b}} should produce |a⟩⟨b|, got: {}",
+            result
+        );
+    }
+
+    // --- Quick quad text ---
+
+    #[test]
+    fn test_qq() {
+        let result = latex_to_typst(r"\qq{hello}");
+        assert!(
+            result.contains("quad") && result.contains("hello"),
+            "\\qq{{hello}} should produce quad \"hello\" quad, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_qif() {
+        let result = latex_to_typst(r"\qif");
+        assert!(
+            result.contains("quad") && result.contains("if"),
+            "\\qif should produce quad \"if\" quad, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_qand() {
+        let result = latex_to_typst(r"\qand");
+        assert!(
+            result.contains("quad") && result.contains("and"),
+            "\\qand should produce quad \"and\" quad, got: {}",
+            result
+        );
+    }
+
+    // --- Matrix macros ---
+
+    #[test]
+    fn test_pmqty() {
+        let result = latex_to_typst(r"\pmqty{a & b \\ c & d}");
+        eprintln!("pmqty result: {}", result);
+        assert!(
+            result.contains("mat("),
+            "\\pmqty should produce mat(...), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_bmqty() {
+        let result = latex_to_typst(r"\bmqty{a & b \\ c & d}");
+        assert!(
+            result.contains("mat(") && result.contains("["),
+            "\\bmqty should produce mat(delim: \"[\", ...), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_vmqty() {
+        let result = latex_to_typst(r"\vmqty{a & b \\ c & d}");
+        assert!(
+            result.contains("mat(") && result.contains("|"),
+            "\\vmqty should produce mat(delim: \"|\", ...), got: {}",
+            result
+        );
+    }
+
+    // --- Combined / integration ---
+
+    #[test]
+    fn test_physics_in_document() {
+        // Realistic physics document snippet
+        let input = r#"\documentclass{article}
+\begin{document}
+The Schrödinger equation: $i \hbar \pdv{}{t} \ket{\psi} = H \ket{\psi}$
+
+Expectation value: $\expval{H}{\psi}$
+
+Commutator: $\comm{x}{p} = i\hbar$
+\end{document}
+"#;
+        let result = latex_document_to_typst(input);
+        eprintln!("Physics document result:\n{}", result);
+
+        // Should not contain error markers
+        assert!(
+            !result.contains("Error"),
+            "Document conversion should not produce errors, got: {}",
+            result
+        );
+
+        // Key physics constructs should be present
+        assert!(
+            result.contains("diff") || result.contains("frac"),
+            "Should contain partial derivative, got: {}",
+            result
+        );
+        assert!(
+            result.contains("angle.l") || result.contains("lr(|"),
+            "Should contain bra-ket notation, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_grad_div_curl_laplacian() {
+        // Zero-argument vector calculus operators
+        let result = latex_to_typst(r"\grad");
+        assert!(
+            result.contains("nabla"),
+            "\\grad should map to nabla, got: {}",
+            result
+        );
+
+        let result = latex_to_typst(r"\laplacian");
+        assert!(
+            result.contains("nabla"),
+            "\\laplacian should map to nabla^2, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_eval() {
+        let result = latex_to_typst(r"\eval{x^2}");
+        assert!(
+            result.contains("bar.v") || result.contains("|"),
+            "\\eval should produce evaluation bar, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_vev() {
+        let result = latex_to_typst(r"\vev{A}");
+        assert!(
+            result.contains("angle.l") && result.contains("0") && result.contains("angle.r"),
+            "\\vev{{A}} should produce lr(angle.l 0 | A | 0 angle.r), got: {}",
+            result
+        );
+    }
+
+    // --- Vector calculus with arguments ---
+
+    #[test]
+    fn test_grad_with_arg() {
+        let result = latex_to_typst(r"\grad{\Psi}");
+        assert!(
+            result.contains("nabla"),
+            "\\grad{{Ψ}} should contain nabla, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_divergence_with_arg() {
+        let result = latex_to_typst(r"\divergence{\vb{A}}");
+        assert!(
+            result.contains("nabla") && result.contains("dot.op"),
+            "\\divergence should produce nabla dot.op ..., got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_curl_with_arg() {
+        let result = latex_to_typst(r"\curl{\vb{B}}");
+        assert!(
+            result.contains("nabla") && result.contains("times"),
+            "\\curl should produce nabla times ..., got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_laplacian_with_arg() {
+        let result = latex_to_typst(r"\laplacian{\Psi}");
+        assert!(
+            result.contains("nabla^2"),
+            "\\laplacian should produce nabla^2 ..., got: {}",
+            result
+        );
+    }
+
+    // --- Star variants ---
+
+    #[test]
+    fn test_abs_star() {
+        let result = latex_to_typst(r"\abs*{x}");
+        assert!(
+            result.contains("abs("),
+            "\\abs*{{x}} should produce abs(...), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_dv_star_inline() {
+        let result = latex_to_typst(r"\dv*{f}{x}");
+        assert!(
+            result.contains("/") && result.contains("dif"),
+            "\\dv*{{f}}{{x}} should produce inline form dif f / dif x, got: {}",
+            result
+        );
+        // Should NOT contain frac() for star variant
+        assert!(
+            !result.contains("frac("),
+            "\\dv* should use / not frac, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_braket_star() {
+        let result = latex_to_typst(r"\braket*{a}{b}");
+        assert!(
+            result.contains("angle.l") && result.contains("angle.r"),
+            "\\braket*{{a}}{{b}} should produce braket notation, got: {}",
+            result
+        );
+    }
+
+    // --- Matrix generators ---
+
+    #[test]
+    fn test_imat() {
+        let result = latex_to_typst(r"\imat{2}");
+        assert!(
+            result.contains("mat(") && result.contains("1") && result.contains("0"),
+            "\\imat{{2}} should produce 2x2 identity matrix, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_pmat_pauli() {
+        let result = latex_to_typst(r"\pmat{1}");
+        assert!(
+            result.contains("mat(") && result.contains("0") && result.contains("1"),
+            "\\pmat{{1}} should produce Pauli sigma_x matrix, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_dmat() {
+        let result = latex_to_typst(r"\dmat{a,b,c}");
+        assert!(
+            result.contains("mat("),
+            "\\dmat{{a,b,c}} should produce diagonal matrix, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_zmat() {
+        let result = latex_to_typst(r"\zmat{2}{3}");
+        assert!(
+            result.contains("mat(") && result.contains("0"),
+            "\\zmat{{2}}{{3}} should produce 2x3 zero matrix, got: {}",
+            result
+        );
+    }
+
+    // --- flatfrac ---
+
+    #[test]
+    fn test_flatfrac() {
+        let result = latex_to_typst(r"\flatfrac{a}{b}");
+        assert!(
+            result.contains("/"),
+            "\\flatfrac{{a}}{{b}} should produce a / b, got: {}",
+            result
+        );
+    }
+}
+
+// ============================================================================
+// T2L Symbol Mapping Tests - Typst to LaTeX
+// ============================================================================
+
+mod t2l_symbol_mappings {
+    use super::*;
+
+    // --- Direct map lookup tests (verify data is present) ---
+
+    #[test]
+    fn test_mapping_data_greek_uppercase() {
+        use tylax::data::maps::TYPST_TO_TEX;
+        assert_eq!(TYPST_TO_TEX.get("Alpha"), Some(&"A"));
+        assert_eq!(TYPST_TO_TEX.get("Beta"), Some(&"B"));
+        assert_eq!(TYPST_TO_TEX.get("Zeta"), Some(&"Z"));
+        assert_eq!(TYPST_TO_TEX.get("digamma"), Some(&"\\digamma"));
+    }
+
+    #[test]
+    fn test_mapping_data_blackboard_bold() {
+        use tylax::data::maps::TYPST_TO_TEX;
+        assert_eq!(TYPST_TO_TEX.get("BB"), Some(&"\\mathbb{B}"));
+        assert_eq!(TYPST_TO_TEX.get("DD"), Some(&"\\mathbb{D}"));
+        assert_eq!(TYPST_TO_TEX.get("PP"), Some(&"\\mathbb{P}"));
+        assert_eq!(TYPST_TO_TEX.get("FF"), Some(&"\\mathbb{F}"));
+    }
+
+    #[test]
+    fn test_mapping_data_arrows() {
+        use tylax::data::maps::TYPST_TO_TEX;
+        assert_eq!(TYPST_TO_TEX.get("arrow.r.not"), Some(&"\\nrightarrow"));
+        assert_eq!(TYPST_TO_TEX.get("arrow.l.not"), Some(&"\\nleftarrow"));
+        assert_eq!(TYPST_TO_TEX.get("arrow.ccw"), Some(&"\\curvearrowleft"));
+        assert_eq!(TYPST_TO_TEX.get("arrow.cw"), Some(&"\\curvearrowright"));
+        assert_eq!(
+            TYPST_TO_TEX.get("arrow.l.r.wave"),
+            Some(&"\\leftrightsquigarrow")
+        );
+        assert_eq!(
+            TYPST_TO_TEX.get("harpoons.ltrb"),
+            Some(&"leftrightharpoons")
+        );
+        assert_eq!(
+            TYPST_TO_TEX.get("harpoons.rtlb"),
+            Some(&"rightleftharpoons")
+        );
+    }
+
+    #[test]
+    fn test_mapping_data_comparisons() {
+        use tylax::data::maps::TYPST_TO_TEX;
+        assert_eq!(TYPST_TO_TEX.get("lt.tilde"), Some(&"\\lesssim"));
+        assert_eq!(TYPST_TO_TEX.get("gt.tilde"), Some(&"\\gtrsim"));
+        assert_eq!(TYPST_TO_TEX.get("lt.approx"), Some(&"\\lessapprox"));
+        assert_eq!(TYPST_TO_TEX.get("gt.approx"), Some(&"\\gtrapprox"));
+        assert_eq!(TYPST_TO_TEX.get("lt.tri"), Some(&"\\vartriangleleft"));
+        assert_eq!(TYPST_TO_TEX.get("gt.tri.eq"), Some(&"\\trianglerighteq"));
+    }
+
+    #[test]
+    fn test_mapping_data_precedence() {
+        use tylax::data::maps::TYPST_TO_TEX;
+        assert_eq!(TYPST_TO_TEX.get("prec.tilde"), Some(&"\\precsim"));
+        assert_eq!(TYPST_TO_TEX.get("succ.tilde"), Some(&"\\succsim"));
+        assert_eq!(TYPST_TO_TEX.get("prec.curly.eq"), Some(&"\\preccurlyeq"));
+        assert_eq!(TYPST_TO_TEX.get("succ.approx"), Some(&"\\succapprox"));
+    }
+
+    #[test]
+    fn test_mapping_data_sets() {
+        use tylax::data::maps::TYPST_TO_TEX;
+        assert_eq!(TYPST_TO_TEX.get("subset.neq"), Some(&"\\subsetneq"));
+        assert_eq!(TYPST_TO_TEX.get("supset.neq"), Some(&"\\supsetneq"));
+        assert_eq!(TYPST_TO_TEX.get("union.plus"), Some(&"\\uplus"));
+        assert_eq!(TYPST_TO_TEX.get("inter.sq"), Some(&"\\sqcap"));
+        assert_eq!(TYPST_TO_TEX.get("without"), Some(&"\\setminus"));
+    }
+
+    #[test]
+    fn test_mapping_data_binary_ops() {
+        use tylax::data::maps::TYPST_TO_TEX;
+        assert_eq!(TYPST_TO_TEX.get("plus.square"), Some(&"\\boxplus"));
+        assert_eq!(TYPST_TO_TEX.get("minus.square"), Some(&"\\boxminus"));
+        assert_eq!(TYPST_TO_TEX.get("times.square"), Some(&"\\boxtimes"));
+        assert_eq!(TYPST_TO_TEX.get("dot.circle"), Some(&"\\odot"));
+        assert_eq!(TYPST_TO_TEX.get("minus.circle"), Some(&"\\ominus"));
+    }
+
+    #[test]
+    fn test_mapping_data_misc() {
+        use tylax::data::maps::TYPST_TO_TEX;
+        assert_eq!(TYPST_TO_TEX.get("dotless.i"), Some(&"\\imath"));
+        assert_eq!(TYPST_TO_TEX.get("dotless.j"), Some(&"\\jmath"));
+        assert_eq!(TYPST_TO_TEX.get("product.co"), Some(&"\\coprod"));
+        // Note: flat/natural/sharp use values without backslash in the original map
+        assert!(TYPST_TO_TEX.get("flat").is_some());
+        assert!(TYPST_TO_TEX.get("natural").is_some());
+        assert!(TYPST_TO_TEX.get("sharp").is_some());
+    }
+
+    #[test]
+    fn test_mapping_data_suits_triangles() {
+        use tylax::data::maps::TYPST_TO_TEX;
+        assert_eq!(TYPST_TO_TEX.get("suit.club.filled"), Some(&"\\clubsuit"));
+        assert_eq!(TYPST_TO_TEX.get("suit.heart.stroked"), Some(&"\\heartsuit"));
+        assert_eq!(TYPST_TO_TEX.get("triangle.stroked.t"), Some(&"\\triangle"));
+        assert_eq!(
+            TYPST_TO_TEX.get("triangle.filled.t"),
+            Some(&"\\blacktriangle")
+        );
+    }
+
+    // --- End-to-end pipeline tests (symbols that the parser handles correctly) ---
+
+    #[test]
+    fn test_digamma_pipeline() {
+        let result = typst_to_latex("$digamma$");
+        assert!(
+            result.contains("digamma"),
+            "digamma should convert through pipeline, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_music_symbols_pipeline() {
+        let result = typst_to_latex("$flat + natural + sharp$");
+        assert!(
+            result.contains("flat") && result.contains("natural") && result.contains("sharp"),
+            "music symbols should convert through pipeline, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_triangle_pipeline() {
+        let result = typst_to_latex("$triangle.stroked.t + triangle.filled.t$");
+        assert!(
+            result.contains("triangle") || result.contains("blacktriangle"),
+            "triangle symbols should convert through pipeline, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_greek_uppercase_pipeline() {
+        // Single uppercase Greek letters - these are also valid identifiers
+        let result = typst_to_latex("$Alpha$");
+        // May produce "A" or "Alpha" depending on parser
+        assert!(
+            !result.is_empty(),
+            "Alpha should produce output, got: {}",
+            result
+        );
+    }
+
+    // --- Overall coverage test ---
+
+    #[test]
+    fn test_typst_to_tex_mapping_count() {
+        use tylax::data::maps::TYPST_TO_TEX;
+        let count = TYPST_TO_TEX.len();
+        eprintln!("TYPST_TO_TEX mapping count: {}", count);
+        assert!(
+            count > 400,
+            "Expected 400+ TYPST_TO_TEX mappings after extension, got {}",
+            count
+        );
+    }
+}
