@@ -1087,7 +1087,17 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             if is_starred {
                 // Inline form: \pdv*{f}{x} → diff f slash diff x
                 match (opt_n, arg2, arg3) {
-                    (_, Some(x), Some(y)) => {
+                    (Some(n), Some(x), Some(y)) => {
+                        let _ = write!(
+                            output,
+                            "diff^{} {} / diff {} diff {} ",
+                            n.trim(),
+                            arg1.trim(),
+                            x.trim(),
+                            y.trim()
+                        );
+                    }
+                    (None, Some(x), Some(y)) => {
                         let _ = write!(
                             output,
                             "diff^2 {} / diff {} diff {} ",
@@ -1115,7 +1125,14 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 }
             } else {
                 match (opt_n, arg2, arg3) {
-                    (_, Some(x), Some(y)) => {
+                    (Some(n), Some(x), Some(y)) => {
+                        let _ = write!(
+                            output,
+                            "frac(diff^{} {}, diff {} diff {}) ",
+                            n.trim(), arg1.trim(), x.trim(), y.trim()
+                        );
+                    }
+                    (None, Some(x), Some(y)) => {
                         let _ = write!(
                             output,
                             "frac(diff^2 {}, diff {} diff {}) ",

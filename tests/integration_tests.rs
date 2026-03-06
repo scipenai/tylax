@@ -2140,6 +2140,16 @@ mod physics_package {
     }
 
     #[test]
+    fn test_pdv_mixed_partial_with_optional_order() {
+        let result = latex_to_typst(r"\pdv[3]{f}{x}{y}");
+        assert!(
+            result.contains("diff^3") && result.contains("diff x") && result.contains("diff y"),
+            "\\pdv[3]{{f}}{{x}}{{y}} should preserve the requested order, got: {}",
+            result
+        );
+    }
+
+    #[test]
     fn test_fdv() {
         let result = latex_to_typst(r"\fdv{F}{g}");
         assert!(
