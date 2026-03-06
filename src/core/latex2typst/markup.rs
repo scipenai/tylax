@@ -841,6 +841,695 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             let _ = write!(output, "${}°$", angle);
         }
 
+        // =====================================================================
+        // physics package commands
+        // =====================================================================
+
+        // --- Automatic bracing ---
+        "pqty" => {
+            // \pqty{x} → lr((x))  -- auto-sized parentheses
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(output, "lr(({}))", content.trim());
+            }
+        }
+        "bqty" => {
+            // \bqty{x} → lr([x])  -- auto-sized brackets
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(output, "lr([{}])", content.trim());
+            }
+        }
+        "Bqty" => {
+            // \Bqty{x} → lr({x})  -- auto-sized braces
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(output, "lr({{ {} }})", content.trim());
+            }
+        }
+        "vqty" => {
+            // \vqty{x} → abs(x)  -- auto-sized vertical bars
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(output, "abs({})", content.trim());
+            }
+        }
+        "abs" | "absolutevalue" | "abs*" => {
+            // \abs{x} → abs(x)   \abs*{x} → abs(x)  (star = no auto-resize, ignored in Typst)
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(output, "abs({})", content.trim());
+            }
+        }
+        "norm" | "norm*" => {
+            // \norm{x} → norm(x)
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(output, "norm({})", content.trim());
+            }
+        }
+        "eval" | "evaluated" | "eval*" => {
+            // \eval{x}_a^b → lr(x |)_a^b
+            // Simplified: output the content with a right vertical bar
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(output, "lr(. {} bar.v)", content.trim());
+            }
+        }
+        "order" => {
+            // \order{x^2} → cal(O)(x^2)
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(output, "cal(O) lr(({})) ", content.trim());
+            }
+        }
+        "comm" | "commutator" | "comm*" => {
+            // \comm{A}{B} → [A, B]
+            let a = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let b = conv.convert_required_arg(&cmd, 1).unwrap_or_default();
+            let _ = write!(output, "lr([{}, {}])", a.trim(), b.trim());
+        }
+        "acomm" | "acommutator" | "anticommutator" | "acomm*"
+        | "pb" | "poissonbracket" | "pb*" => {
+            // \acomm{A}{B} → {A, B}
+            let a = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let b = conv.convert_required_arg(&cmd, 1).unwrap_or_default();
+            let _ = write!(output, "lr({{ {}, {} }})", a.trim(), b.trim());
+        }
+
+        // --- Vector notation ---
+        "vb" | "vectorbold" => {
+            // \vb{a} → bold(a)   \vb*{a} → bold(italic(a))
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(output, "bold({})", content.trim());
+            }
+        }
+        "va" | "vectorarrow" => {
+            // \va{a} → accent(bold(a), arrow.r)
+            // Use arrow.r to match T2L's accent() recognition (arrow.r → \overrightarrow)
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(output, "accent(bold({}), arrow.r)", content.trim());
+            }
+        }
+        "vu" | "vectorunit" => {
+            // \vu{a} → accent(bold(a), hat)
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(output, "accent(bold({}), hat)", content.trim());
+            }
+        }
+
+        // --- Vector calculus operators (with optional argument) ---
+        "grad" | "gradient" => {
+            // \grad → nabla    \grad{Ψ} → nabla Ψ
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let c = content.trim();
+                if c.is_empty() {
+                    output.push_str("nabla ");
+                } else {
+                    let _ = write!(output, "nabla {} ", c);
+                }
+            } else {
+                output.push_str("nabla ");
+            }
+        }
+        "divergence" => {
+            // \divergence → nabla dot.op   \divergence{A} → nabla dot.op A
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let c = content.trim();
+                if c.is_empty() {
+                    output.push_str("nabla dot.op ");
+                } else {
+                    let _ = write!(output, "nabla dot.op {} ", c);
+                }
+            } else {
+                output.push_str("nabla dot.op ");
+            }
+        }
+        "curl" => {
+            // \curl → nabla times   \curl{A} → nabla times A
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let c = content.trim();
+                if c.is_empty() {
+                    output.push_str("nabla times ");
+                } else {
+                    let _ = write!(output, "nabla times {} ", c);
+                }
+            } else {
+                output.push_str("nabla times ");
+            }
+        }
+        "laplacian" => {
+            // \laplacian → nabla^2   \laplacian{Ψ} → nabla^2 Ψ
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let c = content.trim();
+                if c.is_empty() {
+                    output.push_str("nabla^2 ");
+                } else {
+                    let _ = write!(output, "nabla^2 {} ", c);
+                }
+            } else {
+                output.push_str("nabla^2 ");
+            }
+        }
+
+        // --- Inline fraction ---
+        "flatfrac" => {
+            // \flatfrac{a}{b} → a / b (inline form)
+            let a = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let b = conv.convert_required_arg(&cmd, 1).unwrap_or_default();
+            let _ = write!(output, "{} / {} ", a.trim(), b.trim());
+        }
+
+        // --- Derivatives ---
+        "dd" | "differential" => {
+            // \dd → d (upright)
+            // \dd{x} → dif x  (with argument)
+            // \dd[n]{x} → dif^n x
+            let opt_n = conv.get_optional_arg(&cmd, 0);
+            let arg = conv.convert_required_arg(&cmd, 0);
+            match (opt_n, arg) {
+                (Some(n), Some(x)) => {
+                    let _ = write!(output, "dif^{} {} ", n.trim(), x.trim());
+                }
+                (None, Some(x)) => {
+                    let _ = write!(output, "dif {} ", x.trim());
+                }
+                _ => {
+                    output.push_str("dif ");
+                }
+            }
+        }
+        "dv" | "derivative" | "dv*" => {
+            // \dv{f}{x} → frac(dif f, dif x)
+            // \dv*{f}{x} → dif f slash dif x  (inline form)
+            let is_starred = base_name.ends_with('*');
+            let opt_n = conv.get_optional_arg(&cmd, 0);
+            let arg1 = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let arg2 = conv.convert_required_arg(&cmd, 1);
+            if is_starred {
+                // Inline form: \dv*{f}{x} → dif f slash dif x
+                if let Some(n) = opt_n {
+                    match arg2 {
+                        Some(x) => {
+                            let _ = write!(
+                                output,
+                                "dif^{} {} / dif {}^{} ",
+                                n.trim(),
+                                arg1.trim(),
+                                x.trim(),
+                                n.trim()
+                            );
+                        }
+                        None => {
+                            let _ = write!(
+                                output,
+                                "dif^{} / dif {}^{} ",
+                                n.trim(),
+                                arg1.trim(),
+                                n.trim()
+                            );
+                        }
+                    }
+                } else {
+                    match arg2 {
+                        Some(x) => {
+                            let _ = write!(output, "dif {} / dif {} ", arg1.trim(), x.trim());
+                        }
+                        None => {
+                            let _ = write!(output, "dif / dif {} ", arg1.trim());
+                        }
+                    }
+                }
+            } else {
+                match (opt_n, arg2) {
+                    (Some(n), Some(x)) => {
+                        let _ = write!(
+                            output,
+                            "frac(dif^{} {}, dif {}^{}) ",
+                            n.trim(), arg1.trim(), x.trim(), n.trim()
+                        );
+                    }
+                    (None, Some(x)) => {
+                        let _ = write!(
+                            output,
+                            "frac(dif {}, dif {}) ",
+                            arg1.trim(), x.trim()
+                        );
+                    }
+                    _ => {
+                        let _ = write!(
+                            output,
+                            "frac(dif, dif {}) ",
+                            arg1.trim()
+                        );
+                    }
+                }
+            }
+        }
+        "pdv" | "pderivative" | "partialderivative" | "pdv*" => {
+            let is_starred = base_name.ends_with('*');
+            let opt_n = conv.get_optional_arg(&cmd, 0);
+            let arg1 = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let arg2 = conv.convert_required_arg(&cmd, 1);
+            let arg3 = conv.convert_required_arg(&cmd, 2);
+            if is_starred {
+                // Inline form: \pdv*{f}{x} → diff f slash diff x
+                match (opt_n, arg2, arg3) {
+                    (_, Some(x), Some(y)) => {
+                        let _ = write!(
+                            output,
+                            "diff^2 {} / diff {} diff {} ",
+                            arg1.trim(),
+                            x.trim(),
+                            y.trim()
+                        );
+                    }
+                    (Some(n), Some(x), None) => {
+                        let _ = write!(
+                            output,
+                            "diff^{} {} / diff {}^{} ",
+                            n.trim(),
+                            arg1.trim(),
+                            x.trim(),
+                            n.trim()
+                        );
+                    }
+                    (None, Some(x), None) => {
+                        let _ = write!(output, "diff {} / diff {} ", arg1.trim(), x.trim());
+                    }
+                    _ => {
+                        let _ = write!(output, "diff / diff {} ", arg1.trim());
+                    }
+                }
+            } else {
+                match (opt_n, arg2, arg3) {
+                    (_, Some(x), Some(y)) => {
+                        let _ = write!(
+                            output,
+                            "frac(diff^2 {}, diff {} diff {}) ",
+                            arg1.trim(), x.trim(), y.trim()
+                        );
+                    }
+                    (Some(n), Some(x), None) => {
+                        let _ = write!(
+                            output,
+                            "frac(diff^{} {}, diff {}^{}) ",
+                            n.trim(), arg1.trim(), x.trim(), n.trim()
+                        );
+                    }
+                    (None, Some(x), None) => {
+                        let _ = write!(
+                            output,
+                            "frac(diff {}, diff {}) ",
+                            arg1.trim(), x.trim()
+                        );
+                    }
+                    _ => {
+                        let _ = write!(
+                            output,
+                            "frac(diff, diff {}) ",
+                            arg1.trim()
+                        );
+                    }
+                }
+            }
+        }
+        "fdv" | "fderivative" | "functionalderivative" | "fdv*" => {
+            let is_starred = base_name.ends_with('*');
+            let opt_n = conv.get_optional_arg(&cmd, 0);
+            let arg1 = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let arg2 = conv.convert_required_arg(&cmd, 1);
+            if is_starred {
+                if let Some(n) = opt_n {
+                    match arg2 {
+                        Some(g) => {
+                            let _ = write!(
+                                output,
+                                "delta^{} {} / delta {}^{} ",
+                                n.trim(),
+                                arg1.trim(),
+                                g.trim(),
+                                n.trim()
+                            );
+                        }
+                        None => {
+                            let _ = write!(
+                                output,
+                                "delta^{} / delta {}^{} ",
+                                n.trim(),
+                                arg1.trim(),
+                                n.trim()
+                            );
+                        }
+                    }
+                } else {
+                    match arg2 {
+                        Some(g) => {
+                            let _ = write!(output, "delta {} / delta {} ", arg1.trim(), g.trim());
+                        }
+                        None => {
+                            let _ = write!(output, "delta / delta {} ", arg1.trim());
+                        }
+                    }
+                }
+            } else {
+                if let Some(n) = opt_n {
+                    match arg2 {
+                        Some(g) => {
+                            let _ = write!(
+                                output,
+                                "frac(delta^{} {}, delta {}^{}) ",
+                                n.trim(),
+                                arg1.trim(),
+                                g.trim(),
+                                n.trim()
+                            );
+                        }
+                        None => {
+                            let _ = write!(
+                                output,
+                                "frac(delta^{}, delta {}^{}) ",
+                                n.trim(),
+                                arg1.trim(),
+                                n.trim()
+                            );
+                        }
+                    }
+                } else {
+                    match arg2 {
+                        Some(g) => {
+                            let _ = write!(
+                                output,
+                                "frac(delta {}, delta {}) ",
+                                arg1.trim(),
+                                g.trim()
+                            );
+                        }
+                        None => {
+                            let _ = write!(output, "frac(delta, delta {}) ", arg1.trim());
+                        }
+                    }
+                }
+            }
+        }
+        "var" | "variation" => {
+            // \var{F[g]} → delta F[g]
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(output, "delta {} ", content.trim());
+            } else {
+                output.push_str("delta ");
+            }
+        }
+
+        // --- Dirac bra-ket notation ---
+        "ket" | "ket*" => {
+            // \ket{ψ} → lr(| ψ ⟩)
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(output, "lr(| {} angle.r)", content.trim());
+            }
+        }
+        "bra" | "bra*" => {
+            // \bra{ψ} → lr(⟨ ψ |)
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(output, "lr(angle.l {} |)", content.trim());
+            }
+        }
+        "braket" | "innerproduct" | "ip" | "braket*" => {
+            // \braket{a}{b} → lr(⟨ a | b ⟩)
+            // \braket{a} → lr(⟨ a | a ⟩)
+            let a = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let b = conv.convert_required_arg(&cmd, 1);
+            match b {
+                Some(b) => {
+                    let _ = write!(
+                        output,
+                        "lr(angle.l {} | {} angle.r)",
+                        a.trim(), b.trim()
+                    );
+                }
+                None => {
+                    let a_trimmed = a.trim();
+                    let _ = write!(
+                        output,
+                        "lr(angle.l {} | {} angle.r)",
+                        a_trimmed, a_trimmed
+                    );
+                }
+            }
+        }
+        "dyad" | "outerproduct" | "ketbra" | "op" | "dyad*" => {
+            // \dyad{a}{b} → lr(| a ⟩) lr(⟨ b |)
+            // \dyad{a} → lr(| a ⟩) lr(⟨ a |)
+            let a = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let b = conv.convert_required_arg(&cmd, 1);
+            let b_val = b.as_deref().unwrap_or(a.trim());
+            let _ = write!(
+                output,
+                "lr(| {} angle.r) lr(angle.l {} |)",
+                a.trim(), b_val.trim()
+            );
+        }
+        "expval" | "expectationvalue" | "ev" | "expval*" | "ev*" => {
+            // \expval{A} → lr(⟨ A ⟩)
+            // \expval{A}{Ψ} → lr(⟨ Ψ | A | Ψ ⟩)
+            let op = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let state = conv.convert_required_arg(&cmd, 1);
+            match state {
+                Some(psi) => {
+                    let _ = write!(
+                        output,
+                        "lr(angle.l {} | {} | {} angle.r)",
+                        psi.trim(), op.trim(), psi.trim()
+                    );
+                }
+                None => {
+                    let _ = write!(
+                        output,
+                        "lr(angle.l {} angle.r)",
+                        op.trim()
+                    );
+                }
+            }
+        }
+        "vev" => {
+            // \vev{A} → lr(⟨ 0 | A | 0 ⟩)
+            if let Some(op) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(
+                    output,
+                    "lr(angle.l 0 | {} | 0 angle.r)",
+                    op.trim()
+                );
+            }
+        }
+        "mel" | "matrixelement" | "matrixel" | "mel*" => {
+            // \mel{n}{A}{m} → lr(⟨ n | A | m ⟩)
+            let n = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let a = conv.convert_required_arg(&cmd, 1).unwrap_or_default();
+            let m = conv.convert_required_arg(&cmd, 2).unwrap_or_default();
+            let _ = write!(
+                output,
+                "lr(angle.l {} | {} | {} angle.r)",
+                n.trim(), a.trim(), m.trim()
+            );
+        }
+
+        // --- Quick quad text ---
+        "qq" | "qqtext" => {
+            // \qq{word or phrase} → quad "word or phrase" quad
+            // Use get_required_arg (raw text) since qq content is plain text, not math
+            if let Some(content) = conv.get_required_arg(&cmd, 0) {
+                let _ = write!(output, "quad \"{}\" quad ", content.trim());
+            }
+        }
+        "qc" | "qcomma" => {
+            output.push_str(", quad ");
+        }
+        "qcc" => {
+            output.push_str("quad \"c.c.\" quad ");
+        }
+        "qif" | "qthen" | "qelse" | "qotherwise" | "qunless"
+        | "qgiven" | "qusing" | "qassume" | "qsince" | "qlet"
+        | "qfor" | "qall" | "qeven" | "qodd" | "qinteger"
+        | "qand" | "qor" | "qas" | "qin" => {
+            if let Some(text) = crate::data::physics::get_qq_text(base_name) {
+                let _ = write!(output, "quad \"{}\" quad ", text);
+            }
+        }
+
+        // --- Matrix macros ---
+        "mqty" | "matrixquantity" | "pmqty" => {
+            // \mqty(...) / \pmqty{...} → mat(...)
+            if let Some(content) = conv.get_required_arg(&cmd, 0) {
+                let converted = convert_matrix_body(&content);
+                let _ = write!(output, "mat({})", converted);
+            }
+        }
+        "bmqty" => {
+            // \bmqty{...} → mat(delim: \"[\", ...)
+            if let Some(content) = conv.get_required_arg(&cmd, 0) {
+                let converted = convert_matrix_body(&content);
+                let _ = write!(output, "mat(delim: \"[\", {})", converted);
+            }
+        }
+        "vmqty" | "mdet" | "matrixdeterminant" => {
+            // \vmqty{...} / \mdet{...} → mat(delim: \"|\", ...)
+            if let Some(content) = conv.get_required_arg(&cmd, 0) {
+                let converted = convert_matrix_body(&content);
+                let _ = write!(output, "mat(delim: \"|\", {})", converted);
+            }
+        }
+        "Pmqty" => {
+            // \Pmqty{...} → mat(delim: \"(\", ...) (lgroup style - approximate)
+            if let Some(content) = conv.get_required_arg(&cmd, 0) {
+                let converted = convert_matrix_body(&content);
+                let _ = write!(output, "mat(delim: \"(\", {})", converted);
+            }
+        }
+        "smqty" | "smallmatrixquantity" | "spmqty" => {
+            // Small matrix variants → same as mat() (Typst handles sizing)
+            if let Some(content) = conv.get_required_arg(&cmd, 0) {
+                let converted = convert_matrix_body(&content);
+                let _ = write!(output, "mat({})", converted);
+            }
+        }
+        "sbmqty" => {
+            if let Some(content) = conv.get_required_arg(&cmd, 0) {
+                let converted = convert_matrix_body(&content);
+                let _ = write!(output, "mat(delim: \"[\", {})", converted);
+            }
+        }
+        "svmqty" | "smdet" | "smallmatrixdeterminant" => {
+            if let Some(content) = conv.get_required_arg(&cmd, 0) {
+                let converted = convert_matrix_body(&content);
+                let _ = write!(output, "mat(delim: \"|\", {})", converted);
+            }
+        }
+        "sPmqty" => {
+            if let Some(content) = conv.get_required_arg(&cmd, 0) {
+                let converted = convert_matrix_body(&content);
+                let _ = write!(output, "mat(delim: \"(\", {})", converted);
+            }
+        }
+
+        // --- Matrix generators ---
+        "imat" | "identitymatrix" => {
+            // \imat{n} → generate n×n identity matrix
+            let n: usize = conv
+                .get_required_arg(&cmd, 0)
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(2);
+            let mut rows = Vec::new();
+            for i in 0..n {
+                let mut cols = Vec::new();
+                for j in 0..n {
+                    cols.push(if i == j { "1" } else { "0" });
+                }
+                rows.push(cols.join(", "));
+            }
+            let _ = write!(output, "mat({})", rows.join("; "));
+        }
+        "xmat" | "xmatrix" => {
+            // \xmat{x}{n}{m} → n×m matrix filled with x
+            let x = conv.get_required_arg(&cmd, 0).unwrap_or_else(|| "0".into());
+            let n: usize = conv
+                .get_required_arg(&cmd, 1)
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(2);
+            let m: usize = conv
+                .get_required_arg(&cmd, 2)
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(2);
+            let row = vec![x.trim(); m].join(", ");
+            let rows = vec![row; n].join("; ");
+            let _ = write!(output, "mat({})", rows);
+        }
+        "zmat" | "zeromatrix" => {
+            // \zmat{n}{m} → n×m zero matrix (or \zmat{n} → n×n)
+            let n: usize = conv
+                .get_required_arg(&cmd, 0)
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(2);
+            let m: usize = conv
+                .get_required_arg(&cmd, 1)
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(n);
+            let row = vec!["0"; m].join(", ");
+            let rows = vec![row; n].join("; ");
+            let _ = write!(output, "mat({})", rows);
+        }
+        "pmat" | "paulimatrix" => {
+            // \pmat{n} → nth Pauli matrix
+            let idx = conv.get_required_arg(&cmd, 0).unwrap_or_else(|| "0".into());
+            let body = match idx.trim() {
+                "0" => "1, 0; 0, 1",
+                "1" | "x" => "0, 1; 1, 0",
+                "2" | "y" => "0, -i; i, 0",
+                "3" | "z" => "1, 0; 0, -1",
+                _ => "1, 0; 0, 1",
+            };
+            let _ = write!(output, "mat({})", body);
+        }
+        "dmat" | "diagonalmatrix" => {
+            // \dmat{a,b,c} → diagonal matrix
+            if let Some(content) = conv.get_required_arg(&cmd, 0) {
+                let elems: Vec<&str> = content.split(',').map(|s| s.trim()).collect();
+                let n = elems.len();
+                let mut rows = Vec::new();
+                for i in 0..n {
+                    let mut cols = Vec::new();
+                    for j in 0..n {
+                        if i == j {
+                            cols.push(elems[i].to_string());
+                        } else {
+                            cols.push("0".to_string());
+                        }
+                    }
+                    rows.push(cols.join(", "));
+                }
+                let _ = write!(output, "mat({})", rows.join("; "));
+            }
+        }
+        "admat" | "antidiagonalmatrix" => {
+            // \admat{a,b,c} → anti-diagonal matrix
+            if let Some(content) = conv.get_required_arg(&cmd, 0) {
+                let elems: Vec<&str> = content.split(',').map(|s| s.trim()).collect();
+                let n = elems.len();
+                let mut rows = Vec::new();
+                for i in 0..n {
+                    let mut cols = Vec::new();
+                    for j in 0..n {
+                        if i + j == n - 1 {
+                            cols.push(elems[j].to_string());
+                        } else {
+                            cols.push("0".to_string());
+                        }
+                    }
+                    rows.push(cols.join(", "));
+                }
+                let _ = write!(output, "mat({})", rows.join("; "));
+            }
+        }
+
+        // --- Physics operators with braces ---
+        "Res" | "Residue" => {
+            // \Res{f} → op("Res") f   or standalone
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(output, "op(\"Res\") {} ", content.trim());
+            } else {
+                output.push_str("op(\"Res\") ");
+            }
+        }
+        "pv" | "principalvalue" => {
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(output, "cal(P) {} ", content.trim());
+            } else {
+                output.push_str("cal(P) ");
+            }
+        }
+        "PV" => {
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(output, "op(\"P.V.\") {} ", content.trim());
+            } else {
+                output.push_str("op(\"P.V.\") ");
+            }
+        }
+
+        // =====================================================================
+        // End physics package commands
+        // =====================================================================
+
         // Acronym commands - auto (first use = full, subsequent = short)
         "ac" | "gls" | "Ac" | "Gls" => {
             let key = conv.get_required_arg(&cmd, 0).unwrap_or_default();
@@ -1949,6 +2638,25 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
 // =============================================================================
 // Helper functions
 // =============================================================================
+
+/// Convert LaTeX matrix body (& and \\) to Typst matrix syntax (, and ;)
+///
+/// Converts `a & b \\ c & d` → `a, b; c, d`
+fn convert_matrix_body(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '&' => result.push_str(", "),
+            '\\' if chars.peek() == Some(&'\\') => {
+                chars.next(); // consume second backslash
+                result.push_str("; ");
+            }
+            _ => result.push(c),
+        }
+    }
+    result.trim().to_string()
+}
 
 /// Handle \newcommand or \renewcommand
 fn handle_newcommand(conv: &mut LatexConverter, cmd: &CmdItem) {

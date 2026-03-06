@@ -754,6 +754,26 @@ lazy_static! {
         m.insert("implies", "arrow.r.double.long");
         m.insert("to", "arrow.r");
 
+        // === Physics package: zero-argument symbols ===
+        m.insert("divisionsymbol", "div"); // physics renames original \div to \divisionsymbol
+
+        // Dot and cross product symbols
+        m.insert("dotproduct", "dot.op");
+        m.insert("vdot", "dot.op");
+        m.insert("crossproduct", "times");
+        m.insert("cross", "times");
+        m.insert("cp", "times");
+
+        // Physics operators (standalone form — with-arg forms handled in markup.rs)
+        m.insert("trace", "op(\"tr\")");
+        m.insert("Trace", "op(\"Tr\")");
+        m.insert("erf", "op(\"erf\")");
+        m.insert("Residue", "op(\"Res\")");
+
+        // Miscellaneous physics symbols
+        m.insert("varE", "cal(E)");
+        m.insert("ordersymbol", "cal(O)");
+
         m
     };
 }

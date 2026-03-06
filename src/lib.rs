@@ -98,6 +98,7 @@ pub use features::tikz;
 // Re-export symbol data
 pub use data::colors;
 pub use data::extended_symbols;
+pub use data::physics;
 pub use data::siunitx;
 pub use data::symbols;
 
