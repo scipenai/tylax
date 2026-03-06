@@ -2585,9 +2585,18 @@ mod t2l_symbol_mappings {
         assert_eq!(TYPST_TO_TEX.get("arrow.l.not"), Some(&"\\nleftarrow"));
         assert_eq!(TYPST_TO_TEX.get("arrow.ccw"), Some(&"\\curvearrowleft"));
         assert_eq!(TYPST_TO_TEX.get("arrow.cw"), Some(&"\\curvearrowright"));
-        assert_eq!(TYPST_TO_TEX.get("arrow.l.r.wave"), Some(&"\\leftrightsquigarrow"));
-        assert_eq!(TYPST_TO_TEX.get("harpoons.ltrb"), Some(&"leftrightharpoons"));
-        assert_eq!(TYPST_TO_TEX.get("harpoons.rtlb"), Some(&"rightleftharpoons"));
+        assert_eq!(
+            TYPST_TO_TEX.get("arrow.l.r.wave"),
+            Some(&"\\leftrightsquigarrow")
+        );
+        assert_eq!(
+            TYPST_TO_TEX.get("harpoons.ltrb"),
+            Some(&"leftrightharpoons")
+        );
+        assert_eq!(
+            TYPST_TO_TEX.get("harpoons.rtlb"),
+            Some(&"rightleftharpoons")
+        );
     }
 
     #[test]
@@ -2648,7 +2657,10 @@ mod t2l_symbol_mappings {
         assert_eq!(TYPST_TO_TEX.get("suit.club.filled"), Some(&"\\clubsuit"));
         assert_eq!(TYPST_TO_TEX.get("suit.heart.stroked"), Some(&"\\heartsuit"));
         assert_eq!(TYPST_TO_TEX.get("triangle.stroked.t"), Some(&"\\triangle"));
-        assert_eq!(TYPST_TO_TEX.get("triangle.filled.t"), Some(&"\\blacktriangle"));
+        assert_eq!(
+            TYPST_TO_TEX.get("triangle.filled.t"),
+            Some(&"\\blacktriangle")
+        );
     }
 
     // --- End-to-end pipeline tests (symbols that the parser handles correctly) ---

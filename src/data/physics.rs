@@ -37,7 +37,10 @@ pub const QQ_COMMANDS: &[(&str, &str)] = &[
 
 /// Check if a command name is a physics quick-quad command
 pub fn get_qq_text(name: &str) -> Option<&'static str> {
-    QQ_COMMANDS.iter().find(|(k, _)| *k == name).map(|(_, v)| *v)
+    QQ_COMMANDS
+        .iter()
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| *v)
 }
 
 /// Check if a command is a physics package command that needs special handling

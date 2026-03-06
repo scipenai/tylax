@@ -1201,42 +1201,40 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                         }
                     }
                 }
-            } else {
-                if let Some(n) = opt_n {
-                    match arg2 {
-                        Some(g) => {
-                            let _ = write!(
-                                output,
-                                "frac(delta^{} {}, delta {}^{}) ",
-                                n.trim(),
-                                arg1.trim(),
-                                g.trim(),
-                                n.trim()
-                            );
-                        }
-                        None => {
-                            let _ = write!(
-                                output,
-                                "frac(delta^{}, delta {}^{}) ",
-                                n.trim(),
-                                arg1.trim(),
-                                n.trim()
-                            );
-                        }
+            } else if let Some(n) = opt_n {
+                match arg2 {
+                    Some(g) => {
+                        let _ = write!(
+                            output,
+                            "frac(delta^{} {}, delta {}^{}) ",
+                            n.trim(),
+                            arg1.trim(),
+                            g.trim(),
+                            n.trim()
+                        );
                     }
-                } else {
-                    match arg2 {
-                        Some(g) => {
-                            let _ = write!(
-                                output,
-                                "frac(delta {}, delta {}) ",
-                                arg1.trim(),
-                                g.trim()
-                            );
-                        }
-                        None => {
-                            let _ = write!(output, "frac(delta, delta {}) ", arg1.trim());
-                        }
+                    None => {
+                        let _ = write!(
+                            output,
+                            "frac(delta^{}, delta {}^{}) ",
+                            n.trim(),
+                            arg1.trim(),
+                            n.trim()
+                        );
+                    }
+                }
+            } else {
+                match arg2 {
+                    Some(g) => {
+                        let _ = write!(
+                            output,
+                            "frac(delta {}, delta {}) ",
+                            arg1.trim(),
+                            g.trim()
+                        );
+                    }
+                    None => {
+                        let _ = write!(output, "frac(delta, delta {}) ", arg1.trim());
                     }
                 }
             }
@@ -1484,11 +1482,11 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 let elems: Vec<&str> = content.split(',').map(|s| s.trim()).collect();
                 let n = elems.len();
                 let mut rows = Vec::new();
-                for i in 0..n {
+                for (i, elem) in elems.iter().enumerate() {
                     let mut cols = Vec::new();
                     for j in 0..n {
                         if i == j {
-                            cols.push(elems[i].to_string());
+                            cols.push((*elem).to_string());
                         } else {
                             cols.push("0".to_string());
                         }
@@ -1506,9 +1504,9 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 let mut rows = Vec::new();
                 for i in 0..n {
                     let mut cols = Vec::new();
-                    for j in 0..n {
+                    for (j, elem) in elems.iter().enumerate() {
                         if i + j == n - 1 {
-                            cols.push(elems[j].to_string());
+                            cols.push((*elem).to_string());
                         } else {
                             cols.push("0".to_string());
                         }
