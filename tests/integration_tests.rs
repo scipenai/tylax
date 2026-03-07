@@ -1543,7 +1543,7 @@ mod engine_edge_cases {
         // Unknown function should not crash in compat mode
         let input = r#"#totally_undefined_function(1, 2, 3)"#;
         let result = typst_to_latex_with_eval(input, &T2LOptions::default());
-        // Should not panic - result may be empty or contain fallback
+        // Should not panic - result may be empty or contain a best-effort result
         // The key is it doesn't crash
         let _ = result;
     }
@@ -1869,7 +1869,7 @@ mod t2l_lr_delimiters {
     }
 
     #[test]
-    fn test_lr_no_delimiter_fallback() {
+    fn test_lr_no_delimiter_uses_default_parentheses() {
         // When lr() has no recognizable delimiters, should use default ()
         let result = typst_to_latex("$lr(x + y)$");
         assert!(
@@ -1967,7 +1967,7 @@ mod t2l_lr_delimiters {
         let result = typst_to_latex("$lr((x+y), size: 2em)$");
         assert!(
             result.contains("\\left(") && result.contains("\\right)"),
-            "Unsupported size units should fall back to legacy auto sizing, got: {}",
+            "Unsupported size units should fall back to auto sizing, got: {}",
             result
         );
         assert!(
@@ -2199,6 +2199,544 @@ mod t2l_named_args {
             !result.contains("style:"),
             "style named arg leaked: {}",
             result
+        );
+    }
+}
+
+// ============================================================================
+// Escaped punctuation regressions - Typst to LaTeX
+// ============================================================================
+
+mod t2l_escaped_punctuation {
+    use super::*;
+
+    #[test]
+    fn test_cases_escaped_comma_is_literal_comma() {
+        let typst = "$delta[n]=cases(1\\, space n=0, 0\\, space n eq.not 0)$";
+        let result = typst_to_latex_with_options(typst, &T2LOptions::default());
+
+        assert!(
+            result.contains("1 , \\ n = 0") || result.contains("1, \\ n = 0"),
+            "escaped comma should become a literal comma, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("1 \\, \\ n = 0") && !result.contains("0 \\, \\ n \\neq 0"),
+            "escaped comma should not become LaTeX thin space, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_plain_math_escaped_punctuation_is_literal() {
+        let result = typst_to_latex_with_options("$x\\, y\\: z\\; w$", &T2LOptions::default());
+
+        assert!(
+            result.contains("x, y: z; w"),
+            "escaped punctuation should stay literal, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("\\,") && !result.contains("\\:") && !result.contains("\\;"),
+            "escaped punctuation should not become spacing commands, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_lr_escaped_comma_is_literal() {
+        let result =
+            typst_to_latex_with_options("$lr(angle.l x\\, y angle.r)$", &T2LOptions::default());
+
+        assert!(
+            result.contains("x, y"),
+            "escaped comma should remain literal inside lr(), got: {}",
+            result
+        );
+        assert!(
+            !result.contains("\\,"),
+            "escaped comma inside lr() should not become thin space, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_matrix_escaped_punctuation_is_literal() {
+        let result = typst_to_latex_with_options("$mat(1\\, 2; 3\\; 4)$", &T2LOptions::default());
+
+        assert!(
+            result.contains("1, 2"),
+            "escaped comma should remain literal inside matrix cells, got: {}",
+            result
+        );
+        assert!(
+            result.contains("3; 4"),
+            "escaped semicolon should remain literal inside matrix cells, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("\\,") && !result.contains("\\;"),
+            "escaped punctuation inside matrix should not become spacing commands, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_spacing_keywords_still_emit_spacing_commands() {
+        let result =
+            typst_to_latex_with_options("$x thin y med z thick w space q$", &T2LOptions::default());
+
+        assert!(
+            result.contains("\\,"),
+            "thin should still emit LaTeX thin space, got: {}",
+            result
+        );
+        assert!(
+            result.contains("\\:"),
+            "med should still emit LaTeX medium space, got: {}",
+            result
+        );
+        assert!(
+            result.contains("\\;"),
+            "thick should still emit LaTeX thick space, got: {}",
+            result
+        );
+        assert!(
+            result.contains("\\ q") || result.contains("\\  q") || result.contains("\\ q"),
+            "space should still emit LaTeX space command, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_cases_condition_rows_stay_paired() {
+        let result = typst_to_latex_with_options("$cases(x, & y, z, & w)$", &T2LOptions::default());
+
+        assert!(
+            result.contains("x & y"),
+            "cases row should keep value/condition pairing, got: {}",
+            result
+        );
+        assert!(
+            result.contains("z & w"),
+            "cases second row should keep value/condition pairing, got: {}",
+            result
+        );
+        assert!(
+            !result.contains(
+                "x \\
+ & y"
+            ) && !result.contains(
+                "z \\
+ & w"
+            ),
+            "cases condition should not be emitted as a separate row, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_big_operator_func_call_does_not_drop_arguments() {
+        let result = typst_to_latex_with_options("$sum(a, b)$", &T2LOptions::default());
+
+        assert!(
+            result.contains("\\sum"),
+            "big operator should still emit operator command, got: {}",
+            result
+        );
+        assert!(
+            result.contains("a") && result.contains("b"),
+            "big operator func call should not drop argument content, got: {}",
+            result
+        );
+    }
+    #[test]
+    fn test_script_grouping_parentheses_are_not_emitted_in_subscript() {
+        let result = typst_to_latex_with_options("$sum_(i=1)^n x_i$", &T2LOptions::default());
+
+        assert!(
+            result.contains(r#"\sum_{i = 1}^n"#),
+            "grouping parentheses in subscript should not be emitted, got: {}",
+            result
+        );
+        assert!(
+            !result.contains(r#"\sum_{(i = 1)}^n"#),
+            "subscript should not keep grouping parentheses, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_matrix_delim_named_arg_maps_to_pmatrix() {
+        let result =
+            typst_to_latex_with_options(r#"$mat(delim: "(", 1, 2; 3, 4)$"#, &T2LOptions::default());
+        assert!(
+            result.contains(r#"\begin{pmatrix}"#),
+            r#"mat(delim: "(") should emit pmatrix, got: {}"#,
+            result
+        );
+    }
+
+    #[test]
+    fn test_matrix_delim_named_arg_maps_to_bmatrix() {
+        let result =
+            typst_to_latex_with_options(r#"$mat(delim: "[", 1, 2; 3, 4)$"#, &T2LOptions::default());
+        assert!(
+            result.contains(r#"\begin{bmatrix}"#),
+            r#"mat(delim: "[") should emit bmatrix, got: {}"#,
+            result
+        );
+    }
+
+    #[test]
+    fn test_ir_preserves_dotted_symbols_and_big_operators() {
+        let result = typst_to_latex_with_options(
+            "$sum_(i=1)^n x_i eq.not y_i and bar.v.double$",
+            &T2LOptions::default(),
+        );
+
+        assert!(
+            result.contains("\\sum"),
+            "big operator should still emit LaTeX command, got: {}",
+            result
+        );
+        assert!(
+            result.contains("\\neq"),
+            "dotted symbol eq.not should still emit \\neq, got: {}",
+            result
+        );
+        assert!(
+            result.contains("\\|"),
+            "bar.v.double should still emit double vertical bar, got: {}",
+            result
+        );
+    }
+}
+
+// ============================================================================
+// T2L Math IR Tranche-2 Tests
+// ============================================================================
+
+mod t2l_math_ir_tranche2 {
+    use super::*;
+
+    #[test]
+    fn test_limits_ir_preserves_operator_and_scripts() {
+        let result =
+            typst_to_latex_with_options(r#"$limits(op("argmax"))_(x)$"#, &T2LOptions::default());
+
+        assert!(
+            result.contains(r#"\operatorname{argmax}"#),
+            "limits() should preserve operator content, got: {}",
+            result
+        );
+        assert!(
+            result.contains(r#"_x"#) || result.contains(r#"_{x}"#),
+            "limits() should still cooperate with script emission, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_display_ir_respects_block_and_inline_modes() {
+        let block = typst_to_latex_with_options("$display(x+y)$", &T2LOptions::block_math());
+        let inline = typst_to_latex_with_options("$display(x+y)$", &T2LOptions::inline_math());
+
+        assert!(
+            block.contains(r#"\displaystyle x + y"#),
+            "display() should emit displaystyle in block mode, got: {}",
+            block
+        );
+        assert!(
+            !block.contains(r#"\textstyle"#),
+            "block display() should not restore textstyle, got: {}",
+            block
+        );
+        assert!(
+            inline.contains(r#"\displaystyle x + y \textstyle"#),
+            "inline display() should restore textstyle, got: {}",
+            inline
+        );
+    }
+
+    #[test]
+    fn test_inline_ir_respects_block_and_inline_modes() {
+        let block = typst_to_latex_with_options("$inline(x+y)$", &T2LOptions::block_math());
+        let inline = typst_to_latex_with_options("$inline(x+y)$", &T2LOptions::inline_math());
+
+        assert!(
+            block.contains(r#"\textstyle x + y \displaystyle"#),
+            "block inline() should restore displaystyle, got: {}",
+            block
+        );
+        assert!(
+            inline.contains(r#"\textstyle x + y"#),
+            "inline inline() should emit textstyle content, got: {}",
+            inline
+        );
+        assert!(
+            !inline.contains(r#"\displaystyle"#),
+            "inline inline() should not restore displaystyle, got: {}",
+            inline
+        );
+    }
+
+    #[test]
+    fn test_op_ir_emits_operatorname() {
+        let result = typst_to_latex_with_options(r#"$op("foo")$"#, &T2LOptions::default());
+        assert!(
+            result.contains(r#"\operatorname{foo}"#),
+            "op() should emit operatorname, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_class_ir_emits_math_class_commands() {
+        let punct =
+            typst_to_latex_with_options(r#"$class("punctuation", x)$"#, &T2LOptions::default());
+        let relation =
+            typst_to_latex_with_options(r#"$class("relation", x)$"#, &T2LOptions::default());
+
+        assert!(
+            punct.contains(r#"\mathpunct{x}"#),
+            r"class(punctuation, x) should emit \mathpunct, got: {}",
+            punct
+        );
+        assert!(
+            relation.contains(r#"\mathrel{x}"#),
+            r"class(relation, x) should emit \mathrel, got: {}",
+            relation
+        );
+    }
+
+    #[test]
+    fn test_set_arrow_and_accent_ir_emit_wrappers() {
+        let set_result = typst_to_latex_with_options("$set(x)$", &T2LOptions::default());
+        let arrow_result = typst_to_latex_with_options("$arrow(x)$", &T2LOptions::default());
+        let accent_arrow =
+            typst_to_latex_with_options("$accent(x, arrow.r)$", &T2LOptions::default());
+        let accent_hat = typst_to_latex_with_options("$accent(x, hat)$", &T2LOptions::default());
+
+        assert!(
+            set_result.contains(r#"\left\{x\right\}"#),
+            "set() should emit brace delimiters, got: {}",
+            set_result
+        );
+        assert!(
+            arrow_result.contains(r#"\overrightarrow{x}"#),
+            "arrow() should emit overrightarrow, got: {}",
+            arrow_result
+        );
+        assert!(
+            accent_arrow.contains(r#"\overrightarrow{x}"#),
+            "accent(..., arrow.r) should emit overrightarrow, got: {}",
+            accent_arrow
+        );
+        assert!(
+            accent_hat.contains(r#"\hat{x}"#),
+            "accent(..., hat) should emit hat, got: {}",
+            accent_hat
+        );
+    }
+
+    #[test]
+    fn test_accent_ir_supports_common_accent_variants() {
+        let tilde = typst_to_latex_with_options("$accent(x, tilde)$", &T2LOptions::default());
+        let dot = typst_to_latex_with_options("$accent(x, dot)$", &T2LOptions::default());
+        let ddot = typst_to_latex_with_options("$accent(x, ddot)$", &T2LOptions::default());
+        let bar = typst_to_latex_with_options("$accent(x, bar)$", &T2LOptions::default());
+        let grave = typst_to_latex_with_options("$accent(x, grave)$", &T2LOptions::default());
+        let acute = typst_to_latex_with_options("$accent(x, acute)$", &T2LOptions::default());
+        let breve = typst_to_latex_with_options("$accent(x, breve)$", &T2LOptions::default());
+        let check = typst_to_latex_with_options("$accent(x, check)$", &T2LOptions::default());
+
+        assert!(
+            tilde.contains(r#"\tilde{x}"#),
+            "accent(..., tilde) should emit tilde, got: {}",
+            tilde
+        );
+        assert!(
+            dot.contains(r#"\dot{x}"#),
+            "accent(..., dot) should emit dot, got: {}",
+            dot
+        );
+        assert!(
+            ddot.contains(r#"\ddot{x}"#),
+            "accent(..., ddot) should emit ddot, got: {}",
+            ddot
+        );
+        assert!(
+            bar.contains(r#"\bar{x}"#),
+            "accent(..., bar) should emit bar, got: {}",
+            bar
+        );
+        assert!(
+            grave.contains(r#"\grave{x}"#),
+            "accent(..., grave) should emit grave, got: {}",
+            grave
+        );
+        assert!(
+            acute.contains(r#"\acute{x}"#),
+            "accent(..., acute) should emit acute, got: {}",
+            acute
+        );
+        assert!(
+            breve.contains(r#"\breve{x}"#),
+            "accent(..., breve) should emit breve, got: {}",
+            breve
+        );
+        assert!(
+            check.contains(r#"\check{x}"#),
+            "accent(..., check) should emit check, got: {}",
+            check
+        );
+    }
+
+    #[test]
+    fn test_color_ir_emits_color_wrapper() {
+        let result = typst_to_latex_with_options("$color(red, x)$", &T2LOptions::default());
+        assert!(
+            result.contains(r#"{\color{red}x}"#),
+            "color() should emit color wrapper, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_escape_punctuation_preserves_literal_spacing_in_function_calls() {
+        let result = typst_to_latex_with_options(r"$sum(a\, b\: c\; d)$", &T2LOptions::default());
+
+        assert!(
+            result.contains(r#"\sum(a, b: c; d)"#),
+            "escaped punctuation should remain literal in function calls, got: {}",
+            result
+        );
+        assert!(
+            !result.contains(r#"\, "#) && !result.contains(r#"\:"#) && !result.contains(r#"\;"#),
+            "escaped punctuation should not be reinterpreted as spacing commands, got: {}",
+            result
+        );
+    }
+}
+
+// ============================================================================
+// T2L Math Structured IR Tests
+// ============================================================================
+
+mod t2l_math_structured_ir {
+    use super::*;
+
+    #[test]
+    fn test_math_vec_emits_pmatrix_rows() {
+        let result = typst_to_latex_with_options("$math.vec(a, b, c)$", &T2LOptions::default());
+        assert!(
+            result.contains(r#"\begin{pmatrix}"#),
+            "math.vec should emit pmatrix, got: {}",
+            result
+        );
+        assert!(
+            result.contains("a") && result.contains("b") && result.contains("c"),
+            "math.vec should preserve row content, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_attach_emits_pre_and_post_scripts() {
+        let result = typst_to_latex_with_options(
+            "$attach(x, t: n, b: i, tl: a, bl: b)$",
+            &T2LOptions::default(),
+        );
+        assert!(
+            result.contains("{}_{b}^{a}x_{i}^{n}")
+                || result.contains("{}_{b}^{a}x_i^n")
+                || result.contains("{}_b^ax_i^n"),
+            "attach should emit pre/post scripts, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_scripts_and_primes_specials() {
+        let scripts = typst_to_latex_with_options("$scripts(x+y)$", &T2LOptions::default());
+        let primes = typst_to_latex_with_options("$primes(3)$", &T2LOptions::default());
+        assert!(
+            scripts.contains(r#"\displaystyle x + y"#),
+            "scripts should emit displaystyle content, got: {}",
+            scripts
+        );
+        assert!(
+            primes.contains("'''"),
+            "primes(3) should emit three primes, got: {}",
+            primes
+        );
+    }
+
+    #[test]
+    fn test_stretch_and_mid_specials() {
+        let stretch = typst_to_latex_with_options("$stretch(->)$", &T2LOptions::default());
+        let brace_top = typst_to_latex_with_options("$stretch(brace.t)$", &T2LOptions::default());
+        let brace_bottom =
+            typst_to_latex_with_options("$stretch(brace.b)$", &T2LOptions::default());
+        let mid = typst_to_latex_with_options("$mid(|)$", &T2LOptions::default());
+        assert!(
+            stretch.contains(r#"\xrightarrow{}"#),
+            "stretch(->) should emit xrightarrow, got: {}",
+            stretch
+        );
+        assert!(
+            brace_top.contains(r#"\overbrace{}"#),
+            "stretch(brace.t) should emit overbrace, got: {}",
+            brace_top
+        );
+        assert!(
+            brace_bottom.contains(r#"\underbrace{}"#),
+            "stretch(brace.b) should emit underbrace, got: {}",
+            brace_bottom
+        );
+        assert!(
+            mid.contains(r#"\mid"#),
+            r"mid should emit \mid, got: {}",
+            mid
+        );
+    }
+
+    #[test]
+    fn test_circle_divergence_and_curl_specials() {
+        let circle = typst_to_latex_with_options("$circle(x)$", &T2LOptions::default());
+        let divergence = typst_to_latex_with_options("$divergence(A)$", &T2LOptions::default());
+        let curl = typst_to_latex_with_options("$curl(A)$", &T2LOptions::default());
+        assert!(
+            circle.contains(r#"\mathring{x}"#),
+            "circle(x) should emit mathring, got: {}",
+            circle
+        );
+        assert!(
+            divergence.contains(r#"\nabla \cdot A"#),
+            "divergence(A) should emit nabla dot product, got: {}",
+            divergence
+        );
+        assert!(
+            curl.contains(r#"\nabla \times A"#),
+            "curl(A) should emit nabla cross product, got: {}",
+            curl
+        );
+    }
+
+    #[test]
+    fn test_big_operator_and_unknown_func_calls_preserve_content() {
+        let sum = typst_to_latex_with_options("$sum(a, b)$", &T2LOptions::default());
+        let unknown = typst_to_latex_with_options("$foo(x, y)$", &T2LOptions::default());
+        assert!(
+            sum.contains(r#"\sum(a, b)"#),
+            "big-operator function call should emit call syntax, got: {}",
+            sum
+        );
+        assert!(
+            unknown.contains(r#"\operatorname{foo}(x, y)"#),
+            "unknown function call should emit operatorname call, got: {}",
+            unknown
         );
     }
 }

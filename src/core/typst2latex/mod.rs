@@ -7,6 +7,8 @@ pub mod context;
 pub mod engine;
 mod markup;
 mod math;
+mod math_emit;
+mod math_ir;
 mod preprocess;
 mod table;
 mod utils;
@@ -366,7 +368,7 @@ pub fn typst_to_latex_with_eval(input: &str, options: &T2LOptions) -> String {
     // Delegate to the diagnostics API
     let result = typst_to_latex_with_diagnostics(input, options);
 
-    // Print warnings to stderr (preserving legacy behavior for CLI/script use)
+    // Print warnings to stderr (preserving CLI/script side effects)
     for warning in &result.warnings {
         eprintln!("[tylax] Warning: {}", warning);
     }

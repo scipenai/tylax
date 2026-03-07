@@ -100,6 +100,7 @@ impl T2LOptions {
 pub enum TokenType {
     None,
     Operator,
+    Punctuation,
     Letter,
     Number,
     OpenParen,
@@ -292,6 +293,13 @@ impl ConvertContext {
 
         self.push(s);
         self.last_token = token_type;
+    }
+
+    /// Remove a single trailing plain space if present.
+    pub fn trim_trailing_space(&mut self) {
+        if self.output.ends_with(' ') {
+            self.output.pop();
+        }
     }
 
     /// Finalize and clean up the output
