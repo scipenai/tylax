@@ -1,6 +1,6 @@
 [package]
 name = "tylax"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Tylax - High-performance bidirectional LaTeX ↔ Typst converter"
 license = "Apache-2.0"
