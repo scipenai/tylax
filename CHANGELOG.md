@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-03-08
+
+### Fixed
+- **LaTeX-to-Typst Matrix Delimiters**: Preserve matrix semantics for `\left...\right` wrapped `array` and matrix environments. Delimiter-less environments now inherit the outer delimiter as `mat(delim: ...)`, while environments with intrinsic delimiters keep their nested structure instead of collapsing to `abs()` or `norm()`.
+
 ## [0.3.2] - 2026-03-08
 
 ### Fixed
@@ -94,7 +99,8 @@ This release is a major overhaul of the core conversion logic, introducing prope
 - CLI tool (`t2l`)
 - Structured error handling with warnings
 
-[Unreleased]: https://github.com/scipenai/tylax/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/scipenai/tylax/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/scipenai/tylax/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/scipenai/tylax/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/scipenai/tylax/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/scipenai/tylax/compare/v0.2.2...v0.3.0
