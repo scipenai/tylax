@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-03-07
+
+### Fixed
+- **Typst Named Arguments**: Refactored `typst2latex` to parse named arguments through a shared AST-aware `FuncArgs` layer instead of per-call string splitting.
+  - Fixed `lr(..., size: ...)` so `size: #200%` no longer leaks into math output and now maps cleanly to fixed-size LaTeX delimiters.
+  - Fixed tuple-valued and function-valued named arguments such as `grid(columns: (auto, auto, auto))` and `fill: rgb(255, 0, 0)` so values are preserved intact.
+  - Fixed `rotate(angle: 90deg)` and `bibliography(..., style: plain)` to preserve named argument values instead of silently degrading.
+
+### Changed
+- **Color Conversion**: Unified Typst color handling for text, rectangles, and table cells through a shared normalization and LaTeX color-spec pipeline.
+  - Added support for `rgb(...)`, `cmyk(...)`, and `luma(...)` color values in Typst-to-LaTeX conversion.
+  - Kept named colors and `lighten(...)` / `darken(...)` method chains on the same conversion path to reduce duplicated logic.
+
 ## [0.3.0] - 2026-03-07
 
 ### Added
@@ -73,7 +86,8 @@ This release is a major overhaul of the core conversion logic, introducing prope
 - CLI tool (`t2l`)
 - Structured error handling with warnings
 
-[Unreleased]: https://github.com/scipenai/tylax/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/scipenai/tylax/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/scipenai/tylax/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/scipenai/tylax/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/scipenai/tylax/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/scipenai/tylax/compare/v0.2.0...v0.2.1
