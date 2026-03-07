@@ -6,9 +6,9 @@ use super::context::{ConvertContext, EnvironmentContext, TokenType};
 use super::math::convert_math_node;
 use super::table::{LatexCell, LatexCellAlign, LatexHLine, LatexTableGenerator};
 use super::utils::{
-    count_heading_markers, escape_latex_text, extract_length_value, get_raw_text_with_lang,
-    get_simple_text, get_string_content, is_color_name, is_display_math, is_string_or_content,
-    typst_color_to_latex, FuncArgs,
+    count_heading_markers, escape_latex_text, extract_length_value, format_latex_color_command,
+    get_raw_text_with_lang, get_simple_text, get_string_content, is_display_math,
+    is_string_or_content, normalize_typst_color_expr, parse_angle_value, FuncArgs,
 };
 use crate::data::typst_compat::{
     get_heading_command, is_math_func_in_markup, MarkupHandler, TYPST_MARKUP_HANDLERS,
@@ -871,65 +871,33 @@ fn handle_special_markup_func(func_name: &str, children: &[&SyntaxNode], ctx: &m
 // ============================================================================
 
 fn convert_text_func(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
-    let mut weight: Option<String> = None;
-    let mut size: Option<String> = None;
-    let mut style: Option<String> = None;
-    let mut color: Option<String> = None;
+    let args = FuncArgs::from_func_call(children);
+    let weight = args.named_text("weight").map(str::to_string);
+    let size = args.named_text("size").map(str::to_string);
+    let style = args.named_text("style").map(str::to_string);
+    let mut color = args
+        .named_color("fill")
+        .and_then(normalize_typst_color_expr);
     let mut content_nodes = Vec::new();
 
-    if let Some(args) = children.get(1) {
-        for child in args.children() {
-            match child.kind() {
-                SyntaxKind::Named => {
-                    // Parse named argument: key: value
-                    // Use get_simple_text to get the full text, then split on ':'
-                    let full_text = get_simple_text(child);
-                    if let Some(colon_pos) = full_text.find(':') {
-                        let key = full_text[..colon_pos].trim();
-                        let value = full_text[colon_pos + 1..].trim().to_string();
-
-                        match key {
-                            "weight" => weight = Some(value),
-                            "size" => size = Some(value),
-                            "style" => style = Some(value),
-                            "fill" => color = Some(value),
-                            _ => {}
-                        }
-                    }
-                }
-                SyntaxKind::ContentBlock | SyntaxKind::Markup | SyntaxKind::Str => {
-                    content_nodes.push(child);
-                }
-                SyntaxKind::Ident => {
-                    // Positional identifier - could be a color name
-                    let text = child.text().to_string();
-                    if is_color_name(&text) {
-                        color = Some(text);
-                    }
-                }
-                SyntaxKind::FuncCall => {
-                    // Could be a color function like blue.lighten(50%)
-                    let func_text = get_simple_text(child);
-                    if func_text.contains('.') {
-                        let base_color = func_text.split('.').next().unwrap_or("");
-                        if is_color_name(base_color) {
-                            color = Some(base_color.to_string());
-                        }
-                    }
-                    // Or it could be content (like a nested function)
-                    content_nodes.push(child);
-                }
-                _ => {
-                    // Check for positional content (not comma/paren)
-                    if child.kind() != SyntaxKind::Comma
-                        && child.kind() != SyntaxKind::Colon
-                        && child.kind() != SyntaxKind::LeftParen
-                        && child.kind() != SyntaxKind::RightParen
-                    {
-                        content_nodes.push(child);
-                    }
+    for arg in args.iter().filter(|arg| arg.is_positional) {
+        match arg.node.kind() {
+            SyntaxKind::ContentBlock | SyntaxKind::Markup | SyntaxKind::Str => {
+                content_nodes.push(arg.node);
+            }
+            SyntaxKind::Ident => {
+                if let Some(normalized) = normalize_typst_color_expr(&arg.value) {
+                    color = Some(normalized);
                 }
             }
+            SyntaxKind::FuncCall => {
+                if let Some(normalized) = normalize_typst_color_expr(&arg.value) {
+                    color = Some(normalized);
+                } else {
+                    content_nodes.push(arg.node);
+                }
+            }
+            _ => content_nodes.push(arg.node),
         }
     }
 
@@ -938,8 +906,7 @@ fn convert_text_func(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
 
     // Apply color first (outermost wrapper)
     if let Some(c) = &color {
-        let latex_color = typst_color_to_latex(c);
-        ctx.push(&format!("\\textcolor{{{}}}", latex_color));
+        ctx.push(&format_latex_color_command("textcolor", c));
         ctx.push("{");
         suffix_count += 1;
     }
@@ -998,43 +965,22 @@ fn convert_text_func(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
 
 /// Convert #rotate(angle)[content] to \rotatebox{angle}{content}
 fn convert_rotate_func(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
-    let mut angle: Option<f64> = None;
+    let args = FuncArgs::from_func_call(children);
+    let mut angle = args.named_angle("angle");
     let mut content_nodes = Vec::new();
 
-    if let Some(args) = children.get(1) {
-        for child in args.children() {
-            match child.kind() {
-                SyntaxKind::Named => {
-                    let named_children: Vec<_> = child.children().collect();
-                    if named_children.len() >= 2 {
-                        let key = named_children[0].text().to_string();
-                        if key == "angle" {
-                            let value = get_simple_text(named_children[1]);
-                            angle = parse_angle(&value);
-                        }
-                    }
-                }
-                SyntaxKind::ContentBlock | SyntaxKind::Markup => {
-                    content_nodes.push(child);
-                }
-                _ => {
-                    // Check for positional angle argument (e.g., -45deg)
-                    if child.kind() != SyntaxKind::Comma
-                        && child.kind() != SyntaxKind::LeftParen
-                        && child.kind() != SyntaxKind::RightParen
-                    {
-                        let text = child.text().to_string();
-                        if text.contains("deg")
-                            || text.contains("rad")
-                            || text.parse::<f64>().is_ok()
-                        {
-                            angle = parse_angle(&text);
-                        } else if child.kind() == SyntaxKind::Unary {
-                            // Handle negative angles like -45deg
-                            let full_text = get_simple_text(child);
-                            angle = parse_angle(&full_text);
-                        }
-                    }
+    for arg in args.iter().filter(|arg| arg.is_positional) {
+        match arg.node.kind() {
+            SyntaxKind::ContentBlock | SyntaxKind::Markup => content_nodes.push(arg.node),
+            SyntaxKind::Unary => {
+                angle = parse_angle_value(&arg.value);
+            }
+            _ => {
+                if arg.value.contains("deg")
+                    || arg.value.contains("rad")
+                    || arg.value.parse::<f64>().is_ok()
+                {
+                    angle = parse_angle_value(&arg.value);
                 }
             }
         }
@@ -1052,23 +998,6 @@ fn convert_rotate_func(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
     ctx.push("}");
 }
 
-/// Parse angle string (e.g., "45deg", "-90deg", "1.57rad") to degrees
-fn parse_angle(s: &str) -> Option<f64> {
-    let s = s.trim();
-    if s.ends_with("deg") {
-        s.trim_end_matches("deg").trim().parse::<f64>().ok()
-    } else if s.ends_with("rad") {
-        s.trim_end_matches("rad")
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .map(|r| r.to_degrees())
-    } else {
-        // Try parsing as plain number (assume degrees)
-        s.parse::<f64>().ok()
-    }
-}
-
 /// Convert #rect(...)[content] to appropriate LaTeX
 /// - If has content with fill: use \colorbox (preserves content)
 /// - If no content with fill and height: use \rule (solid rectangle)
@@ -1078,7 +1007,7 @@ fn convert_rect_func(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
 
     let width = args.named("width");
     let height = args.named("height");
-    let fill = args.named("fill");
+    let fill = args.named("fill").and_then(normalize_typst_color_expr);
 
     // Get content nodes
     let mut content_nodes = Vec::new();
@@ -1093,22 +1022,23 @@ fn convert_rect_func(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
     let has_content = !content_nodes.is_empty();
 
     // Determine the best LaTeX representation
-    if let Some(f) = fill {
-        let color = typst_color_to_latex(f);
+    if let Some(f) = fill.as_deref() {
+        let colorbox = format_latex_color_command("colorbox", f);
+        let color_cmd = format_latex_color_command("color", f);
 
         if has_content {
             // Has content - must use \colorbox to preserve it
             // Optionally wrap in minipage if width specified
             if let Some(w) = width {
                 let latex_width = convert_dimension_to_latex(w);
-                ctx.push(&format!("\\colorbox{{{}}}", color));
+                ctx.push(&colorbox);
                 ctx.push(&format!("{{\\begin{{minipage}}{{{}}}", latex_width));
                 for node in &content_nodes {
                     convert_markup_node(node, ctx);
                 }
                 ctx.push("\\end{minipage}}");
             } else {
-                ctx.push(&format!("\\colorbox{{{}}}", color));
+                ctx.push(&colorbox);
                 ctx.push("{");
                 for node in &content_nodes {
                     convert_markup_node(node, ctx);
@@ -1122,12 +1052,13 @@ fn convert_rect_func(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
                 .map(convert_dimension_to_latex)
                 .unwrap_or_else(|| "\\linewidth".to_string());
             ctx.push(&format!(
-                "{{\\color{{{}}}\\rule{{{}}}{{{}}}}}",
-                color, latex_width, latex_height
+                "{{{}\\rule{{{}}}{{{}}}}}",
+                color_cmd, latex_width, latex_height
             ));
         } else {
             // Has fill but no height and no content - just colorbox with empty
-            ctx.push(&format!("\\colorbox{{{}}}{{}}", color));
+            ctx.push(&colorbox);
+            ctx.push("{}");
         }
     } else if let Some(h) = height {
         // No fill, but has height - black rule
@@ -1231,6 +1162,7 @@ fn get_func_call_name(node: &SyntaxNode) -> String {
 
 /// Convert a Typst table to LaTeX using the state-aware table generator
 fn convert_table_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
+    let args = FuncArgs::from_func_call(children);
     let mut columns: usize = 0;
     let mut col_aligns: Vec<LatexCellAlign> = Vec::new();
     let mut cells: Vec<LatexCell> = Vec::new();
@@ -1238,34 +1170,27 @@ fn convert_table_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
     let mut in_header = false;
     let mut header_end_idx: Option<usize> = None;
 
-    if let Some(args) = children.get(1) {
-        for child in args.children() {
+    if let Some(args_node) = children.get(1) {
+        for child in args_node.children() {
             match child.kind() {
                 SyntaxKind::Named => {
-                    let named_children: Vec<_> = child.children().collect();
-                    if !named_children.is_empty() {
-                        let key = named_children[0].text().to_string();
-
-                        if key == "columns" {
-                            let full_text = get_simple_text(child);
-                            if let Some(colon_pos) = full_text.find(':') {
-                                let value = full_text[colon_pos + 1..].trim();
-                                if let Some(n) = infer_table_columns(value) {
+                    if let Some(arg) = args.arg_for_node(child) {
+                        match arg.name.as_deref() {
+                            Some("columns") => {
+                                if let Some(n) = infer_table_columns(&arg.value) {
                                     columns = n;
                                 }
-                            }
-                            if columns == 0 {
-                                let auto_count = full_text.matches("auto").count();
-                                if auto_count > 0 {
-                                    columns = auto_count;
+                                if columns == 0 {
+                                    let auto_count = arg.value.matches("auto").count();
+                                    if auto_count > 0 {
+                                        columns = auto_count;
+                                    }
                                 }
                             }
-                        } else if key == "align" {
-                            let full_text = get_simple_text(child);
-                            if let Some(colon_pos) = full_text.find(':') {
-                                let value = full_text[colon_pos + 1..].trim();
-                                col_aligns = parse_typst_align(value);
+                            Some("align") => {
+                                col_aligns = parse_typst_align(&arg.value);
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -1811,26 +1736,13 @@ fn convert_label_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
 }
 
 fn convert_bibliography_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
+    let args = FuncArgs::from_func_call(children);
     let mut bib_file = String::new();
-    let mut style = "plain".to_string();
+    let style = args.named_text("style").unwrap_or("plain").to_string();
 
-    if let Some(args) = children.get(1) {
-        for child in args.children() {
-            match child.kind() {
-                SyntaxKind::Str => {
-                    bib_file = get_string_content(child);
-                }
-                SyntaxKind::Named => {
-                    let named_children: Vec<_> = child.children().collect();
-                    if named_children.len() >= 2 {
-                        let key = named_children[0].text().to_string();
-                        if key == "style" {
-                            style = get_simple_text(named_children[1]);
-                        }
-                    }
-                }
-                _ => {}
-            }
+    if let Some(first_node) = args.first_node() {
+        if first_node.kind() == SyntaxKind::Str {
+            bib_file = get_string_content(first_node);
         }
     }
 
@@ -1865,23 +1777,11 @@ fn convert_theorem_to_latex(env_name: &str, children: &[&SyntaxNode], ctx: &mut 
 // ============================================================================
 
 fn convert_grid_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
-    let mut num_cols = 2usize;
-
-    if let Some(args) = children.get(1) {
-        for child in args.children() {
-            if child.kind() == SyntaxKind::Named {
-                let named_children: Vec<_> = child.children().collect();
-                if named_children.len() >= 2 {
-                    let key = named_children[0].text().to_string();
-                    if key == "columns" {
-                        if let Ok(n) = get_simple_text(named_children[1]).parse::<usize>() {
-                            num_cols = n;
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let args = FuncArgs::from_func_call(children);
+    let num_cols = args
+        .named_text("columns")
+        .and_then(|value| infer_table_columns(value).or_else(|| value.parse::<usize>().ok()))
+        .unwrap_or(2);
 
     // Calculate column width
     let col_width = if num_cols > 0 {
@@ -1901,43 +1801,25 @@ fn convert_grid_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
 
 /// Convert function arguments as text content, ignoring named argument keys
 pub fn convert_func_args_text(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
-    for (i, child) in children.iter().enumerate() {
-        if i == 0 {
-            continue; // Skip function name
-        }
-        if child.kind() == SyntaxKind::Args {
-            for arg_child in child.children() {
-                match arg_child.kind() {
-                    SyntaxKind::ContentBlock | SyntaxKind::Markup => {
-                        convert_markup_node(arg_child, ctx);
-                    }
-                    SyntaxKind::Named => {
-                        // For named args, only process the value if it's content
-                        // Skip the key
-                        let named_children: Vec<_> = arg_child.children().collect();
-                        if named_children.len() >= 2 {
-                            let value = named_children[1];
-                            if value.kind() == SyntaxKind::ContentBlock
-                                || value.kind() == SyntaxKind::Markup
-                            {
-                                convert_markup_node(value, ctx);
-                            }
-                            // Otherwise ignore scalar values like size: 10pt
-                        }
-                    }
-                    _ => {
-                        // Check if it is "body" (pos arg)
-                        if arg_child.kind() != SyntaxKind::Comma
-                            && arg_child.kind() != SyntaxKind::Colon
-                            && arg_child.kind() != SyntaxKind::LeftParen
-                            && arg_child.kind() != SyntaxKind::RightParen
-                        {
-                            convert_markup_node(arg_child, ctx);
-                        }
-                    }
-                }
+    let args = FuncArgs::from_func_call(children);
+
+    for arg in args.iter() {
+        if arg.is_positional {
+            if let Some(node) = arg.value_node {
+                convert_markup_node(node, ctx);
             }
-        } else if child.kind() == SyntaxKind::ContentBlock {
+            continue;
+        }
+
+        if let Some(node) = arg.value_node {
+            if node.kind() == SyntaxKind::ContentBlock || node.kind() == SyntaxKind::Markup {
+                convert_markup_node(node, ctx);
+            }
+        }
+    }
+
+    for child in children.iter().skip(1) {
+        if child.kind() == SyntaxKind::ContentBlock {
             for arg_child in child.children() {
                 convert_markup_node(arg_child, ctx);
             }
@@ -2056,39 +1938,26 @@ fn convert_list_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, is_
 // ============================================================================
 
 fn convert_raw_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
-    let mut lang = String::new();
+    let args = FuncArgs::from_func_call(children);
+    let lang = args.named_text("lang").unwrap_or("").to_string();
     let mut content = String::new();
-    let mut is_block = false;
+    let mut is_block = args.named_bool("block").unwrap_or(false);
 
-    if let Some(args) = children.get(1) {
-        for child in args.children() {
-            match child.kind() {
-                SyntaxKind::Str => {
-                    content = get_string_content(child);
-                }
-                SyntaxKind::Named => {
-                    let named_children: Vec<_> = child.children().collect();
-                    if named_children.len() >= 2 {
-                        let key = named_children[0].text().to_string();
-                        if key == "lang" {
-                            lang = get_simple_text(named_children[1]);
-                        } else if key == "block" {
-                            let val = get_simple_text(named_children[1]);
-                            is_block = val == "true";
-                        }
-                    }
-                }
-                SyntaxKind::ContentBlock => {
-                    content = child
-                        .text()
-                        .to_string()
-                        .trim_start_matches('[')
-                        .trim_end_matches(']')
-                        .to_string();
-                    is_block = content.contains('\n');
-                }
-                _ => {}
+    if let Some(first_node) = args.first_node() {
+        match first_node.kind() {
+            SyntaxKind::Str => {
+                content = get_string_content(first_node);
             }
+            SyntaxKind::ContentBlock => {
+                content = first_node
+                    .text()
+                    .to_string()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_string();
+                is_block = content.contains('\n');
+            }
+            _ => {}
         }
     }
 

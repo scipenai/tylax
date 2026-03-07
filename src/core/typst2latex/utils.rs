@@ -236,43 +236,69 @@ pub fn is_color_name(s: &str) -> bool {
     )
 }
 
-/// Convert Typst color to LaTeX color name (returns owned String for complex expressions)
-pub fn typst_color_to_latex(color: &str) -> String {
-    let color = color.trim();
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatexColorSpec {
+    pub model: Option<&'static str>,
+    pub value: String,
+}
 
-    // Handle color expressions like "purple.lighten(80%)" or "red.darken(20%)"
-    if color.contains('.') {
-        let parts: Vec<&str> = color.split('.').collect();
-        if let Some(base_color) = parts.first() {
-            let base = simple_color_to_latex(base_color.trim());
-
-            // Check for lighten/darken
-            if parts.len() > 1 {
-                let method = parts[1];
-                if method.starts_with("lighten(") {
-                    // Extract percentage: lighten(80%) -> 80
-                    if let Some(pct) = extract_percentage(method) {
-                        // LaTeX xcolor: color!percentage!white for lighten
-                        let remaining = 100 - pct;
-                        return format!("{}!{}!white", base, remaining);
-                    }
-                } else if method.starts_with("darken(") {
-                    // Extract percentage: darken(20%) -> 20
-                    if let Some(pct) = extract_percentage(method) {
-                        // LaTeX xcolor: color!percentage!black for darken
-                        let remaining = 100 - pct;
-                        return format!("{}!{}!black", base, remaining);
-                    }
-                } else if method.starts_with("transparentize(") || method.starts_with("opacify(") {
-                    // Transparency - just return base color (LaTeX doesn't handle this well in tables)
-                    return base.to_string();
-                }
-            }
-            return base.to_string();
+impl LatexColorSpec {
+    pub fn new(model: Option<&'static str>, value: impl Into<String>) -> Self {
+        Self {
+            model,
+            value: value.into(),
         }
     }
 
-    simple_color_to_latex(color).to_string()
+    pub fn format_command(&self, command: &str) -> String {
+        if let Some(model) = self.model {
+            format!("\\{}[{}]{{{}}}", command, model, self.value)
+        } else {
+            format!("\\{}{{{}}}", command, self.value)
+        }
+    }
+}
+
+pub fn normalize_typst_color_expr(color: &str) -> Option<String> {
+    let color = color.trim();
+
+    if is_color_name(color)
+        || is_typst_color_method_chain(color)
+        || parse_typst_rgb_spec(color).is_some()
+        || parse_typst_cmyk_spec(color).is_some()
+        || parse_typst_luma_spec(color).is_some()
+    {
+        Some(color.to_string())
+    } else {
+        None
+    }
+}
+
+pub fn format_latex_color_command(command: &str, color: &str) -> String {
+    typst_color_to_latex_spec(color).format_command(command)
+}
+
+pub fn typst_color_to_latex_spec(color: &str) -> LatexColorSpec {
+    let color = color.trim();
+
+    if let Some((model, value)) = parse_typst_rgb_spec(color) {
+        return LatexColorSpec::new(Some(model), value);
+    }
+
+    if let Some((model, value)) = parse_typst_cmyk_spec(color) {
+        return LatexColorSpec::new(Some(model), value);
+    }
+
+    if let Some((model, value)) = parse_typst_luma_spec(color) {
+        return LatexColorSpec::new(Some(model), value);
+    }
+
+    // Handle color expressions like "purple.lighten(80%)" or "red.darken(20%)"
+    if let Some(color) = color_method_chain_to_latex(color) {
+        return LatexColorSpec::new(None, color);
+    }
+
+    LatexColorSpec::new(None, simple_color_to_latex(color))
 }
 
 /// Extract percentage from method call like "lighten(80%)" -> 80
@@ -483,6 +509,214 @@ pub fn extract_length_value(text: &str) -> Option<String> {
     None
 }
 
+fn is_typst_color_method_chain(color: &str) -> bool {
+    let Some((base, rest)) = color.split_once('.') else {
+        return false;
+    };
+
+    is_color_name(base.trim())
+        && rest.split('.').all(|method| {
+            method.starts_with("lighten(")
+                || method.starts_with("darken(")
+                || method.starts_with("transparentize(")
+                || method.starts_with("opacify(")
+        })
+}
+
+fn color_method_chain_to_latex(color: &str) -> Option<String> {
+    let (base, rest) = color.split_once('.')?;
+    if !is_color_name(base.trim()) {
+        return None;
+    }
+
+    let mut current = simple_color_to_latex(base.trim()).to_string();
+    for method in rest.split('.') {
+        if method.starts_with("lighten(") {
+            let pct = extract_percentage(method)?;
+            let remaining = 100 - pct;
+            current = format!("{}!{}!white", current, remaining);
+        } else if method.starts_with("darken(") {
+            let pct = extract_percentage(method)?;
+            let remaining = 100 - pct;
+            current = format!("{}!{}!black", current, remaining);
+        } else if method.starts_with("transparentize(") || method.starts_with("opacify(") {
+            continue;
+        } else {
+            return None;
+        }
+    }
+
+    Some(current)
+}
+
+fn parse_typst_rgb_spec(color: &str) -> Option<(&'static str, String)> {
+    let content = parse_typst_color_func_args(color, "rgb")?;
+
+    if content.len() == 1 {
+        let hex = content[0].trim().trim_matches('"').trim_matches('\'');
+        let hex = hex.trim_start_matches('#');
+        if hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(("HTML", hex.to_uppercase()));
+        }
+        if hex.len() == 3 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            let expanded: String = hex
+                .chars()
+                .flat_map(|c| [c.to_ascii_uppercase(), c.to_ascii_uppercase()])
+                .collect();
+            return Some(("HTML", expanded));
+        }
+        return None;
+    }
+
+    if content.len() != 3 {
+        return None;
+    }
+
+    let components: Option<Vec<_>> = content
+        .iter()
+        .map(|part| parse_color_component(part))
+        .collect();
+    let components = components?;
+
+    if components
+        .iter()
+        .all(|component| component.is_percent || component.value <= 1.0)
+    {
+        let values = components
+            .iter()
+            .map(|component| {
+                let value = if component.is_percent {
+                    component.value / 100.0
+                } else {
+                    component.value
+                };
+                format_decimal(value)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        Some(("rgb", values))
+    } else if components
+        .iter()
+        .all(|component| !component.is_percent && component.value <= 255.0)
+    {
+        let values = components
+            .iter()
+            .map(|component| format!("{}", component.value.round() as i32))
+            .collect::<Vec<_>>()
+            .join(",");
+        Some(("RGB", values))
+    } else {
+        None
+    }
+}
+
+fn parse_typst_cmyk_spec(color: &str) -> Option<(&'static str, String)> {
+    let content = parse_typst_color_func_args(color, "cmyk")?;
+    if content.len() != 4 {
+        return None;
+    }
+
+    let components: Option<Vec<_>> = content
+        .iter()
+        .map(|part| parse_color_component(part))
+        .collect();
+    let components = components?;
+
+    let values = components
+        .iter()
+        .map(|component| {
+            let value = if component.is_percent {
+                component.value / 100.0
+            } else {
+                component.value
+            };
+            format_decimal(value)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(("cmyk", values))
+}
+
+fn parse_typst_luma_spec(color: &str) -> Option<(&'static str, String)> {
+    let content = parse_typst_color_func_args(color, "luma")?;
+    if content.len() != 1 {
+        return None;
+    }
+
+    let component = parse_color_component(content[0])?;
+    let value = if component.is_percent {
+        component.value / 100.0
+    } else {
+        component.value
+    };
+    Some(("gray", format_decimal(value)))
+}
+
+fn parse_typst_color_func_args<'a>(color: &'a str, func: &str) -> Option<Vec<&'a str>> {
+    let color = color.trim();
+    let prefix = format!("{}(", func);
+    if !color.starts_with(&prefix) || !color.ends_with(')') {
+        return None;
+    }
+
+    let inner = &color[prefix.len()..color.len() - 1];
+    Some(
+        inner
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect(),
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParsedColorComponent {
+    value: f64,
+    is_percent: bool,
+}
+
+fn parse_color_component(value: &str) -> Option<ParsedColorComponent> {
+    let value = value.trim();
+    if let Some(num) = value.strip_suffix('%') {
+        return Some(ParsedColorComponent {
+            value: num.trim().parse::<f64>().ok()?,
+            is_percent: true,
+        });
+    }
+
+    Some(ParsedColorComponent {
+        value: value.parse::<f64>().ok()?,
+        is_percent: false,
+    })
+}
+
+fn format_decimal(value: f64) -> String {
+    let mut formatted = format!("{:.4}", value);
+    while formatted.contains('.') && formatted.ends_with('0') {
+        formatted.pop();
+    }
+    if formatted.ends_with('.') {
+        formatted.pop();
+    }
+    formatted
+}
+
+/// Parse angle string (e.g., "45deg", "-90deg", "1.57rad") to degrees
+pub fn parse_angle_value(text: &str) -> Option<f64> {
+    let text = text.trim();
+    if text.ends_with("deg") {
+        text.trim_end_matches("deg").trim().parse::<f64>().ok()
+    } else if text.ends_with("rad") {
+        text.trim_end_matches("rad")
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|r| r.to_degrees())
+    } else {
+        text.parse::<f64>().ok()
+    }
+}
+
 // ============================================================================
 // Generic Function Arguments Parser
 // ============================================================================
@@ -490,80 +724,108 @@ pub fn extract_length_value(text: &str) -> Option<String> {
 /// Parsed function argument with extracted values
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub struct ParsedArg {
+pub struct ParsedArg<'a> {
     /// The argument value as text
     pub value: String,
     /// The argument name (for named arguments)
     pub name: Option<String>,
     /// Whether this is a positional argument
     pub is_positional: bool,
+    /// Original AST node for this argument
+    pub node: &'a SyntaxNode,
+    /// Value AST node for this argument (same as `node` for positional args)
+    pub value_node: Option<&'a SyntaxNode>,
+    /// All AST nodes contributing to the value, in source order.
+    pub value_nodes: Vec<&'a SyntaxNode>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownNamedArgPolicy {
+    Ignore,
+    Preserve,
+    Fallback,
+    Warn,
 }
 
 /// Generic function arguments parser for Typst AST
 /// Provides a unified way to extract named and positional arguments from FuncCall nodes
-/// This version stores extracted values rather than node references for simplicity
 #[allow(dead_code)]
-pub struct FuncArgs {
-    /// Named arguments: key -> value text
-    named: std::collections::HashMap<String, String>,
-    /// Positional arguments in order (as text)
-    positional: Vec<String>,
+pub struct FuncArgs<'a> {
+    /// Named arguments: key -> first occurrence index in `all`
+    named: std::collections::HashMap<String, usize>,
+    /// Positional arguments in order (indices into `all`)
+    positional: Vec<usize>,
     /// All arguments in order (for iteration)
-    all: Vec<ParsedArg>,
+    all: Vec<ParsedArg<'a>>,
 }
 
 #[allow(dead_code)]
-impl FuncArgs {
+impl<'a> FuncArgs<'a> {
     /// Create a new FuncArgs parser from a FuncCall node's children
     /// The children should be the children of the FuncCall node (first is function name)
-    pub fn from_func_call(children: &[&SyntaxNode]) -> Self {
+    pub fn from_func_call(children: &'a [&'a SyntaxNode]) -> Self {
+        children
+            .iter()
+            .skip(1)
+            .find(|child| child.kind() == SyntaxKind::Args)
+            .map_or_else(Self::empty, |args_node| Self::from_args_node(args_node))
+    }
+
+    /// Create a parser directly from an Args node.
+    pub fn from_args_node(args_node: &'a SyntaxNode) -> Self {
         let mut named = std::collections::HashMap::new();
         let mut positional = Vec::new();
         let mut all = Vec::new();
+        let children: Vec<_> = args_node.children().collect();
+        let mut idx = 0;
 
-        // Find the Args node (usually the second child)
-        for child in children.iter().skip(1) {
-            if child.kind() == SyntaxKind::Args {
-                // Parse arguments from Args node
-                for arg in child.children() {
-                    match arg.kind() {
-                        SyntaxKind::Named => {
-                            // Named argument: key: value
-                            let (key, value) = Self::parse_named_arg(arg);
-                            if let (Some(k), Some(v)) = (key, value) {
-                                named.insert(k.clone(), v.clone());
-                                all.push(ParsedArg {
-                                    value: v,
-                                    name: Some(k),
-                                    is_positional: false,
-                                });
+        while idx < children.len() {
+            let arg = children[idx];
+            match arg.kind() {
+                SyntaxKind::Named => {
+                    if let Some(mut parsed) = Self::parse_named_arg(arg) {
+                        if parsed.value.trim().is_empty() {
+                            if let Some((value, value_node, value_nodes, cursor)) =
+                                Self::recover_empty_named_value(&children, idx + 1)
+                            {
+                                parsed.value = value;
+                                parsed.value_node = value_node;
+                                parsed.value_nodes = value_nodes;
+                                idx = cursor.saturating_sub(1);
                             }
                         }
-                        // Skip punctuation and whitespace
-                        SyntaxKind::Comma
-                        | SyntaxKind::LeftParen
-                        | SyntaxKind::RightParen
-                        | SyntaxKind::Space => {
-                            continue;
+
+                        let idx = all.len();
+                        if let Some(ref name) = parsed.name {
+                            named.entry(name.clone()).or_insert(idx);
                         }
-                        _ => {
-                            // Positional argument
-                            if is_content_node(arg) {
-                                let value = get_simple_text(arg);
-                                if !value.is_empty() {
-                                    positional.push(value.clone());
-                                    all.push(ParsedArg {
-                                        value,
-                                        name: None,
-                                        is_positional: true,
-                                    });
-                                }
-                            }
-                        }
+                        all.push(parsed);
                     }
                 }
-                break;
+                SyntaxKind::Comma
+                | SyntaxKind::LeftParen
+                | SyntaxKind::RightParen
+                | SyntaxKind::Space => {}
+                _ if is_content_node(arg) => {
+                    let value = get_simple_text(arg);
+                    if !value.is_empty() {
+                        let idx = all.len();
+                        positional.push(idx);
+                        all.push(ParsedArg {
+                            value,
+                            name: None,
+                            is_positional: true,
+                            node: arg,
+                            value_node: Some(arg),
+                            value_nodes: vec![arg],
+                        });
+                    }
+                }
+                _ => {}
             }
+
+            idx += 1;
         }
 
         Self {
@@ -573,52 +835,246 @@ impl FuncArgs {
         }
     }
 
-    /// Parse a Named argument node to extract key and value
-    fn parse_named_arg(node: &SyntaxNode) -> (Option<String>, Option<String>) {
+    fn empty() -> Self {
+        Self {
+            named: std::collections::HashMap::new(),
+            positional: Vec::new(),
+            all: Vec::new(),
+        }
+    }
+
+    fn recover_empty_named_value(
+        children: &[&'a SyntaxNode],
+        mut cursor: usize,
+    ) -> Option<(String, Option<&'a SyntaxNode>, Vec<&'a SyntaxNode>, usize)> {
+        while cursor < children.len() && children[cursor].kind() == SyntaxKind::Space {
+            cursor += 1;
+        }
+
+        if cursor >= children.len() {
+            return None;
+        }
+
+        let first = children[cursor];
+        let mut value_nodes = Vec::new();
+        let mut value_node = Some(first);
+        let mut value = String::new();
+
+        let is_self_contained = matches!(
+            first.kind(),
+            SyntaxKind::Parenthesized
+                | SyntaxKind::Array
+                | SyntaxKind::Dict
+                | SyntaxKind::ContentBlock
+                | SyntaxKind::Markup
+                | SyntaxKind::Str
+                | SyntaxKind::Equation
+                | SyntaxKind::FuncCall
+        );
+
+        if is_self_contained {
+            value_nodes.push(first);
+            value.push_str(first.text().as_ref());
+            return Some((
+                value.trim().to_string(),
+                value_node,
+                value_nodes,
+                cursor + 1,
+            ));
+        }
+
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut brace_depth = 0usize;
+
+        while cursor < children.len() {
+            let node = children[cursor];
+            match node.kind() {
+                SyntaxKind::Comma | SyntaxKind::Semicolon
+                    if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 =>
+                {
+                    break;
+                }
+                SyntaxKind::RightParen
+                    if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 =>
+                {
+                    break;
+                }
+                SyntaxKind::Named if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                    break;
+                }
+                SyntaxKind::LeftParen => paren_depth += 1,
+                SyntaxKind::RightParen if paren_depth > 0 => paren_depth -= 1,
+                SyntaxKind::LeftBracket => bracket_depth += 1,
+                SyntaxKind::RightBracket if bracket_depth > 0 => bracket_depth -= 1,
+                SyntaxKind::LeftBrace => brace_depth += 1,
+                SyntaxKind::RightBrace if brace_depth > 0 => brace_depth -= 1,
+                _ => {}
+            }
+
+            if value_node.is_none() && node.kind() != SyntaxKind::Space {
+                value_node = Some(node);
+            }
+
+            if node.kind() != SyntaxKind::Space {
+                value_nodes.push(node);
+            }
+            value.push_str(node.text().as_ref());
+            cursor += 1;
+        }
+
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some((trimmed, value_node, value_nodes, cursor))
+        }
+    }
+
+    /// Parse a Named argument node to extract key and value while preserving AST nodes.
+    fn parse_named_arg(node: &'a SyntaxNode) -> Option<ParsedArg<'a>> {
         let mut key: Option<String> = None;
-        let mut value: Option<String> = None;
+        let mut value = String::new();
+        let mut value_node: Option<&'a SyntaxNode> = None;
+        let mut value_nodes: Vec<&'a SyntaxNode> = Vec::new();
+        let mut seen_colon = false;
 
         for child in node.children() {
             match child.kind() {
-                SyntaxKind::Ident => {
-                    if key.is_none() {
-                        key = Some(child.text().to_string());
+                SyntaxKind::Ident | SyntaxKind::MathIdent if key.is_none() => {
+                    key = Some(child.text().to_string());
+                }
+                SyntaxKind::Colon if key.is_some() => {
+                    seen_colon = true;
+                }
+                SyntaxKind::Space if !seen_colon => {}
+                _ if key.is_some() && seen_colon => {
+                    let text = get_simple_text(child);
+                    if !text.trim().is_empty() {
+                        if value_node.is_none() {
+                            value_node = Some(child);
+                        }
+                        value_nodes.push(child);
+                        value.push_str(&text);
                     }
                 }
-                // Skip punctuation
-                SyntaxKind::Colon | SyntaxKind::Space => {
-                    continue;
-                }
-                _ => {
-                    // The value node
-                    if key.is_some() && value.is_none() {
-                        value = Some(get_simple_text(child));
-                    }
-                }
+                _ => {}
             }
         }
 
-        (key, value)
+        Some(ParsedArg {
+            value: value.trim().to_string(),
+            name: Some(key?),
+            is_positional: false,
+            node,
+            value_node,
+            value_nodes,
+        })
+    }
+
+    /// Get a named argument descriptor by key.
+    pub fn named_arg(&self, key: &str) -> Option<&ParsedArg<'a>> {
+        self.named.get(key).and_then(|idx| self.all.get(*idx))
     }
 
     /// Get a named argument value by key
     pub fn named(&self, key: &str) -> Option<&str> {
-        self.named.get(key).map(|s| s.as_str())
+        self.named_arg(key).map(|arg| arg.value.as_str())
+    }
+
+    /// Get a named argument value node by key.
+    pub fn named_node(&self, key: &str) -> Option<&'a SyntaxNode> {
+        self.named_arg(key).and_then(|arg| arg.value_node)
+    }
+
+    /// Get all named argument value nodes by key.
+    pub fn named_nodes(&self, key: &str) -> Option<&[&'a SyntaxNode]> {
+        self.named_arg(key).map(|arg| arg.value_nodes.as_slice())
+    }
+
+    /// Get a named argument as text.
+    pub fn named_text(&self, key: &str) -> Option<&str> {
+        self.named(key)
+    }
+
+    /// Parse a named argument as bool.
+    pub fn named_bool(&self, key: &str) -> Option<bool> {
+        let value = self.named(key)?.trim().trim_matches('"');
+        match value {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Parse a named argument as usize.
+    pub fn named_usize(&self, key: &str) -> Option<usize> {
+        self.named(key)?.trim().parse::<usize>().ok()
+    }
+
+    /// Parse a named argument as LaTeX-compatible length.
+    pub fn named_length(&self, key: &str) -> Option<String> {
+        extract_length_value(self.named(key)?)
+    }
+
+    /// Parse a named argument as an angle in degrees.
+    pub fn named_angle(&self, key: &str) -> Option<f64> {
+        parse_angle_value(self.named(key)?)
+    }
+
+    /// Get a named color expression as text.
+    pub fn named_color(&self, key: &str) -> Option<&str> {
+        self.named(key)
     }
 
     /// Get a positional argument value by index
     pub fn positional(&self, index: usize) -> Option<&str> {
-        self.positional.get(index).map(|s| s.as_str())
+        self.positional_arg(index).map(|arg| arg.value.as_str())
+    }
+
+    /// Get a positional argument descriptor by index.
+    pub fn positional_arg(&self, index: usize) -> Option<&ParsedArg<'a>> {
+        self.positional
+            .get(index)
+            .and_then(|all_idx| self.all.get(*all_idx))
+    }
+
+    /// Get a positional argument value node by index.
+    pub fn positional_node(&self, index: usize) -> Option<&'a SyntaxNode> {
+        self.positional_arg(index).and_then(|arg| arg.value_node)
     }
 
     /// Get all positional argument values
-    pub fn positional_values(&self) -> &[String] {
-        &self.positional
+    pub fn positional_values(&self) -> Vec<&str> {
+        self.positional
+            .iter()
+            .filter_map(|idx| self.all.get(*idx).map(|arg| arg.value.as_str()))
+            .collect()
     }
 
     /// Get all named argument keys
     pub fn named_keys(&self) -> Vec<&str> {
-        self.named.keys().map(|s| s.as_str()).collect()
+        self.all
+            .iter()
+            .filter_map(|arg| arg.name.as_deref())
+            .collect()
+    }
+
+    /// Get unknown named argument keys given an allow-list.
+    pub fn unknown_named_keys<'b>(&'b self, known: &[&str]) -> Vec<&'b str> {
+        self.all
+            .iter()
+            .filter_map(|arg| arg.name.as_deref())
+            .filter(|name| !known.contains(name))
+            .collect()
+    }
+
+    /// Check if there are any unknown named arguments given an allow-list.
+    pub fn has_unknown_named(&self, known: &[&str]) -> bool {
+        self.all
+            .iter()
+            .filter_map(|arg| arg.name.as_deref())
+            .any(|name| !known.contains(&name))
     }
 
     /// Get count of positional arguments
@@ -637,24 +1093,49 @@ impl FuncArgs {
     }
 
     /// Iterate over all arguments in order
-    pub fn iter(&self) -> impl Iterator<Item = &ParsedArg> {
+    pub fn iter(&self) -> impl Iterator<Item = &ParsedArg<'a>> {
         self.all.iter()
+    }
+
+    /// Find the parsed argument descriptor for an original AST node.
+    pub fn arg_for_node(&self, node: &SyntaxNode) -> Option<&ParsedArg<'a>> {
+        self.all.iter().find(|arg| std::ptr::eq(arg.node, node))
     }
 
     /// Get the first positional argument (common case)
     pub fn first(&self) -> Option<&str> {
-        self.positional.first().map(|s| s.as_str())
+        self.positional_arg(0).map(|arg| arg.value.as_str())
+    }
+
+    /// Get the first positional argument node.
+    pub fn first_node(&self) -> Option<&'a SyntaxNode> {
+        self.positional_node(0)
     }
 
     /// Check if there are any arguments
     pub fn is_empty(&self) -> bool {
-        self.positional.is_empty() && self.named.is_empty()
+        self.all.is_empty()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use typst_syntax::{parse_code, SyntaxKind, SyntaxNode};
+
+    fn find_first_func_call(node: &SyntaxNode) -> Option<SyntaxNode> {
+        if node.kind() == SyntaxKind::FuncCall {
+            return Some(node.clone());
+        }
+
+        for child in node.children() {
+            if let Some(found) = find_first_func_call(&child) {
+                return Some(found);
+            }
+        }
+
+        None
+    }
 
     #[test]
     fn test_escape_latex() {
@@ -682,5 +1163,140 @@ mod tests {
             Some("0.50\\textwidth".to_string())
         );
         assert_eq!(extract_length_value("1fr"), None); // fr units handled separately
+    }
+
+    #[test]
+    fn test_func_args_preserve_order_and_nodes() {
+        let root = parse_code("demo(1, size: #200%, block: true)");
+        let func = find_first_func_call(&root).expect("func call");
+        let children: Vec<_> = func.children().collect();
+        let args = FuncArgs::from_func_call(&children);
+        assert_eq!(args.first(), Some("1"));
+        assert_eq!(args.named("size"), Some("#200%"));
+        assert_eq!(args.named_bool("block"), Some(true));
+        assert_eq!(
+            args.named_nodes("size").map(|nodes| {
+                nodes
+                    .iter()
+                    .map(|node| node.text().to_string())
+                    .collect::<String>()
+            }),
+            Some("#200%".to_string())
+        );
+
+        let ordered: Vec<_> = args
+            .iter()
+            .map(|arg| (arg.name.clone(), arg.value.clone(), arg.is_positional))
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![
+                (None, "1".to_string(), true),
+                (Some("size".to_string()), "#200%".to_string(), false),
+                (Some("block".to_string()), "true".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_func_args_unknown_keys_and_typed_helpers() {
+        let root = parse_code("demo(width: 10pt, angle: 1.57079632679rad, mode: fancy)");
+        let func = find_first_func_call(&root).expect("func call");
+        let children: Vec<_> = func.children().collect();
+        let args = FuncArgs::from_func_call(&children);
+
+        assert_eq!(args.named_length("width"), Some("10pt".to_string()));
+        assert!(args.named_angle("angle").unwrap() > 89.9);
+        assert_eq!(args.unknown_named_keys(&["width", "angle"]), vec!["mode"]);
+        assert!(args.has_unknown_named(&["width", "angle"]));
+    }
+
+    #[test]
+    fn test_func_args_content_block_node() {
+        let root = parse_code("demo(width: 10pt, [hello])");
+        let func = find_first_func_call(&root).expect("func call");
+        let children: Vec<_> = func.children().collect();
+        let args = FuncArgs::from_func_call(&children);
+
+        assert_eq!(args.positional_count(), 1);
+        assert_eq!(
+            args.positional_node(0).map(|node| node.kind()),
+            Some(SyntaxKind::ContentBlock)
+        );
+    }
+
+    #[test]
+    fn test_func_args_angle_with_content_block() {
+        let root = parse_code("rotate(angle: 90deg)[Hi]");
+        let func = find_first_func_call(&root).expect("func call");
+        let children: Vec<_> = func.children().collect();
+        let args = FuncArgs::from_func_call(&children);
+
+        assert_eq!(args.named("angle"), Some("90deg"));
+        assert_eq!(args.named_angle("angle"), Some(90.0));
+        assert_eq!(
+            args.positional_node(0).map(|node| node.kind()),
+            Some(SyntaxKind::ContentBlock)
+        );
+    }
+
+    #[test]
+    fn test_func_args_tuple_named_value_preserved() {
+        let root = parse_code("grid(columns: (auto, auto, auto))[A]");
+        let func = find_first_func_call(&root).expect("func call");
+        let children: Vec<_> = func.children().collect();
+        let args = FuncArgs::from_func_call(&children);
+        assert_eq!(args.named("columns"), Some("(auto, auto, auto)"));
+    }
+
+    #[test]
+    fn test_func_args_rgb_named_value_preserved() {
+        let root = parse_code("text(fill: rgb(255, 0, 0))[Hello]");
+        let func = find_first_func_call(&root).expect("func call");
+        let children: Vec<_> = func.children().collect();
+        let args = FuncArgs::from_func_call(&children);
+        assert_eq!(args.named("fill"), Some("rgb(255, 0, 0)"));
+    }
+
+    #[test]
+    fn test_typst_color_to_latex_spec_rgb_models() {
+        assert_eq!(
+            typst_color_to_latex_spec("rgb(255, 0, 0)"),
+            LatexColorSpec::new(Some("RGB"), "255,0,0")
+        );
+        assert_eq!(
+            typst_color_to_latex_spec("rgb(1, 0, 0)"),
+            LatexColorSpec::new(Some("rgb"), "1,0,0")
+        );
+        assert_eq!(
+            typst_color_to_latex_spec("rgb(\"#ff0000\")"),
+            LatexColorSpec::new(Some("HTML"), "FF0000")
+        );
+    }
+
+    #[test]
+    fn test_typst_color_to_latex_spec_cmyk_and_luma() {
+        assert_eq!(
+            typst_color_to_latex_spec("cmyk(0, 1, 1, 0)"),
+            LatexColorSpec::new(Some("cmyk"), "0,1,1,0")
+        );
+        assert_eq!(
+            typst_color_to_latex_spec("luma(0.5)"),
+            LatexColorSpec::new(Some("gray"), "0.5")
+        );
+    }
+
+    #[test]
+    fn test_normalize_typst_color_expr() {
+        assert_eq!(normalize_typst_color_expr("red"), Some("red".to_string()));
+        assert_eq!(
+            normalize_typst_color_expr("blue.lighten(80%)"),
+            Some("blue.lighten(80%)".to_string())
+        );
+        assert_eq!(
+            normalize_typst_color_expr("rgb(255, 0, 0)"),
+            Some("rgb(255, 0, 0)".to_string())
+        );
+        assert_eq!(normalize_typst_color_expr("not-a-color"), None);
     }
 }

@@ -208,6 +208,24 @@ fn test_cell_fill() {
 }
 
 #[test]
+fn test_cell_fill_color_models() {
+    let mut rgb_cell = LatexCell::new("RGB".to_string());
+    rgb_cell.fill = Some("rgb(255, 0, 0)".to_string());
+    let rgb_latex = rgb_cell.to_latex(LatexCellAlign::Center);
+    assert!(rgb_latex.contains("\\cellcolor[RGB]{255,0,0}"));
+
+    let mut cmyk_cell = LatexCell::new("CMYK".to_string());
+    cmyk_cell.fill = Some("cmyk(0, 1, 1, 0)".to_string());
+    let cmyk_latex = cmyk_cell.to_latex(LatexCellAlign::Center);
+    assert!(cmyk_latex.contains("\\cellcolor[cmyk]{0,1,1,0}"));
+
+    let mut gray_cell = LatexCell::new("Gray".to_string());
+    gray_cell.fill = Some("luma(0.5)".to_string());
+    let gray_latex = gray_cell.to_latex(LatexCellAlign::Center);
+    assert!(gray_latex.contains("\\cellcolor[gray]{0.5}"));
+}
+
+#[test]
 fn test_nested_table_cell() {
     // Test that a cell containing a nested tabular works
     let nested_tabular = r"\begin{tabular}{|c|c|}

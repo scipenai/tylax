@@ -1883,6 +1883,324 @@ mod t2l_lr_delimiters {
             result
         );
     }
+
+    #[test]
+    fn test_lr_size_percent_uses_fixed_delimiters() {
+        let result = typst_to_latex("$lr({a_n}, size: #200%)$");
+        assert!(
+            result.contains("\\bigg\\{") && result.contains("\\bigg\\}"),
+            "size: #200% should map to fixed-size braces, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("\\left") && !result.contains("\\right"),
+            "Explicit size should not use \\left/\\right, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("size:") && !result.contains('%'),
+            "Named arg fragments should not leak, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_lr_size_small_percent_uses_bigl() {
+        let result = typst_to_latex("$lr((x+y), size: #120%)$");
+        assert!(
+            result.contains("\\big(") && result.contains("\\big)"),
+            "size: #120% should map to \\big...\\big, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("\\left") && !result.contains("\\right"),
+            "Explicit size should not use \\left/\\right, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("size:") && !result.contains('%'),
+            "Named arg fragments should not leak, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_lr_size_100_percent_uses_plain_delimiters() {
+        let result = typst_to_latex("$lr((x+y), size: #100%)$");
+        assert!(
+            !result.contains("\\left") && !result.contains("\\right"),
+            "size: #100% should stay plain, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("\\bigl")
+                && !result.contains("\\Bigl")
+                && !result.contains("\\biggl")
+                && !result.contains("\\Biggl"),
+            "size: #100% should not use fixed-size commands, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("size:") && !result.contains('%'),
+            "Named arg fragments should not leak, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_lr_size_with_empty_delimiter_dot() {
+        let result = typst_to_latex("$lr(., x, size: #200%)$");
+        assert!(
+            result.contains("\\bigg."),
+            "Dot delimiter should remain valid in fixed-size mode, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("size:") && !result.contains('%'),
+            "Named arg fragments should not leak, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_lr_size_unsupported_unit_falls_back_without_leak() {
+        let result = typst_to_latex("$lr((x+y), size: 2em)$");
+        assert!(
+            result.contains("\\left(") && result.contains("\\right)"),
+            "Unsupported size units should fall back to legacy auto sizing, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("size:"),
+            "Named arg fragments should not leak, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_lr_unknown_named_arg_falls_back_without_dropping_content() {
+        let result = typst_to_latex("$lr((x+y), foo: bar)$");
+        assert!(
+            result.contains("foo") && result.contains("bar"),
+            "Unknown named args should not be silently dropped, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_lr_size_and_unknown_named_arg_drops_only_size() {
+        let result = typst_to_latex("$lr((x), size: #200%, foo: bar)$");
+        assert!(
+            !result.contains("size:") && !result.contains('%'),
+            "Recognized size arg should still be stripped when unknown named args exist, got: {}",
+            result
+        );
+        assert!(
+            result.contains("foo") && result.contains("bar"),
+            "Unknown named args should still be preserved, got: {}",
+            result
+        );
+    }
+}
+
+// ============================================================================
+// Named Argument Regression Tests - Typst to LaTeX
+// ============================================================================
+
+mod t2l_named_args {
+    use super::*;
+
+    #[test]
+    fn test_rotate_named_angle_preserved() {
+        let result =
+            typst_to_latex_with_options("#rotate(angle: 90deg)[Hi]", &T2LOptions::default());
+        assert!(
+            result.contains("\\rotatebox{90}"),
+            "rotate angle should be preserved, got: {}",
+            result
+        );
+        assert!(
+            result.contains("Hi"),
+            "rotate content missing, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_text_named_args_no_leak() {
+        let result = typst_to_latex_with_options(
+            "#text(weight: \"bold\", style: \"italic\", size: 20pt)[Hello]",
+            &T2LOptions::default(),
+        );
+        assert!(
+            result.contains("\\textbf"),
+            "missing bold wrapper: {}",
+            result
+        );
+        assert!(
+            result.contains("\\textit"),
+            "missing italic wrapper: {}",
+            result
+        );
+        assert!(
+            result.contains("\\Huge") || result.contains("\\huge"),
+            "missing size wrapper: {}",
+            result
+        );
+        assert!(!result.contains("size:"), "named arg leaked: {}", result);
+    }
+
+    #[test]
+    fn test_raw_named_args_preserved() {
+        let result = typst_to_latex_with_options(
+            "#raw(lang: \"rust\", block: true)[fn main() {}]",
+            &T2LOptions::default(),
+        );
+        assert!(
+            result.contains("\\begin{lstlisting}")
+                || result.contains("\\begin{verbatim}")
+                || result.contains("\\texttt"),
+            "raw content should remain code-like, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("lang:"),
+            "lang named arg leaked: {}",
+            result
+        );
+        assert!(
+            !result.contains("block:"),
+            "block named arg leaked: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_grid_columns_named_arg_preserved() {
+        let result =
+            typst_to_latex_with_options("#grid(columns: 3)[A][B][C]", &T2LOptions::default());
+        assert!(
+            result.contains("0.32\\textwidth"),
+            "grid columns should drive width, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("columns:"),
+            "columns named arg leaked: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_grid_tuple_columns_named_arg_preserved() {
+        let result = typst_to_latex_with_options(
+            "#grid(columns: (auto, auto, auto))[A][B][C]",
+            &T2LOptions::default(),
+        );
+        assert!(
+            result.contains("0.32\\textwidth"),
+            "tuple-valued columns should still infer 3 columns, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("columns:"),
+            "columns named arg leaked: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_text_rgb_fill_named_arg_preserved() {
+        let result = typst_to_latex_with_options(
+            "#text(fill: rgb(255, 0, 0))[Hello]",
+            &T2LOptions::default(),
+        );
+        assert!(
+            result.contains("\\textcolor[RGB]{255,0,0}"),
+            "rgb fill should map to xcolor RGB, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("fill:"),
+            "fill named arg leaked: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_text_cmyk_fill_named_arg_preserved() {
+        let result = typst_to_latex_with_options(
+            "#text(fill: cmyk(0, 1, 1, 0))[Hello]",
+            &T2LOptions::default(),
+        );
+        assert!(
+            result.contains("\\textcolor[cmyk]{0,1,1,0}"),
+            "cmyk fill should map to xcolor cmyk, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("fill:"),
+            "fill named arg leaked: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_text_luma_fill_named_arg_preserved() {
+        let result =
+            typst_to_latex_with_options("#text(fill: luma(0.5))[Hello]", &T2LOptions::default());
+        assert!(
+            result.contains("\\textcolor[gray]{0.5}"),
+            "luma fill should map to xcolor gray, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("fill:"),
+            "fill named arg leaked: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_rect_rgb_fill_named_arg_preserved() {
+        let result = typst_to_latex_with_options(
+            "#rect(fill: rgb(255, 0, 0))[Hello]",
+            &T2LOptions::default(),
+        );
+        assert!(
+            result.contains("\\colorbox[RGB]{255,0,0}"),
+            "rect rgb fill should map to xcolor RGB, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("fill:"),
+            "fill named arg leaked: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_bibliography_style_named_arg_preserved() {
+        let result = typst_to_latex_with_options(
+            "#bibliography(\"refs.bib\", style: plain)",
+            &T2LOptions::default(),
+        );
+        assert!(
+            result.contains("\\bibliographystyle{plain}"),
+            "style should be preserved, got: {}",
+            result
+        );
+        assert!(
+            result.contains("\\bibliography{refs}"),
+            "bib file should be preserved, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("style:"),
+            "style named arg leaked: {}",
+            result
+        );
+    }
 }
 
 // ============================================================================

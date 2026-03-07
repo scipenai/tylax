@@ -3,7 +3,7 @@
 //! Handles mathematical expressions, formulas, and math-specific constructs.
 
 use super::context::{ConvertContext, TokenType};
-use super::utils::{get_simple_text, is_content_node, UNICODE_TO_LATEX};
+use super::utils::{get_simple_text, is_content_node, FuncArgs, UNICODE_TO_LATEX};
 use crate::data::maps::{DELIMITER_MAP, TYPST_TO_TEX};
 use crate::data::typst_compat::{MathHandler, TYPST_MATH_HANDLERS};
 use typst_syntax::{SyntaxKind, SyntaxNode};
@@ -1032,48 +1032,22 @@ fn handle_special_math_func(func_str: &str, children: &[&SyntaxNode], ctx: &mut 
 /// Convert matrix-like constructs
 pub fn convert_matrix(node: &SyntaxNode, ctx: &mut ConvertContext, env_name: &str) {
     let children: Vec<&SyntaxNode> = node.children().collect();
+    let args = FuncArgs::from_func_call(&children);
 
     // Determine the actual environment name based on delim: parameter
     let mut actual_env = env_name.to_string();
 
-    if let Some(args_node) = children.get(1) {
-        for child in args_node.children() {
-            if child.kind() == SyntaxKind::Named {
-                let named_children: Vec<&SyntaxNode> = child.children().collect();
-                if !named_children.is_empty() {
-                    let key = named_children[0].text().to_string();
-                    if key == "delim" {
-                        // Find the value (skip key, colon, space)
-                        for nc in &named_children {
-                            let val = nc.text().to_string();
-                            let val = val.trim().trim_matches('"').trim_matches('\'');
-                            match val {
-                                "[" => {
-                                    actual_env = "bmatrix".to_string();
-                                    break;
-                                }
-                                "(" => {
-                                    actual_env = "pmatrix".to_string();
-                                    break;
-                                }
-                                "{" => {
-                                    actual_env = "Bmatrix".to_string();
-                                    break;
-                                }
-                                "|" => {
-                                    actual_env = "vmatrix".to_string();
-                                    break;
-                                }
-                                "||" => {
-                                    actual_env = "Vmatrix".to_string();
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
+    if let Some(delim) = args
+        .named_text("delim")
+        .map(|value| value.trim().trim_matches('"').trim_matches('\''))
+    {
+        match delim {
+            "[" => actual_env = "bmatrix".to_string(),
+            "(" => actual_env = "pmatrix".to_string(),
+            "{" => actual_env = "Bmatrix".to_string(),
+            "|" => actual_env = "vmatrix".to_string(),
+            "||" => actual_env = "Vmatrix".to_string(),
+            _ => {}
         }
     }
 
@@ -1227,11 +1201,15 @@ pub fn convert_cases(node: &SyntaxNode, ctx: &mut ConvertContext) {
 
 /// Check if a text string represents a recognized delimiter for lr()
 fn is_delimiter(text: &str) -> bool {
-    DELIMITER_MAP.contains_key(text)
+    text == "." || DELIMITER_MAP.contains_key(text)
 }
 
 /// Get LaTeX delimiter string from text, with fallback
 fn get_latex_delimiter(text: &str, is_left: bool) -> &'static str {
+    if text == "." {
+        return ".";
+    }
+
     DELIMITER_MAP
         .get(text)
         .copied()
@@ -1254,39 +1232,167 @@ fn set_last_token_after_delimiter(ctx: &mut ConvertContext, delim: &str) {
 /// Convert Typst lr() function to LaTeX \left...\right
 /// Extracted to a separate function for clarity and maintainability
 fn convert_lr_to_latex(args_node: &SyntaxNode, ctx: &mut ConvertContext) {
-    let args: Vec<&SyntaxNode> = args_node.children().collect();
-    let content_nodes = collect_lr_content_nodes(&args);
+    let raw_args: Vec<&SyntaxNode> = args_node.children().collect();
+    let args = FuncArgs::from_args_node(args_node);
+    let parsed = parse_lr_args(&raw_args, &args);
 
-    if content_nodes.is_empty() {
-        ctx.push("\\left(\\right)");
+    if parsed.has_unknown_named_args {
+        let content_nodes = parsed.fallback_content_nodes;
+
+        if content_nodes.is_empty() {
+            ctx.push("\\left(\\right)");
+            return;
+        }
+
+        convert_lr_content_nodes(&content_nodes, ctx);
         return;
     }
 
-    convert_lr_content_nodes(&content_nodes, ctx);
+    if parsed.content_nodes.is_empty() {
+        if let Some(size) = parsed.size {
+            emit_fixed_lr_delimiter(ctx, "(", true, size);
+            emit_fixed_lr_delimiter(ctx, ")", false, size);
+        } else {
+            ctx.push("\\left(\\right)");
+        }
+        return;
+    }
+
+    if let Some(size) = parsed.size {
+        convert_lr_content_nodes_fixed_size(&parsed.content_nodes, size, ctx);
+    } else {
+        convert_lr_content_nodes(&parsed.content_nodes, ctx);
+    }
 }
 
-/// Collect lr() content nodes while preserving separators
-fn collect_lr_content_nodes<'a>(args: &'a [&'a SyntaxNode]) -> Vec<&'a SyntaxNode> {
-    let mut content = Vec::new();
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LrDelimiterSize {
+    Plain,
+    Big,
+    BigLarge,
+    BigGl,
+    BigGLarge,
+}
 
-    for child in args {
+struct ParsedLrArgs<'a> {
+    content_nodes: Vec<&'a SyntaxNode>,
+    fallback_content_nodes: Vec<&'a SyntaxNode>,
+    size: Option<LrDelimiterSize>,
+    has_unknown_named_args: bool,
+}
+
+fn parse_lr_args<'a>(raw_args: &'a [&'a SyntaxNode], args: &FuncArgs<'a>) -> ParsedLrArgs<'a> {
+    let mut content_nodes = Vec::new();
+    let mut fallback_content_nodes = Vec::new();
+    let size = args.named("size").and_then(parse_lr_size_percent);
+    let has_unknown_named_args = args.has_unknown_named(&["size"]);
+
+    for (idx, child) in raw_args.iter().enumerate() {
         match child.kind() {
             SyntaxKind::LeftParen | SyntaxKind::RightParen | SyntaxKind::Space => {}
-            SyntaxKind::Math | SyntaxKind::MathDelimited => {
-                push_lr_inner_nodes(child, &mut content);
+            SyntaxKind::Named => {
+                if !is_lr_size_named(child, args) {
+                    fallback_content_nodes.push(*child);
+                }
             }
             SyntaxKind::Comma | SyntaxKind::Semicolon => {
-                content.push(*child);
+                if lr_separator_is_adjacent_to_named(raw_args, idx) {
+                } else {
+                    content_nodes.push(*child);
+                }
+
+                if lr_separator_is_adjacent_to_size_named(raw_args, idx, args) {
+                    continue;
+                }
+
+                fallback_content_nodes.push(*child);
+            }
+            SyntaxKind::Math | SyntaxKind::MathDelimited => {
+                push_lr_inner_nodes(child, &mut content_nodes);
+                push_lr_inner_nodes(child, &mut fallback_content_nodes);
             }
             _ => {
                 if is_content_node(child) {
-                    content.push(*child);
+                    content_nodes.push(*child);
+                    fallback_content_nodes.push(*child);
                 }
             }
         }
     }
 
-    content
+    ParsedLrArgs {
+        content_nodes,
+        fallback_content_nodes,
+        size,
+        has_unknown_named_args,
+    }
+}
+
+fn lr_separator_is_adjacent_to_named(args: &[&SyntaxNode], idx: usize) -> bool {
+    lr_prev_significant_arg(args, idx)
+        .map(|node| node.kind() == SyntaxKind::Named)
+        .unwrap_or(false)
+        || lr_next_significant_arg(args, idx)
+            .map(|node| node.kind() == SyntaxKind::Named)
+            .unwrap_or(false)
+}
+
+fn lr_separator_is_adjacent_to_size_named(
+    args: &[&SyntaxNode],
+    idx: usize,
+    parsed_args: &FuncArgs<'_>,
+) -> bool {
+    lr_prev_significant_arg(args, idx)
+        .map(|node| is_lr_size_named(node, parsed_args))
+        .unwrap_or(false)
+        || lr_next_significant_arg(args, idx)
+            .map(|node| is_lr_size_named(node, parsed_args))
+            .unwrap_or(false)
+}
+
+fn is_lr_size_named(node: &SyntaxNode, parsed_args: &FuncArgs<'_>) -> bool {
+    parsed_args
+        .arg_for_node(node)
+        .and_then(|arg| arg.name.as_deref())
+        == Some("size")
+}
+
+fn lr_prev_significant_arg<'a>(args: &'a [&'a SyntaxNode], idx: usize) -> Option<&'a SyntaxNode> {
+    args[..idx].iter().rev().find_map(|node| match node.kind() {
+        SyntaxKind::LeftParen | SyntaxKind::RightParen | SyntaxKind::Space => None,
+        _ => Some(*node),
+    })
+}
+
+fn lr_next_significant_arg<'a>(args: &'a [&'a SyntaxNode], idx: usize) -> Option<&'a SyntaxNode> {
+    args[idx + 1..].iter().find_map(|node| match node.kind() {
+        SyntaxKind::LeftParen | SyntaxKind::RightParen | SyntaxKind::Space => None,
+        _ => Some(*node),
+    })
+}
+
+fn parse_lr_size_percent(text: &str) -> Option<LrDelimiterSize> {
+    let normalized = text
+        .trim()
+        .trim_start_matches('#')
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+
+    let percent = normalized.strip_suffix('%')?.trim().parse::<f64>().ok()?;
+
+    Some(if percent <= 100.0 {
+        LrDelimiterSize::Plain
+    } else if percent < 140.0 {
+        LrDelimiterSize::Big
+    } else if percent < 180.0 {
+        LrDelimiterSize::BigLarge
+    } else if percent < 240.0 {
+        LrDelimiterSize::BigGl
+    } else {
+        LrDelimiterSize::BigGLarge
+    })
 }
 
 fn push_lr_inner_nodes<'a>(node: &'a SyntaxNode, content: &mut Vec<&'a SyntaxNode>) {
@@ -1342,6 +1448,77 @@ fn convert_lr_content_nodes(content: &[&SyntaxNode], ctx: &mut ConvertContext) {
             convert_math_node(child, ctx);
         }
         ctx.push("\\right)");
+    }
+}
+
+fn convert_lr_content_nodes_fixed_size(
+    content: &[&SyntaxNode],
+    size: LrDelimiterSize,
+    ctx: &mut ConvertContext,
+) {
+    let left_delim = find_lr_edge_delimiter(content, true);
+    let right_delim = find_lr_edge_delimiter(content, false);
+
+    let (left_text, right_text) = if left_delim.is_some() || right_delim.is_some() {
+        (
+            left_delim
+                .as_ref()
+                .map(|delim| delim.text.as_str())
+                .unwrap_or("."),
+            right_delim
+                .as_ref()
+                .map(|delim| delim.text.as_str())
+                .unwrap_or("."),
+        )
+    } else {
+        ("(", ")")
+    };
+
+    emit_fixed_lr_delimiter(ctx, left_text, true, size);
+
+    for (idx, child) in content.iter().enumerate() {
+        if should_skip_lr_index(idx, left_delim.as_ref(), right_delim.as_ref()) {
+            continue;
+        }
+        convert_math_node(child, ctx);
+    }
+
+    emit_fixed_lr_delimiter(ctx, right_text, false, size);
+}
+
+fn emit_fixed_lr_delimiter(
+    ctx: &mut ConvertContext,
+    delim_text: &str,
+    is_left: bool,
+    size: LrDelimiterSize,
+) {
+    let latex = get_latex_delimiter(delim_text, is_left);
+
+    match size {
+        LrDelimiterSize::Plain => {
+            ctx.push(latex);
+            set_last_token_after_delimiter(ctx, latex);
+        }
+        LrDelimiterSize::Big => {
+            ctx.push("\\big");
+            ctx.push(latex);
+            set_last_token_after_delimiter(ctx, latex);
+        }
+        LrDelimiterSize::BigLarge => {
+            ctx.push("\\Big");
+            ctx.push(latex);
+            set_last_token_after_delimiter(ctx, latex);
+        }
+        LrDelimiterSize::BigGl => {
+            ctx.push("\\bigg");
+            ctx.push(latex);
+            set_last_token_after_delimiter(ctx, latex);
+        }
+        LrDelimiterSize::BigGLarge => {
+            ctx.push("\\Bigg");
+            ctx.push(latex);
+            set_last_token_after_delimiter(ctx, latex);
+        }
     }
 }
 

@@ -2,7 +2,7 @@
 
 use typst_syntax::SyntaxNode;
 
-use crate::core::typst2latex::utils::get_simple_text;
+use crate::core::typst2latex::utils::FuncArgs;
 
 /// Style of horizontal line
 #[allow(dead_code)]
@@ -79,42 +79,10 @@ impl LatexHLine {
 
     /// Parse from a Typst table.hline(...) FuncCall node
     pub fn from_typst_ast(node: &SyntaxNode) -> Self {
-        use typst_syntax::SyntaxKind;
-
-        let mut start: Option<usize> = None;
-        let mut end: Option<usize> = None;
-
-        for child in node.children() {
-            if child.kind() == SyntaxKind::Args {
-                for arg in child.children() {
-                    if arg.kind() == SyntaxKind::Named {
-                        let named_children: Vec<_> = arg.children().collect();
-                        if !named_children.is_empty() {
-                            let key = named_children[0].text().to_string();
-                            let full_text = get_simple_text(arg);
-
-                            if let Some(colon_pos) = full_text.find(':') {
-                                let value = full_text[colon_pos + 1..].trim();
-
-                                match key.as_str() {
-                                    "start" => {
-                                        if let Ok(n) = value.parse::<usize>() {
-                                            start = Some(n);
-                                        }
-                                    }
-                                    "end" => {
-                                        if let Ok(n) = value.parse::<usize>() {
-                                            end = Some(n);
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let children: Vec<_> = node.children().collect();
+        let args = FuncArgs::from_func_call(&children);
+        let start = args.named_usize("start");
+        let end = args.named_usize("end");
 
         LatexHLine {
             start,

@@ -4,7 +4,9 @@ use typst_syntax::SyntaxNode;
 
 use crate::core::typst2latex::context::{ConvertContext, EnvironmentContext};
 use crate::core::typst2latex::markup::convert_markup_node;
-use crate::core::typst2latex::utils::{get_simple_text, is_color_name, typst_color_to_latex};
+use crate::core::typst2latex::utils::{
+    format_latex_color_command, normalize_typst_color_expr, FuncArgs,
+};
 
 /// LaTeX cell alignment options
 #[allow(dead_code)]
@@ -109,65 +111,33 @@ impl LatexCell {
         let mut rowspan = 1usize;
         let mut align = None;
         let mut fill = None;
+        let children: Vec<_> = node.children().collect();
+        let args = FuncArgs::from_func_call(&children);
 
         for child in node.children() {
             if child.kind() == SyntaxKind::Args {
                 for arg in child.children() {
                     match arg.kind() {
                         SyntaxKind::Named => {
-                            // Parse named arguments like colspan: 2, rowspan: 3, align: center
-                            let named_children: Vec<_> = arg.children().collect();
-                            if !named_children.is_empty() {
-                                let key = named_children[0].text().to_string();
-
-                                // Extract value from the rest of the named argument
-                                let full_text = get_simple_text(arg);
-                                if let Some(colon_pos) = full_text.find(':') {
-                                    let value = full_text[colon_pos + 1..].trim();
-
-                                    match key.as_str() {
-                                        "colspan" => {
-                                            if let Ok(n) = value.parse::<usize>() {
-                                                colspan = n;
-                                            }
+                            if let Some(parsed) = args.arg_for_node(arg) {
+                                match parsed.name.as_deref() {
+                                    Some("colspan") => {
+                                        if let Some(n) = args.named_usize("colspan") {
+                                            colspan = n;
                                         }
-                                        "rowspan" => {
-                                            if let Ok(n) = value.parse::<usize>() {
-                                                rowspan = n;
-                                            }
-                                        }
-                                        "align" => {
-                                            align = Some(LatexCellAlign::from_typst(value));
-                                        }
-                                        "fill" => {
-                                            // Store the complete color expression for proper conversion
-                                            // Examples: "blue", "blue.lighten(80%)", "rgb(255, 0, 0)"
-                                            let value_trimmed = value.trim();
-
-                                            // Check if it starts with a known color name
-                                            if is_color_name(value_trimmed) {
-                                                fill = Some(value_trimmed.to_string());
-                                            } else if value_trimmed.contains('.') {
-                                                // Color with method call: blue.lighten(80%)
-                                                let base = value_trimmed
-                                                    .split('.')
-                                                    .next()
-                                                    .unwrap_or("")
-                                                    .trim();
-                                                if is_color_name(base) {
-                                                    // Store the FULL expression, not just base
-                                                    fill = Some(value_trimmed.to_string());
-                                                }
-                                            } else if value_trimmed.starts_with("rgb")
-                                                || value_trimmed.starts_with("luma")
-                                                || value_trimmed.starts_with("cmyk")
-                                            {
-                                                // Store as-is for potential future handling
-                                                fill = Some(value_trimmed.to_string());
-                                            }
-                                        }
-                                        _ => {}
                                     }
+                                    Some("rowspan") => {
+                                        if let Some(n) = args.named_usize("rowspan") {
+                                            rowspan = n;
+                                        }
+                                    }
+                                    Some("align") => {
+                                        align = Some(LatexCellAlign::from_typst(&parsed.value));
+                                    }
+                                    Some("fill") => {
+                                        fill = normalize_typst_color_expr(&parsed.value);
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -231,8 +201,10 @@ impl LatexCell {
 
         // Add cell color if present
         if let Some(ref color) = self.fill {
-            let latex_color = typst_color_to_latex(color);
-            prefix.push_str(&format!("\\cellcolor{{{}}} ", latex_color));
+            prefix.push_str(&format!(
+                "{} ",
+                format_latex_color_command("cellcolor", color)
+            ));
         }
 
         let content = format!("{}{}", prefix, content_str);
