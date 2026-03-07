@@ -585,6 +585,16 @@ fn convert_matrix(
     env_name: &str,
     output: &mut String,
 ) {
+    convert_matrix_with_delim(conv, node, env_name, None, output);
+}
+
+pub(crate) fn convert_matrix_with_delim(
+    conv: &mut LatexConverter,
+    node: &SyntaxNode,
+    env_name: &str,
+    delim_override: Option<&str>,
+    output: &mut String,
+) {
     conv.state.push_env(EnvironmentContext::Matrix);
     let prev_mode = conv.state.mode;
     conv.state.mode = ConversionMode::Math;
@@ -598,7 +608,7 @@ fn convert_matrix(
     // Determine delimiter type
     // For plain "matrix" environment, use delim: #none
     // For others, use the appropriate delimiter string
-    let delim = match env_name {
+    let delim = delim_override.or(match env_name {
         "pmatrix" => Some("("),
         "bmatrix" => Some("["),
         "Bmatrix" => Some("{"),
@@ -606,7 +616,7 @@ fn convert_matrix(
         "Vmatrix" => Some("‖"), // Use double bar Unicode character for Typst
         "smallmatrix" | "matrix" => None,
         _ => None,
-    };
+    });
 
     // Clean up content - remove zws markers and format
     let content = content
@@ -632,6 +642,15 @@ fn convert_matrix(
 /// The delimiter is always `#none` because `array` is typically wrapped by
 /// `\left...\right` which handles delimiters separately.
 fn convert_array(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut String) {
+    convert_array_with_delim(conv, node, None, output);
+}
+
+pub(crate) fn convert_array_with_delim(
+    conv: &mut LatexConverter,
+    node: &SyntaxNode,
+    delim_override: Option<&str>,
+    output: &mut String,
+) {
     conv.state.push_env(EnvironmentContext::Matrix);
     let prev_mode = conv.state.mode;
     conv.state.mode = ConversionMode::Math;
@@ -648,7 +667,14 @@ fn convert_array(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut Stri
         .trim()
         .to_string();
 
-    let _ = write!(output, "mat(delim: #none, {}) ", content);
+    match delim_override {
+        Some(delim) => {
+            let _ = write!(output, "mat(delim: \"{}\", {}) ", delim, content);
+        }
+        None => {
+            let _ = write!(output, "mat(delim: #none, {}) ", content);
+        }
+    }
 }
 
 /// Convert a cases environment

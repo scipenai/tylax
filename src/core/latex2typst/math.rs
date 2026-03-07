@@ -2,11 +2,12 @@
 //!
 //! This module handles math formulas, delimiters, and math-specific constructs.
 
-use mitex_parser::syntax::{FormulaItem, SyntaxElement, SyntaxKind};
+use mitex_parser::syntax::{FormulaItem, SyntaxElement, SyntaxKind, SyntaxNode};
 use rowan::ast::AstNode;
 use std::fmt::Write;
 
 use super::context::{ConversionMode, LatexConverter};
+use super::environment::{convert_array_with_delim, convert_matrix_with_delim};
 
 /// Convert a math formula ($..$ or $$..$$)
 pub fn convert_formula(conv: &mut LatexConverter, elem: SyntaxElement, output: &mut String) {
@@ -216,6 +217,58 @@ pub fn convert_lr(conv: &mut LatexConverter, elem: SyntaxElement, output: &mut S
         _ => (true, true),
     };
 
+    // Check for matrix-like bodies first so determinant-style expressions with
+    // vertical bars do not get collapsed into abs()/norm().
+    if let Some(matrix_like) = classify_lr_matrix_like(children.as_slice(), body_start, body_end) {
+        match (
+            &matrix_like.kind,
+            left_delim.as_deref(),
+            right_delim.as_deref(),
+        ) {
+            (LrMatrixKind::NoIntrinsicDelim, Some("("), Some(")")) => {
+                emit_lr_matrix_like(conv, &matrix_like.node, &matrix_like.env_name, "(", output);
+                return;
+            }
+            (LrMatrixKind::NoIntrinsicDelim, Some("["), Some("]")) => {
+                emit_lr_matrix_like(conv, &matrix_like.node, &matrix_like.env_name, "[", output);
+                return;
+            }
+            (LrMatrixKind::NoIntrinsicDelim, Some("{"), Some("}")) => {
+                emit_lr_matrix_like(conv, &matrix_like.node, &matrix_like.env_name, "{", output);
+                return;
+            }
+            (LrMatrixKind::NoIntrinsicDelim, Some("bar.v"), Some("bar.v")) => {
+                emit_lr_matrix_like(conv, &matrix_like.node, &matrix_like.env_name, "|", output);
+                return;
+            }
+            (LrMatrixKind::NoIntrinsicDelim, Some("bar.v.double"), Some("bar.v.double")) => {
+                emit_lr_matrix_like(conv, &matrix_like.node, &matrix_like.env_name, "‖", output);
+                return;
+            }
+            (LrMatrixKind::WithIntrinsicDelim, Some("bar.v"), Some("bar.v")) => {
+                emit_nested_lr_matrix_like(
+                    conv,
+                    &matrix_like.node,
+                    &matrix_like.env_name,
+                    "bar.v",
+                    output,
+                );
+                return;
+            }
+            (LrMatrixKind::WithIntrinsicDelim, Some("bar.v.double"), Some("bar.v.double")) => {
+                emit_nested_lr_matrix_like(
+                    conv,
+                    &matrix_like.node,
+                    &matrix_like.env_name,
+                    "bar.v.double",
+                    output,
+                );
+                return;
+            }
+            _ => {}
+        }
+    }
+
     // Check for norm: \left\| ... \right\| -> norm(...)
     if left_delim.as_deref() == Some("bar.v.double")
         && right_delim.as_deref() == Some("bar.v.double")
@@ -330,6 +383,115 @@ pub fn convert_lr(conv: &mut LatexConverter, elem: SyntaxElement, output: &mut S
     } else {
         output.push(' ');
     }
+}
+
+enum LrMatrixKind {
+    NoIntrinsicDelim,
+    WithIntrinsicDelim,
+}
+
+struct LrMatrixBody {
+    env_name: String,
+    node: SyntaxNode,
+    kind: LrMatrixKind,
+}
+
+fn classify_lr_matrix_like(
+    children: &[SyntaxElement],
+    body_start: usize,
+    body_end: usize,
+) -> Option<LrMatrixBody> {
+    let mut significant = Vec::new();
+
+    for child in children.iter().take(body_end).skip(body_start) {
+        match child {
+            SyntaxElement::Token(t)
+                if matches!(
+                    t.kind(),
+                    SyntaxKind::TokenWhiteSpace | SyntaxKind::TokenLineBreak
+                ) => {}
+            SyntaxElement::Token(t) if t.text() == "." => {}
+            SyntaxElement::Node(n) if n.kind() == SyntaxKind::ClauseLR => {}
+            _ => significant.push(child),
+        }
+    }
+
+    if significant.len() != 1 {
+        return None;
+    }
+
+    let node = unwrap_trivial_matrix_wrapper(significant[0].clone())?;
+    let env = mitex_parser::syntax::EnvItem::cast(node.clone())?;
+    let env_name = env.name_tok()?.text().to_string();
+
+    let kind = match env_name.as_str() {
+        "array" | "matrix" | "smallmatrix" => LrMatrixKind::NoIntrinsicDelim,
+        "pmatrix" | "bmatrix" | "Bmatrix" | "vmatrix" | "Vmatrix" => {
+            LrMatrixKind::WithIntrinsicDelim
+        }
+        _ => return None,
+    };
+
+    Some(LrMatrixBody {
+        env_name,
+        node,
+        kind,
+    })
+}
+
+fn unwrap_trivial_matrix_wrapper(elem: SyntaxElement) -> Option<SyntaxNode> {
+    match elem {
+        SyntaxElement::Node(node) => match node.kind() {
+            SyntaxKind::ItemCurly | SyntaxKind::ItemText | SyntaxKind::ClauseArgument => {
+                let mut significant = Vec::new();
+                for child in node.children_with_tokens() {
+                    match child.kind() {
+                        SyntaxKind::TokenWhiteSpace
+                        | SyntaxKind::TokenLineBreak
+                        | SyntaxKind::TokenLBrace
+                        | SyntaxKind::TokenRBrace => {}
+                        _ => significant.push(child),
+                    }
+                }
+                if significant.len() == 1 {
+                    unwrap_trivial_matrix_wrapper(significant[0].clone())
+                } else {
+                    Some(node)
+                }
+            }
+            _ => Some(node),
+        },
+        SyntaxElement::Token(_) => None,
+    }
+}
+
+fn emit_lr_matrix_like(
+    conv: &mut LatexConverter,
+    node: &SyntaxNode,
+    env_name: &str,
+    delim: &str,
+    output: &mut String,
+) {
+    match env_name {
+        "array" => convert_array_with_delim(conv, node, Some(delim), output),
+        _ => convert_matrix_with_delim(conv, node, env_name, Some(delim), output),
+    }
+}
+
+fn emit_nested_lr_matrix_like(
+    conv: &mut LatexConverter,
+    node: &SyntaxNode,
+    env_name: &str,
+    outer_delim: &str,
+    output: &mut String,
+) {
+    output.push_str("lr(");
+    output.push_str(outer_delim);
+    output.push(' ');
+    convert_matrix_with_delim(conv, node, env_name, None, output);
+    output.push(' ');
+    output.push_str(outer_delim);
+    output.push_str(") ");
 }
 
 /// Convert subscript/superscript attachment

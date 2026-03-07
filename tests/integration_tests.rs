@@ -108,6 +108,150 @@ mod l2t_math {
             "array inside \\left...\\right should become mat(), got: {}",
             result
         );
+
+        // determinant-like array with single bars should become a matrix with |
+        let result = latex_to_typst(r"\left|\begin{array}{cc} a & b \\ c & d \end{array}\right|");
+        assert!(
+            result.contains("mat(delim: \"|\"") || result.contains("mat(delim: \"|\", "),
+            "array inside \\left|...\\right| should become mat(delim: \"|\", ...), got: {}",
+            result
+        );
+        assert!(
+            !result.contains("abs("),
+            "array inside \\left|...\\right| should NOT become abs(...), got: {}",
+            result
+        );
+
+        // determinant-like array with double bars should become a matrix with ‖
+        let result = latex_to_typst(r"\left\|\begin{array}{cc} a & b \\ c & d \end{array}\right\|");
+        assert!(
+            result.contains("mat(delim: \"‖\"") || result.contains("mat(delim: \"‖\", "),
+            "array inside \\left\\|...\\right\\| should become mat(delim: \"‖\", ...), got: {}",
+            result
+        );
+        assert!(
+            !result.contains("norm("),
+            "array inside \\left\\|...\\right\\| should NOT become norm(...), got: {}",
+            result
+        );
+
+        // scalar abs must remain abs(...)
+        let result = latex_to_typst(r"\left|x+y\right|");
+        assert!(
+            result.contains("abs("),
+            "scalar |...| should still become abs(...), got: {}",
+            result
+        );
+
+        // scalar norm must remain norm(...)
+        let result = latex_to_typst(r"\left\|x+y\right\|");
+        assert!(
+            result.contains("norm("),
+            "scalar ||...|| should still become norm(...), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_lr_wrapped_no_intrinsic_matrix_family() {
+        let result = latex_to_typst(r"\left(\begin{matrix} a & b \\ c & d \end{matrix}\right)");
+        assert!(
+            result.contains("mat(delim: \"(\"") || result.contains("mat(delim: \"(\", "),
+            r"matrix inside \left(...\right) should inherit ( delimiter, got: {}",
+            result
+        );
+
+        let result =
+            latex_to_typst(r"\left[\begin{smallmatrix} a & b \\ c & d \end{smallmatrix}\right]");
+        assert!(
+            result.contains("mat(delim: \"[\"") || result.contains("mat(delim: \"[\", "),
+            r"smallmatrix inside \left[...\right] should inherit [ delimiter, got: {}",
+            result
+        );
+
+        let result = latex_to_typst(r"\left\{\begin{matrix} a & b \\ c & d \end{matrix}\right\}");
+        assert!(
+            result.contains("mat(delim: \"{\"") || result.contains("mat(delim: \"{\", "),
+            "matrix inside brace-wrapped left/right should inherit brace delimiter, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_lr_wrapped_intrinsic_matrix_family_preserves_nested_delims() {
+        let result = latex_to_typst(r"\left|\begin{pmatrix} a & b \\ c & d \end{pmatrix}\right|");
+        assert!(
+            result.contains("mat(delim: \"(\"") || result.contains("mat(delim: \"(\", "),
+            "pmatrix should keep its inner ( delimiter, got: {}",
+            result
+        );
+        assert!(
+            result.contains("bar.v") || result.contains("lr("),
+            "outer |...| should still be preserved around pmatrix, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("abs("),
+            "pmatrix inside |...| should not collapse to abs(...), got: {}",
+            result
+        );
+
+        let result = latex_to_typst(r"\left[\begin{pmatrix} a & b \\ c & d \end{pmatrix}\right]");
+        assert!(
+            result.contains("mat(delim: \"(\"") || result.contains("mat(delim: \"(\", "),
+            "pmatrix should keep its inner ( delimiter under outer [], got: {}",
+            result
+        );
+        assert!(
+            !result.contains("mat(delim: \"[\"") && !result.contains("mat(delim: \"[\", "),
+            "outer [] should not override inner pmatrix delimiter, got: {}",
+            result
+        );
+
+        let result = latex_to_typst(r"\left\|\begin{vmatrix} a & b \\ c & d \end{vmatrix}\right\|");
+        assert!(
+            result.contains("mat(delim: \"|\"") || result.contains("mat(delim: \"|\", "),
+            "vmatrix should keep its inner | delimiter, got: {}",
+            result
+        );
+        assert!(
+            result.contains("bar.v.double") || result.contains("lr("),
+            "outer ||...|| should still be preserved around vmatrix, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("norm("),
+            "vmatrix inside ||...|| should not collapse to norm(...), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_lr_wrapped_matrix_with_trivial_grouping() {
+        let result = latex_to_typst(r"\left|{\begin{array}{cc} a & b \\ c & d \end{array}}\right|");
+        assert!(
+            result.contains("mat(delim: \"|\"") || result.contains("mat(delim: \"|\", "),
+            "single curly wrapper should still classify array as matrix-like, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("abs("),
+            "single curly wrapper should not force abs(...), got: {}",
+            result
+        );
+
+        let result =
+            latex_to_typst(r"\left| {{\begin{array}{cc} a & b \\ c & d \end{array}} } \right|");
+        assert!(
+            result.contains("mat(delim: \"|\"") || result.contains("mat(delim: \"|\", "),
+            "nested trivial wrappers should still classify array as matrix-like, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("abs("),
+            "nested trivial wrappers should not force abs(...), got: {}",
+            result
+        );
     }
 
     #[test]
