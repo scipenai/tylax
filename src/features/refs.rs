@@ -20,6 +20,46 @@ pub enum CitationMode {
     NoParen,
 }
 
+pub fn citation_mode_from_latex_command(command: &str) -> Option<CitationMode> {
+    let normalized = command
+        .trim_start_matches('\\')
+        .trim_end_matches('*')
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "cite" | "citep" | "citeal" | "citealp" | "citealt" | "parencite" | "autocite"
+        | "footcite" | "smartcite" | "supercite" | "fullcite" | "footfullcite" | "cites"
+        | "parencites" | "autocites" => Some(CitationMode::Normal),
+        "citet" | "textcite" | "textcites" => Some(CitationMode::AuthorInText),
+        "citeyear" | "citeyearpar" => Some(CitationMode::SuppressAuthor),
+        "citeauthor" => Some(CitationMode::NoParen),
+        _ => None,
+    }
+}
+
+pub fn citation_mode_from_typst_form(form: Option<&str>) -> CitationMode {
+    let normalized = form
+        .map(str::trim)
+        .map(|s| s.trim_matches('"').trim_matches('\''))
+        .unwrap_or("");
+
+    match normalized {
+        "prose" => CitationMode::AuthorInText,
+        "year" => CitationMode::SuppressAuthor,
+        "author" => CitationMode::NoParen,
+        _ => CitationMode::Normal,
+    }
+}
+
+pub fn reference_type_from_latex_command(command: &str) -> Option<ReferenceType> {
+    match command.trim_start_matches('\\') {
+        "ref" => Some(ReferenceType::Basic),
+        "autoref" | "cref" | "Cref" | "nameref" => Some(ReferenceType::Named),
+        "pageref" => Some(ReferenceType::Page),
+        "eqref" => Some(ReferenceType::Equation),
+        _ => None,
+    }
+}
+
 /// A single citation
 #[derive(Debug, Clone)]
 pub struct Citation {
@@ -396,45 +436,58 @@ pub fn parse_latex_label(input: &str) -> Option<String> {
 // Typst Citation Parsing
 // ============================================================================
 
-/// Parse Typst citation (`@key` or `#cite(<key>)`)
+/// Parse explicit Typst citation (`#cite(<key>)`)
 pub fn parse_typst_citation(input: &str) -> Option<CiteGroup> {
     let input = input.trim();
 
-    if let Some(rest) = input.strip_prefix('@') {
-        // Simple @key syntax
-        let key: String = rest
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == ':')
-            .collect();
+    if !(input.starts_with("#cite(") || input.starts_with("cite(")) {
+        return None;
+    }
 
-        if key.is_empty() {
-            return None;
+    let mut group = CiteGroup::new();
+    let mode = citation_mode_from_typst_form(extract_named_string_arg(input, "form"));
+    group.suffix = extract_named_bracket_arg(input, "supplement");
+
+    let mut cursor = input;
+    while let Some(start) = cursor.find('<') {
+        let rest = &cursor[start + 1..];
+        let end = rest.find('>')?;
+        let key = rest[..end].trim();
+        if !key.is_empty() {
+            group.push(Citation::with_mode(key.to_string(), mode));
         }
-
-        let citation = Citation::new(key);
-        return Some(CiteGroup::single(citation));
+        cursor = &rest[end + 1..];
     }
 
-    if input.starts_with("#cite(") || input.starts_with("cite(") {
-        // #cite(<key>) or #cite(<key>, form: "prose")
-        let start = input.find('<')? + 1;
-        let end = input.find('>')?;
-        let key = input[start..end].to_string();
-
-        // Check for form argument
-        let mode = if input.contains("form: \"prose\"") || input.contains("form: 'prose'") {
-            CitationMode::AuthorInText
-        } else if input.contains("form: \"year\"") || input.contains("form: 'year'") {
-            CitationMode::SuppressAuthor
-        } else {
-            CitationMode::Normal
-        };
-
-        let citation = Citation::with_mode(key, mode);
-        return Some(CiteGroup::single(citation));
+    if group.citations.is_empty() {
+        None
+    } else {
+        Some(group)
     }
+}
 
-    None
+fn extract_named_string_arg<'a>(input: &'a str, name: &str) -> Option<&'a str> {
+    let pattern = format!("{}:", name);
+    let start = input.find(&pattern)? + pattern.len();
+    let rest = input[start..].trim_start();
+    let quote = rest.chars().next()?;
+    if quote != "\"".chars().next().unwrap() && quote != "'".chars().next().unwrap() {
+        return None;
+    }
+    let rest = &rest[quote.len_utf8()..];
+    let end = rest.find(quote)?;
+    Some(&rest[..end])
+}
+
+fn extract_named_bracket_arg(input: &str, name: &str) -> Option<String> {
+    let pattern = format!("{}:", name);
+    let start = input.find(&pattern)? + pattern.len();
+    let rest = input[start..].trim_start();
+    if !rest.starts_with('[') {
+        return None;
+    }
+    let end = rest.find(']')?;
+    Some(rest[1..end].trim().to_string())
 }
 
 /// Parse Typst reference (@label)
@@ -545,27 +598,8 @@ pub fn citation_to_typst(group: &CiteGroup) -> String {
         return String::new();
     }
 
-    // For single citation with normal mode, use simple @key syntax
-    if group.citations.len() == 1 {
-        let citation = &group.citations[0];
-
-        if citation.mode == CitationMode::Normal
-            && citation.prefix.is_none()
-            && citation.suffix.is_none()
-            && is_simple_key(&citation.key)
-        {
-            let mut result = format!("@{}", citation.key);
-
-            // Add suffix in brackets if group has suffix
-            if let Some(ref suffix) = group.suffix {
-                result.push_str(&format!("[{}]", suffix));
-            }
-
-            return result;
-        }
-    }
-
-    // Otherwise use #cite() syntax
+    // Citations must remain explicit in Typst.
+    // Bare @key is reserved for reference-first semantics on the T2L path.
     let mut result = String::from("#cite(");
 
     // Add keys
@@ -585,6 +619,9 @@ pub fn citation_to_typst(group: &CiteGroup) -> String {
         CitationMode::SuppressAuthor => {
             result.push_str(", form: \"year\"");
         }
+        CitationMode::NoParen => {
+            result.push_str(", form: \"author\"");
+        }
         _ => {}
     }
 
@@ -594,7 +631,11 @@ pub fn citation_to_typst(group: &CiteGroup) -> String {
     }
 
     result.push(')');
-    result
+    if let Some(ref prefix) = group.prefix {
+        format!("{} {}", prefix, result)
+    } else {
+        result
+    }
 }
 
 /// Check if a citation key is simple (can use @key syntax)
@@ -605,10 +646,34 @@ fn is_simple_key(key: &str) -> bool {
 
 /// Convert reference to Typst
 pub fn reference_to_typst(reference: &Reference) -> String {
-    if is_simple_key(&reference.target) {
-        format!("@{}", reference.target)
-    } else {
-        format!("#ref(<{}>)", reference.target)
+    match reference.ref_type {
+        ReferenceType::Equation => {
+            let target = if reference.target.starts_with("eq-") {
+                reference.target.clone()
+            } else {
+                format!("eq-{}", reference.target)
+            };
+            if is_simple_key(&target) {
+                format!("@{}", target)
+            } else {
+                format!("#ref(<{}>)", target)
+            }
+        }
+        ReferenceType::Page => {
+            let target = if is_simple_key(&reference.target) {
+                format!("@{}", reference.target)
+            } else {
+                format!("#ref(<{}>)", reference.target)
+            };
+            format!("#locate(loc => {{{}.page()}})", target)
+        }
+        _ => {
+            if is_simple_key(&reference.target) {
+                format!("@{}", reference.target)
+            } else {
+                format!("#ref(<{}>)", reference.target)
+            }
+        }
     }
 }
 
@@ -782,9 +847,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_typst_citation() {
-        let group = parse_typst_citation("@author2020").unwrap();
-        assert_eq!(group.citations[0].key, "author2020");
+    fn test_parse_typst_citation_is_explicit_only() {
+        assert!(parse_typst_citation("@author2020").is_none());
+
+        let reference = parse_typst_ref("@author2020").unwrap();
+        assert_eq!(reference.target, "author2020");
+        assert_eq!(reference.ref_type, ReferenceType::Basic);
     }
 
     #[test]
@@ -807,7 +875,24 @@ mod tests {
         let citation = Citation::new("test2020".to_string());
         let group = CiteGroup::single(citation);
         let typst = citation_to_typst(&group);
-        assert_eq!(typst, "@test2020");
+        assert_eq!(typst, r#"#cite(<test2020>)"#);
+    }
+
+    #[test]
+    fn test_citation_to_typst_with_prefix_and_suffix() {
+        let mut group = CiteGroup::single(Citation::new("test2020".to_string()));
+        group.prefix = Some("see".to_string());
+        group.suffix = Some("ch. 2".to_string());
+        let typst = citation_to_typst(&group);
+        assert_eq!(typst, r#"see #cite(<test2020>, supplement: [ch. 2])"#);
+    }
+
+    #[test]
+    fn test_citation_to_typst_author_form() {
+        let citation = Citation::with_mode("test2020".to_string(), CitationMode::NoParen);
+        let group = CiteGroup::single(citation);
+        let typst = citation_to_typst(&group);
+        assert_eq!(typst, r#"#cite(<test2020>, form: "author")"#);
     }
 
     #[test]
@@ -833,6 +918,24 @@ mod tests {
     fn test_reference_to_typst() {
         let reference = Reference::new("fig-1".to_string());
         assert_eq!(reference_to_typst(&reference), "@fig-1");
+    }
+
+    #[test]
+    fn test_reference_to_typst_equation_and_page() {
+        let equation = Reference {
+            target: "energy".to_string(),
+            ref_type: ReferenceType::Equation,
+        };
+        assert_eq!(reference_to_typst(&equation), "@eq-energy");
+
+        let page = Reference {
+            target: "fig-one".to_string(),
+            ref_type: ReferenceType::Page,
+        };
+        assert_eq!(
+            reference_to_typst(&page),
+            "#locate(loc => {@fig-one.page()})"
+        );
     }
 
     #[test]

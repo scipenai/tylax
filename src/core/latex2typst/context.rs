@@ -11,6 +11,7 @@ use std::fmt::Write;
 
 use crate::data::constants::{AcronymDef, GlossaryDef};
 use crate::data::maps::TEX_COMMAND_SPEC;
+use crate::features::refs::{CitationMode, ReferenceType};
 use fxhash::FxHashMap;
 use lazy_static::lazy_static;
 
@@ -184,6 +185,21 @@ pub struct PendingOperator {
     pub is_limits: bool,
 }
 
+/// Pending citation state for commands whose arguments are emitted as following siblings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCitation {
+    pub mode: CitationMode,
+    pub optional_args: Vec<String>,
+    pub current_optional_raw: String,
+    pub collecting_optional: bool,
+}
+
+/// Pending reference state for commands whose label argument is emitted as a following curly group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingReference {
+    pub ref_type: ReferenceType,
+}
+
 /// Conversion state maintained during AST traversal
 #[derive(Debug, Default)]
 pub struct ConversionState {
@@ -197,6 +213,10 @@ pub struct ConversionState {
     pub pending_label: Option<String>,
     /// Pending operator state
     pub pending_op: Option<PendingOperator>,
+    /// Pending citation state
+    pub pending_citation: Option<PendingCitation>,
+    /// Pending reference state
+    pub pending_reference: Option<PendingReference>,
     /// User-defined macros
     pub macros: HashMap<String, MacroDef>,
     /// Whether we're in preamble
@@ -538,9 +558,108 @@ impl LatexConverter {
         }
     }
 
+    fn handle_pending_citation(&mut self, elem: SyntaxElement, output: &mut String) -> bool {
+        let Some(mut pending) = self.state.pending_citation.take() else {
+            return false;
+        };
+
+        match elem.kind() {
+            SyntaxKind::TokenWhiteSpace | SyntaxKind::TokenLineBreak
+                if pending.collecting_optional =>
+            {
+                if !pending.current_optional_raw.ends_with(' ') {
+                    pending.current_optional_raw.push(' ');
+                }
+                self.state.pending_citation = Some(pending);
+                true
+            }
+            SyntaxKind::TokenWhiteSpace | SyntaxKind::TokenLineBreak => {
+                self.state.pending_citation = Some(pending);
+                true
+            }
+            SyntaxKind::TokenAsterisk => {
+                self.state.pending_citation = Some(pending);
+                true
+            }
+            SyntaxKind::TokenLBracket if !pending.collecting_optional => {
+                pending.collecting_optional = true;
+                pending.current_optional_raw.clear();
+                self.state.pending_citation = Some(pending);
+                true
+            }
+            SyntaxKind::TokenRBracket if pending.collecting_optional => {
+                pending
+                    .optional_args
+                    .push(pending.current_optional_raw.trim().to_string());
+                pending.current_optional_raw.clear();
+                pending.collecting_optional = false;
+                self.state.pending_citation = Some(pending);
+                true
+            }
+            SyntaxKind::ItemCurly if !pending.collecting_optional => {
+                if let SyntaxElement::Node(node) = elem {
+                    super::markup::emit_pending_citation_from_curly(&node, pending, output);
+                    return true;
+                }
+                self.state.pending_citation = Some(pending);
+                false
+            }
+            _ if pending.collecting_optional => {
+                match &elem {
+                    SyntaxElement::Node(node) => pending
+                        .current_optional_raw
+                        .push_str(&node.text().to_string()),
+                    SyntaxElement::Token(token) => {
+                        pending.current_optional_raw.push_str(token.text())
+                    }
+                }
+                self.state.pending_citation = Some(pending);
+                true
+            }
+            _ => {
+                self.state.pending_citation = Some(pending);
+                false
+            }
+        }
+    }
+
+    fn handle_pending_reference(&mut self, elem: SyntaxElement, output: &mut String) -> bool {
+        let Some(pending) = self.state.pending_reference.take() else {
+            return false;
+        };
+
+        match elem.kind() {
+            SyntaxKind::TokenWhiteSpace
+            | SyntaxKind::TokenLineBreak
+            | SyntaxKind::TokenAsterisk => {
+                self.state.pending_reference = Some(pending);
+                true
+            }
+            SyntaxKind::ItemCurly => {
+                if let SyntaxElement::Node(node) = elem {
+                    super::markup::emit_pending_reference_from_curly(&node, pending, output);
+                    return true;
+                }
+                self.state.pending_reference = Some(pending);
+                false
+            }
+            _ => {
+                self.state.pending_reference = Some(pending);
+                false
+            }
+        }
+    }
+
     /// Visit a syntax element (node or token)
     pub fn visit_element(&mut self, elem: SyntaxElement, output: &mut String) {
         use SyntaxKind::*;
+
+        if self.handle_pending_citation(elem.clone(), output) {
+            return;
+        }
+        if self.handle_pending_reference(elem.clone(), output) {
+            return;
+        }
 
         match elem.kind() {
             // Handle errors gracefully

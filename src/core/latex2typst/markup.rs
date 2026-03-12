@@ -18,10 +18,90 @@ use crate::data::symbols::{
 use mitex_spec::CommandSpecItem;
 
 use super::context::{
-    ConversionMode, EnvironmentContext, LatexConverter, MacroDef, PendingOperator,
+    ConversionMode, EnvironmentContext, LatexConverter, MacroDef, PendingCitation, PendingOperator,
+    PendingReference,
 };
 use super::utils::{sanitize_label, to_roman_numeral};
 use crate::features::images::ImageAttributes;
+use crate::features::refs::{
+    citation_mode_from_latex_command, citation_to_typst, label_to_typst, reference_to_typst,
+    reference_type_from_latex_command, Citation, CitationMode, CiteGroup, Reference, ReferenceType,
+};
+
+fn has_split_optional_citation_start(cmd: &CmdItem) -> bool {
+    cmd.syntax().children().any(|child| {
+        child.kind() == mitex_parser::syntax::SyntaxKind::ClauseArgument
+            && matches!(
+                child.first_token().map(|tok| tok.kind()),
+                Some(mitex_parser::syntax::SyntaxKind::TokenLBracket)
+            )
+    })
+}
+
+fn optional_args_to_prefix_suffix(optional_args: &[String]) -> (Option<String>, Option<String>) {
+    let cleaned: Vec<String> = optional_args
+        .iter()
+        .map(|value| {
+            value
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim()
+                .to_string()
+        })
+        .filter(|value| !value.is_empty())
+        .collect();
+
+    match cleaned.as_slice() {
+        [] => (None, None),
+        [only] => (None, Some(only.clone())),
+        [prefix, suffix, ..] => (Some(prefix.clone()), Some(suffix.clone())),
+    }
+}
+
+fn emit_citation_group(
+    keys: &str,
+    mode: CitationMode,
+    prefix: Option<String>,
+    suffix: Option<String>,
+    output: &mut String,
+) {
+    let mut group = CiteGroup::new();
+    group.prefix = prefix.filter(|value| !value.trim().is_empty());
+    group.suffix = suffix.filter(|value| !value.trim().is_empty());
+    for key in keys.split(',') {
+        let key = key.trim();
+        if !key.is_empty() {
+            group.push(Citation::with_mode(key.to_string(), mode));
+        }
+    }
+    if !group.citations.is_empty() {
+        output.push_str(&citation_to_typst(&group));
+    }
+}
+
+pub fn emit_pending_citation_from_curly(
+    node: &mitex_parser::syntax::SyntaxNode,
+    pending: PendingCitation,
+    output: &mut String,
+) {
+    let keys = crate::core::latex2typst::utils::extract_curly_inner_content(node);
+    let (prefix, suffix) = optional_args_to_prefix_suffix(&pending.optional_args);
+    emit_citation_group(&keys, pending.mode, prefix, suffix, output);
+}
+
+pub fn emit_pending_reference_from_curly(
+    node: &mitex_parser::syntax::SyntaxNode,
+    pending: PendingReference,
+    output: &mut String,
+) {
+    let label = sanitize_label(&crate::core::latex2typst::utils::extract_curly_inner_content(node));
+    let reference = Reference {
+        target: label,
+        ref_type: pending.ref_type,
+    };
+    output.push_str(&reference_to_typst(&reference));
+}
 
 /// Convert a command symbol (e.g., \alpha, \beta, or special chars like \$, \%)
 pub fn convert_command_sym(conv: &mut LatexConverter, elem: SyntaxElement, output: &mut String) {
@@ -416,8 +496,6 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
 
         // Labels and references
         "label" => {
-            // Skip label output if we're inside equation/align environments
-            // because those environments handle labels at the end of the math block
             if conv.state.is_inside(&EnvironmentContext::Equation)
                 || conv.state.is_inside(&EnvironmentContext::Align)
             {
@@ -425,60 +503,47 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             }
             let label = conv.get_required_arg(&cmd, 0).unwrap_or_default();
             let clean_label = sanitize_label(&label);
-            let _ = write!(output, "<{}>", clean_label);
+            output.push_str(&label_to_typst(&clean_label));
         }
-        "ref" | "autoref" | "cref" | "Cref" => {
-            let label = conv.get_required_arg(&cmd, 0).unwrap_or_default();
-            let clean_label = sanitize_label(&label);
-            let _ = write!(output, "@{}", clean_label);
-        }
-        "eqref" => {
-            let label = conv.get_required_arg(&cmd, 0).unwrap_or_default();
-            let sanitized = sanitize_label(&label);
-            if !sanitized.starts_with("eq-") {
-                let _ = write!(output, "@eq-{}", sanitized);
+        "ref" | "autoref" | "cref" | "Cref" | "eqref" | "pageref" | "nameref" => {
+            let ref_type = reference_type_from_latex_command(base_name).unwrap_or(ReferenceType::Basic);
+            if let Some(label) = conv.get_required_arg(&cmd, 0) {
+                let clean_label = sanitize_label(&label);
+                let reference = Reference {
+                    target: clean_label,
+                    ref_type,
+                };
+                output.push_str(&reference_to_typst(&reference));
             } else {
-                let _ = write!(output, "@{}", sanitized);
+                conv.state.pending_reference = Some(PendingReference { ref_type });
             }
         }
-        "pageref" => {
-            let label = conv.get_required_arg(&cmd, 0).unwrap_or_default();
-            let clean_label = sanitize_label(&label);
-            let _ = write!(output, "#locate(loc => {{@{}.page()}})", clean_label);
-        }
-        "nameref" => {
-            let label = conv.get_required_arg(&cmd, 0).unwrap_or_default();
-            let clean_label = sanitize_label(&label);
-            let _ = write!(output, "@{}", clean_label);
-        }
 
-        // Citations - Full set from l2t.rs (40+ variants)
+        // Citations - routed through shared citation semantics
         "cite" | "Cite" | "citep" | "citep*" | "citet" | "citet*" | "citeal"
         | "citealp" | "citealp*" | "citealt" | "citealt*"
         | "autocite" | "Autocite" | "textcite" | "Textcite"
         | "parencite" | "Parencite" | "footcite" | "Footcite"
         | "smartcite" | "Smartcite" | "supercite" | "fullcite"
         | "footfullcite" | "cites" | "Cites" | "textcites" | "Textcites"
-        | "parencites" | "Parencites" | "autocites" | "Autocites" => {
-            let keys = conv.get_required_arg(&cmd, 0).unwrap_or_default();
-            let opt = conv.get_optional_arg(&cmd, 0);
-            for (i, key) in keys.split(',').enumerate() {
-                if i > 0 {
-                    output.push(' ');
-                }
-                let _ = write!(output, "@{}", key.trim());
+        | "parencites" | "Parencites" | "autocites" | "Autocites"
+        | "citeauthor" | "citeauthor*" | "citeyear" | "citeyearpar" => {
+            let mode = citation_mode_from_latex_command(base_name).unwrap_or(CitationMode::Normal);
+            let optional_args = [conv.get_optional_arg(&cmd, 0), conv.get_optional_arg(&cmd, 1)]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            if let Some(keys) = conv.get_required_arg(&cmd, 0) {
+                let (prefix, suffix) = optional_args_to_prefix_suffix(&optional_args);
+                emit_citation_group(&keys, mode, prefix, suffix, output);
+            } else {
+                conv.state.pending_citation = Some(PendingCitation {
+                    mode,
+                    optional_args,
+                    current_optional_raw: String::new(),
+                    collecting_optional: has_split_optional_citation_start(&cmd),
+                });
             }
-            if let Some(note) = opt {
-                let _ = write!(output, " [{}]", note);
-            }
-        }
-        "citeauthor" | "citeauthor*" => {
-            let key = conv.get_required_arg(&cmd, 0).unwrap_or_default();
-            let _ = write!(output, "#cite(<{}>, form: \"author\")", key.trim());
-        }
-        "citeyear" | "citeyearpar" => {
-            let key = conv.get_required_arg(&cmd, 0).unwrap_or_default();
-            let _ = write!(output, "#cite(<{}>, form: \"year\")", key.trim());
         }
 
         // URLs and hyperlinks

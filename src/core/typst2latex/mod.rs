@@ -14,6 +14,7 @@ mod table;
 mod utils;
 
 pub use context::{ConvertContext, EnvironmentContext, T2LOptions, TokenType};
+use engine::ContentNode;
 use typst_syntax::{parse, parse_math};
 
 // Re-export specific items that were previously exposed by `eval` from core
@@ -307,18 +308,17 @@ pub fn typst_to_latex_with_diagnostics(input: &str, options: &T2LOptions) -> Con
     let mut warnings = Vec::new();
 
     // Step 1: Expand macros using MiniEval (with show rules applied)
-    let expanded_input = match engine::expand_macros_with_warnings(input) {
-        Ok(result) => {
-            // Convert engine warnings to conversion warnings
-            warnings.extend(result.warnings.into_iter().map(ConversionWarning::from));
-            result.output
-        }
-        Err(e) => {
-            // Graceful degradation: fall back to simple preprocessing
-            warnings.push(ConversionWarning::from_eval_error(&e));
-            preprocess::preprocess_typst(input)
-        }
-    };
+    let (expanded_input, expanded_nodes): (String, Option<Vec<ContentNode>>) =
+        match engine::expand_macros_with_warnings(input) {
+            Ok(result) => {
+                warnings.extend(result.warnings.into_iter().map(ConversionWarning::from));
+                (result.output, Some(result.nodes))
+            }
+            Err(e) => {
+                warnings.push(ConversionWarning::from_eval_error(&e));
+                (preprocess::preprocess_typst(input), None)
+            }
+        };
 
     // Step 2: Convert the (possibly expanded) Typst to LaTeX
     let mut ctx = ConvertContext::new();
@@ -327,6 +327,8 @@ pub fn typst_to_latex_with_diagnostics(input: &str, options: &T2LOptions) -> Con
     if options.math_only {
         let root = parse_math(&expanded_input);
         math::convert_math_node(&root, &mut ctx);
+    } else if let Some(nodes) = expanded_nodes.as_ref() {
+        markup::convert_content_nodes_to_latex(nodes, &mut ctx);
     } else {
         let root = parse(&expanded_input);
         markup::convert_markup_node(&root, &mut ctx);

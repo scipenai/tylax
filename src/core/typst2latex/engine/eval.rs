@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use crate::features::refs::{citation_mode_from_typst_form, CitationMode, ReferenceType};
 use indexmap::IndexMap;
 
 use typst_syntax::ast::{self, AstNode};
@@ -15,8 +16,10 @@ use super::library::{call_builtin, call_calc, call_method, BuiltinResult};
 use super::ops;
 use super::scope::Scopes;
 use super::value::{
-    Alignment, Arguments, Closure, ContentNode, Direction, EvalError, EvalErrorKind, EvalResult,
-    HorizAlign, Selector, ShowRule, SourceSpan, Value, VertAlign,
+    bibliography_content_value, citation_content_value, label_content_value,
+    normalize_ref_target_text, reference_content_value, Alignment, Arguments, Closure, ContentNode,
+    Direction, EvalError, EvalErrorKind, EvalResult, HorizAlign, Selector, ShowRule, SourceSpan,
+    Value, VertAlign,
 };
 use super::vfs::{NoopVfs, VirtualFileSystem};
 
@@ -459,6 +462,8 @@ impl MiniEval {
             | ast::Expr::Raw(_)
             | ast::Expr::Equation(_)
             | ast::Expr::Math(_)
+            | ast::Expr::Label(_)
+            | ast::Expr::Ref(_)
             | ast::Expr::Escape(_)
             | ast::Expr::Shorthand(_) => self.eval_markup_element(expr),
 
@@ -588,6 +593,13 @@ impl MiniEval {
                     block: false,
                 }]))
             }
+            ast::Expr::Label(label) => Ok(Value::Content(vec![ContentNode::Label(
+                label.get().to_string(),
+            )])),
+            ast::Expr::Ref(reference) => Ok(Value::Content(vec![ContentNode::Reference {
+                target: reference.target().to_string(),
+                ref_type: ReferenceType::Basic,
+            }])),
             ast::Expr::Escape(esc) => Ok(Value::Content(vec![ContentNode::Text(
                 esc.get().to_string(),
             )])),
@@ -1340,6 +1352,158 @@ impl MiniEval {
         })))
     }
 
+    fn eval_ref_target_value(&mut self, value: Value) -> EvalResult<String> {
+        let raw = match value {
+            Value::Label(label) => label,
+            Value::Str(text) => text,
+            Value::Content(nodes) if nodes.len() == 1 => match &nodes[0] {
+                ContentNode::Label(label) | ContentNode::LabelDef(label) => label.clone(),
+                ContentNode::Text(text) => text.clone(),
+                _ => nodes[0].to_typst(),
+            },
+            Value::Content(nodes) => nodes.iter().map(|n| n.to_typst()).collect::<String>(),
+            other => other.display(),
+        };
+        Ok(normalize_ref_target_text(&raw))
+    }
+
+    fn eval_ref_target_expr(&mut self, expr: ast::Expr) -> EvalResult<String> {
+        let value = self.eval_expr(expr)?;
+        self.eval_ref_target_value(value)
+    }
+
+    fn eval_semantic_text_expr(&mut self, expr: ast::Expr) -> EvalResult<String> {
+        match expr {
+            ast::Expr::Ident(ident) => Ok(ident.get().to_string()),
+            other => {
+                let value = self.eval_expr(other)?;
+                self.eval_ref_target_value(value)
+            }
+        }
+    }
+
+    fn eval_semantic_cite(&mut self, args: ast::Args) -> EvalResult<Value> {
+        let mut keys = Vec::new();
+        let mut mode = CitationMode::Normal;
+        let mut supplement = None;
+
+        for arg in args.items() {
+            match arg {
+                ast::Arg::Pos(expr) => {
+                    let key = self.eval_ref_target_expr(expr)?;
+                    if !key.is_empty() {
+                        keys.push(key);
+                    }
+                }
+                ast::Arg::Named(named) => match named.name().get().as_str() {
+                    "form" => {
+                        let form = self.eval_semantic_text_expr(named.expr())?;
+                        mode = citation_mode_from_typst_form(Some(form.as_str()));
+                    }
+                    "supplement" => {
+                        let text = self.eval_semantic_text_expr(named.expr())?;
+                        if !text.is_empty() {
+                            supplement = Some(
+                                text.trim_start_matches('[')
+                                    .trim_end_matches(']')
+                                    .trim()
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    _ => {}
+                },
+                ast::Arg::Spread(_) => {
+                    return Err(EvalError::argument(
+                        "cite does not support spread arguments in MiniEval semantic mode"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
+        citation_content_value(keys, mode, supplement)
+    }
+
+    fn eval_semantic_ref(&mut self, args: ast::Args) -> EvalResult<Value> {
+        let mut items = args.items();
+        let first = items
+            .next()
+            .ok_or_else(|| EvalError::argument("ref expects 1 label argument".to_string()))?;
+        if items.next().is_some() {
+            return Err(EvalError::argument(
+                "ref expects exactly 1 label argument".to_string(),
+            ));
+        }
+        let target = match first {
+            ast::Arg::Pos(expr) => self.eval_ref_target_expr(expr)?,
+            ast::Arg::Named(_) | ast::Arg::Spread(_) => {
+                return Err(EvalError::argument(
+                    "ref expects 1 positional label argument".to_string(),
+                ))
+            }
+        };
+        Ok(reference_content_value(target, ReferenceType::Basic))
+    }
+
+    fn eval_semantic_label(&mut self, args: ast::Args) -> EvalResult<Value> {
+        let mut items = args.items();
+        let first = items
+            .next()
+            .ok_or_else(|| EvalError::argument("label expects 1 label argument".to_string()))?;
+        if items.next().is_some() {
+            return Err(EvalError::argument(
+                "label expects exactly 1 label argument".to_string(),
+            ));
+        }
+        let label = match first {
+            ast::Arg::Pos(expr) => self.eval_ref_target_expr(expr)?,
+            ast::Arg::Named(_) | ast::Arg::Spread(_) => {
+                return Err(EvalError::argument(
+                    "label expects 1 positional label argument".to_string(),
+                ))
+            }
+        };
+        Ok(label_content_value(label))
+    }
+
+    fn eval_semantic_bibliography(&mut self, args: ast::Args) -> EvalResult<Value> {
+        let mut file = None;
+        let mut style = None;
+
+        for arg in args.items() {
+            match arg {
+                ast::Arg::Pos(expr) => {
+                    if file.is_none() {
+                        let value = self.eval_semantic_text_expr(expr)?;
+                        if !value.is_empty() {
+                            file = Some(value);
+                        }
+                    }
+                }
+                ast::Arg::Named(named) => {
+                    if named.name().get().as_str() == "style" {
+                        let value = self.eval_semantic_text_expr(named.expr())?;
+                        if !value.is_empty() {
+                            style = Some(value);
+                        }
+                    }
+                }
+                ast::Arg::Spread(_) => {
+                    return Err(EvalError::argument(
+                        "bibliography does not support spread arguments in MiniEval semantic mode"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
+        let file = file.ok_or_else(|| {
+            EvalError::argument("bibliography expects a file argument".to_string())
+        })?;
+        bibliography_content_value(file, style)
+    }
+
     /// Evaluate a function call.
     fn eval_func_call(&mut self, call: ast::FuncCall) -> EvalResult<Value> {
         // Check recursion depth early to prevent stack overflow
@@ -1373,6 +1537,14 @@ impl MiniEval {
             // Check if it's a user-defined function
             if let Some(Value::Func(closure)) = self.scopes.get(name).cloned() {
                 return self.call_closure(&closure, args);
+            }
+
+            match name {
+                "cite" => return self.eval_semantic_cite(args),
+                "ref" => return self.eval_semantic_ref(args),
+                "label" => return self.eval_semantic_label(args),
+                "bibliography" => return self.eval_semantic_bibliography(args),
+                _ => {}
             }
 
             // Try built-in functions
@@ -2067,6 +2239,8 @@ impl Default for MiniEval {
 pub struct ExpandResult {
     /// The expanded source code
     pub output: String,
+    /// The expanded content nodes before serialization
+    pub nodes: Vec<ContentNode>,
     /// Warnings generated during expansion
     pub warnings: Vec<EvalWarning>,
 }
@@ -2172,7 +2346,11 @@ pub fn expand_macros_with_warnings(source: &str) -> EvalResult<ExpandResult> {
     // Collect warnings
     let warnings = eval.take_warnings();
 
-    Ok(ExpandResult { output, warnings })
+    Ok(ExpandResult {
+        output,
+        nodes: normalized_nodes,
+        warnings,
+    })
 }
 
 #[cfg(test)]

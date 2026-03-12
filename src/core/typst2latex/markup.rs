@@ -3,6 +3,7 @@
 //! Handles document structure, text formatting, and non-math content.
 
 use super::context::{ConvertContext, EnvironmentContext, TokenType};
+use super::engine::ContentNode;
 use super::math::convert_math_node;
 use super::table::{LatexCell, LatexCellAlign, LatexHLine, LatexTableGenerator};
 use super::utils::{
@@ -12,6 +13,10 @@ use super::utils::{
 };
 use crate::data::typst_compat::{
     get_heading_command, is_math_func_in_markup, MarkupHandler, TYPST_MARKUP_HANDLERS,
+};
+use crate::features::refs::{
+    citation_mode_from_typst_form, citation_to_latex, label_to_latex, reference_to_latex, Citation,
+    CiteGroup, Reference,
 };
 use crate::tikz::{convert_cetz_to_tikz, is_cetz_code};
 use typst_syntax::{SyntaxKind, SyntaxNode};
@@ -110,6 +115,88 @@ const LISTINGS_SUPPORTED_LANGUAGES: &[&str] = &[
     "typescript",
     "ts",
 ];
+
+fn flush_typst_chunk(buffer: &mut String, ctx: &mut ConvertContext) {
+    if buffer.trim().is_empty() {
+        buffer.clear();
+        return;
+    }
+    let root = typst_syntax::parse(buffer);
+    convert_markup_node(&root, ctx);
+    buffer.clear();
+}
+
+pub fn convert_content_nodes_to_latex(nodes: &[ContentNode], ctx: &mut ConvertContext) {
+    let mut buffer = String::new();
+
+    for node in nodes {
+        match node {
+            ContentNode::Space => {
+                flush_typst_chunk(&mut buffer, ctx);
+                if !ctx.output.is_empty()
+                    && !ctx.output.ends_with(' ')
+                    && !ctx.output.ends_with('\n')
+                {
+                    ctx.push(" ");
+                }
+            }
+            ContentNode::Parbreak => {
+                flush_typst_chunk(&mut buffer, ctx);
+                ctx.ensure_paragraph_break();
+                ctx.last_token = TokenType::Newline;
+            }
+            ContentNode::Linebreak => {
+                flush_typst_chunk(&mut buffer, ctx);
+                ctx.push("\\\n");
+                ctx.last_token = TokenType::Newline;
+            }
+            ContentNode::Citation {
+                keys,
+                mode,
+                supplement,
+            } => {
+                flush_typst_chunk(&mut buffer, ctx);
+                let mut group = CiteGroup::new();
+                group.suffix = supplement.clone();
+                for key in keys {
+                    group.push(Citation::with_mode(key.clone(), *mode));
+                }
+                ctx.push(&citation_to_latex(&group));
+                ctx.last_token = TokenType::Command;
+            }
+            ContentNode::Reference { target, ref_type } => {
+                flush_typst_chunk(&mut buffer, ctx);
+                ctx.push(&reference_to_latex(&Reference {
+                    target: target.clone(),
+                    ref_type: *ref_type,
+                }));
+                ctx.last_token = TokenType::Command;
+            }
+            ContentNode::LabelDef(label) => {
+                flush_typst_chunk(&mut buffer, ctx);
+                ctx.push(&label_to_latex(label));
+                ctx.last_token = TokenType::Command;
+            }
+            ContentNode::Bibliography { file, style } => {
+                flush_typst_chunk(&mut buffer, ctx);
+                let bib_name = file
+                    .trim_end_matches(".yml")
+                    .trim_end_matches(".yaml")
+                    .trim_end_matches(".bib");
+                ctx.ensure_paragraph_break();
+                ctx.push_line(&format!(
+                    r"\bibliographystyle{{{}}}",
+                    style.clone().unwrap_or_else(|| "plain".to_string())
+                ));
+                ctx.push_line(&format!(r"\bibliography{{{}}}", bib_name));
+                ctx.last_token = TokenType::Command;
+            }
+            other => buffer.push_str(&other.to_typst()),
+        }
+    }
+
+    flush_typst_chunk(&mut buffer, ctx);
+}
 
 /// Check if a language is supported by the listings package
 fn is_listings_supported(lang: &str) -> bool {
@@ -526,14 +613,10 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
 
         // References: @label -> \ref{label}
         SyntaxKind::Ref => {
-            // Get full text recursively since node.text() may be empty for composite nodes
             let text = get_simple_text(node);
-            // Extract label name (remove @ prefix)
-            let label = text.trim_start_matches('@');
+            let label = text.trim_start_matches('@').trim();
             if !label.is_empty() {
-                ctx.push("\\ref{");
-                ctx.push(label);
-                ctx.push("}");
+                ctx.push(&reference_to_latex(&Reference::new(label.to_string())));
                 ctx.last_token = TokenType::Command;
             }
         }
@@ -541,12 +624,11 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
         // Labels: <label> -> \label{label}
         SyntaxKind::Label => {
             let text = node.text().to_string();
-            // Extract label name (remove < and > )
-            let label = text.trim_start_matches('<').trim_end_matches('>');
-            ctx.push("\\label{");
-            ctx.push(label);
-            ctx.push("}");
-            ctx.last_token = TokenType::Command;
+            let label = normalize_label_like_text(&text);
+            if !label.is_empty() {
+                ctx.push(&label_to_latex(&label));
+                ctx.last_token = TokenType::Command;
+            }
         }
 
         // Primitive types - output their text representation
@@ -1664,73 +1746,79 @@ fn convert_link_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
 // Citation and Reference Conversion
 // ============================================================================
 
-fn convert_cite_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
-    let mut keys: Vec<String> = Vec::new();
+fn normalize_label_like_text(text: &str) -> String {
+    text.trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string()
+}
 
-    if let Some(args) = children.get(1) {
-        for child in args.children() {
-            match child.kind() {
-                SyntaxKind::Str => {
-                    keys.push(get_string_content(child));
-                }
-                SyntaxKind::Label => {
-                    let label_text = child.text().to_string();
-                    keys.push(
-                        label_text
-                            .trim_start_matches('<')
-                            .trim_end_matches('>')
-                            .to_string(),
-                    );
-                }
-                _ => {
-                    let text = get_simple_text(child);
-                    if !text.is_empty() && text != "," {
-                        keys.push(
-                            text.trim_start_matches('<')
-                                .trim_end_matches('>')
-                                .to_string(),
-                        );
-                    }
-                }
+fn normalize_citation_note_text(text: &str) -> String {
+    text.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string()
+}
+
+fn extract_label_like_from_node(node: &SyntaxNode) -> Option<String> {
+    match node.kind() {
+        SyntaxKind::Label => Some(normalize_label_like_text(node.text().as_ref())),
+        SyntaxKind::Str => Some(get_string_content(node)),
+        _ => {
+            let text = get_simple_text(node);
+            let normalized = normalize_label_like_text(&text);
+            if normalized.is_empty() {
+                None
+            } else {
+                Some(normalized)
+            }
+        }
+    }
+}
+
+fn convert_cite_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
+    let args = FuncArgs::from_func_call(children);
+    let mut group = CiteGroup::new();
+    let mode = citation_mode_from_typst_form(args.named_text("form"));
+    group.suffix = args
+        .named_text("supplement")
+        .map(normalize_citation_note_text)
+        .filter(|value| !value.is_empty());
+
+    for index in 0..args.positional_count() {
+        if let Some(node) = args.positional_node(index) {
+            if let Some(key) = extract_label_like_from_node(node) {
+                group.push(Citation::with_mode(key, mode));
             }
         }
     }
 
-    if keys.is_empty() {
+    if group.citations.is_empty() {
         return;
     }
 
-    ctx.push("\\cite{");
-    ctx.push(&keys.join(", "));
-    ctx.push("}");
+    ctx.push(&citation_to_latex(&group));
 }
 
 fn convert_ref_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
-    if let Some(args) = children.get(1) {
-        for child in args.children() {
-            let text = get_simple_text(child);
-            if !text.is_empty() {
-                let label = text.trim_start_matches('<').trim_end_matches('>');
-                ctx.push("\\ref{");
-                ctx.push(label);
-                ctx.push("}");
-                return;
-            }
+    let args = FuncArgs::from_func_call(children);
+    if let Some(node) = args.first_node() {
+        if let Some(target) = extract_label_like_from_node(node) {
+            ctx.push(&reference_to_latex(&Reference::new(target)));
         }
     }
 }
 
 fn convert_label_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
-    if let Some(args) = children.get(1) {
-        for child in args.children() {
-            let text = get_simple_text(child);
-            if !text.is_empty() {
-                let label = text.trim_start_matches('<').trim_end_matches('>');
-                ctx.push("\\label{");
-                ctx.push(label);
-                ctx.push("}");
-                return;
-            }
+    let args = FuncArgs::from_func_call(children);
+    if let Some(node) = args.first_node() {
+        if let Some(label) = extract_label_like_from_node(node) {
+            ctx.push(&label_to_latex(&label));
         }
     }
 }

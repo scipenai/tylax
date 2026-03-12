@@ -50,6 +50,11 @@ pub fn convert_curly(conv: &mut LatexConverter, elem: SyntaxElement, output: &mu
         _ => return,
     };
 
+    if let Some(pending) = conv.state.pending_citation.take() {
+        super::markup::emit_pending_citation_from_curly(&node, pending, output);
+        return;
+    }
+
     // Check if this is an argument for a pending operator (operatorname*)
     if let Some(op) = conv.state.pending_op.take() {
         // This group is the argument for a pending operator

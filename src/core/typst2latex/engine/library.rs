@@ -3,6 +3,7 @@
 //! This module implements built-in functions and methods that match typst-hs
 //! capabilities for full macro evaluation support.
 
+use crate::features::refs::{citation_mode_from_typst_form, CitationMode, ReferenceType};
 use chrono::{Datelike, NaiveDate, NaiveTime, Timelike};
 use indexmap::IndexMap;
 use regex::Regex;
@@ -10,8 +11,10 @@ use std::sync::Arc;
 
 use super::data;
 use super::value::{
-    Alignment, Arg, Arguments, Closure, Color, ContentNode, Counter, DateTime, EvalError,
-    EvalResult, HorizAlign, Length, LengthUnit, Selector, State, Value, VertAlign, WrappedRegex,
+    bibliography_content_value, citation_content_value, label_content_value,
+    normalize_ref_target_text, reference_content_value, Alignment, Arg, Arguments, Closure, Color,
+    ContentNode, Counter, DateTime, EvalError, EvalResult, HorizAlign, Length, LengthUnit,
+    Selector, State, Value, VertAlign, WrappedRegex,
 };
 use super::vfs::VirtualFileSystem;
 
@@ -70,6 +73,9 @@ pub fn call_builtin(
         "regex" => builtin_regex(args).into(),
         "version" => builtin_version(args).into(),
         "label" => builtin_label(args).into(),
+        "cite" => builtin_cite(args, named).into(),
+        "ref" => builtin_ref(args).into(),
+        "bibliography" => builtin_bibliography(args, named).into(),
         "arguments" => builtin_arguments(args, named).into(),
 
         // Length constructors
@@ -497,13 +503,75 @@ fn builtin_version(args: Vec<Value>) -> EvalResult<Value> {
     Ok(Value::Version(version))
 }
 
+fn value_to_ref_target(value: &Value) -> EvalResult<String> {
+    let raw = match value {
+        Value::Label(l) => l.clone(),
+        Value::Str(s) => s.clone(),
+        Value::Content(nodes) if nodes.len() == 1 => match &nodes[0] {
+            ContentNode::Label(l) => l.clone(),
+            ContentNode::Text(t) => t.clone(),
+            _ => content_node_to_text(&nodes[0]).trim().to_string(),
+        },
+        Value::Content(nodes) => nodes
+            .iter()
+            .map(content_node_to_text)
+            .collect::<String>()
+            .trim()
+            .to_string(),
+        other => other.display().trim().to_string(),
+    };
+    Ok(normalize_ref_target_text(&raw))
+}
+
+fn value_to_plain_text(value: &Value) -> String {
+    match value {
+        Value::Str(s) => s.clone(),
+        Value::Label(l) => l.clone(),
+        Value::Content(nodes) => nodes
+            .iter()
+            .map(content_node_to_text)
+            .collect::<String>()
+            .trim()
+            .to_string(),
+        other => other.display().trim().to_string(),
+    }
+}
+
 fn builtin_label(args: Vec<Value>) -> EvalResult<Value> {
     match args.as_slice() {
-        [Value::Str(s)] => Ok(Value::Label(s.clone())),
+        [value] => Ok(label_content_value(value_to_ref_target(value)?)),
         _ => Err(EvalError::argument(
             "label expects 1 string argument".to_string(),
         )),
     }
+}
+
+fn builtin_cite(args: Vec<Value>, named: IndexMap<String, Value>) -> EvalResult<Value> {
+    let keys = args
+        .iter()
+        .map(value_to_ref_target)
+        .collect::<EvalResult<Vec<_>>>()?;
+    let mode = citation_mode_from_typst_form(named.get("form").map(value_to_plain_text).as_deref());
+    let supplement = named.get("supplement").map(value_to_plain_text);
+    citation_content_value(keys, mode, supplement)
+}
+
+fn builtin_ref(args: Vec<Value>) -> EvalResult<Value> {
+    match args.as_slice() {
+        [value] => Ok(reference_content_value(
+            value_to_ref_target(value)?,
+            ReferenceType::Basic,
+        )),
+        _ => Err(EvalError::argument(
+            "ref expects 1 label argument".to_string(),
+        )),
+    }
+}
+
+fn builtin_bibliography(args: Vec<Value>, named: IndexMap<String, Value>) -> EvalResult<Value> {
+    let file = args.first().map(value_to_plain_text).unwrap_or_default();
+    let style = named.get("style").map(value_to_plain_text);
+    bibliography_content_value(file, style)
 }
 
 fn builtin_arguments(args: Vec<Value>, named: IndexMap<String, Value>) -> EvalResult<Value> {
@@ -1452,6 +1520,10 @@ fn call_content_method(c: &[ContentNode], method: &str, args: Vec<Value>) -> Eva
                     ContentNode::Linebreak => "linebreak".to_string(),
                     ContentNode::Parbreak => "parbreak".to_string(),
                     ContentNode::Label(_) => "label".to_string(),
+                    ContentNode::Citation { .. } => "cite".to_string(),
+                    ContentNode::Reference { .. } => "ref".to_string(),
+                    ContentNode::LabelDef(_) => "label".to_string(),
+                    ContentNode::Bibliography { .. } => "bibliography".to_string(),
                     ContentNode::FuncCall { name, .. } => name.clone(),
                     ContentNode::RawSource(_) => "raw".to_string(),
                     ContentNode::State { .. } => "state".to_string(),
@@ -1586,6 +1658,63 @@ fn content_node_to_fields(node: &ContentNode) -> IndexMap<String, Value> {
             fields.insert("label".to_string(), Value::Str(l.clone()));
             fields
         }
+        ContentNode::Citation {
+            keys,
+            mode,
+            supplement,
+        } => {
+            let mut fields = IndexMap::new();
+            fields.insert(
+                "keys".to_string(),
+                Value::Array(keys.iter().cloned().map(Value::Str).collect()),
+            );
+            fields.insert(
+                "mode".to_string(),
+                Value::Str(
+                    match mode {
+                        CitationMode::Normal => "normal",
+                        CitationMode::AuthorInText => "prose",
+                        CitationMode::SuppressAuthor => "year",
+                        CitationMode::NoParen => "author",
+                    }
+                    .to_string(),
+                ),
+            );
+            if let Some(supplement) = supplement {
+                fields.insert("supplement".to_string(), Value::Str(supplement.clone()));
+            }
+            fields
+        }
+        ContentNode::Reference { target, ref_type } => {
+            let mut fields = IndexMap::new();
+            fields.insert("target".to_string(), Value::Str(target.clone()));
+            fields.insert(
+                "kind".to_string(),
+                Value::Str(
+                    match ref_type {
+                        ReferenceType::Basic => "basic",
+                        ReferenceType::Named => "named",
+                        ReferenceType::Page => "page",
+                        ReferenceType::Equation => "equation",
+                    }
+                    .to_string(),
+                ),
+            );
+            fields
+        }
+        ContentNode::LabelDef(l) => {
+            let mut fields = IndexMap::new();
+            fields.insert("label".to_string(), Value::Str(l.clone()));
+            fields
+        }
+        ContentNode::Bibliography { file, style } => {
+            let mut fields = IndexMap::new();
+            fields.insert("file".to_string(), Value::Str(file.clone()));
+            if let Some(style) = style {
+                fields.insert("style".to_string(), Value::Str(style.clone()));
+            }
+            fields
+        }
         _ => IndexMap::new(),
     }
 }
@@ -1613,6 +1742,10 @@ fn content_node_to_text(node: &ContentNode) -> String {
                 }
             })
             .unwrap_or_default(),
+        ContentNode::Citation { keys, .. } => keys.join(", "),
+        ContentNode::Reference { target, .. } => target.clone(),
+        ContentNode::LabelDef(l) => l.clone(),
+        ContentNode::Bibliography { file, .. } => file.clone(),
         ContentNode::RawSource(s) => s.clone(),
         _ => String::new(),
     }

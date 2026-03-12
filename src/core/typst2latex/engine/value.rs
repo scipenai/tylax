@@ -6,6 +6,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::features::refs::{citation_to_typst, Citation, CitationMode, CiteGroup, ReferenceType};
 use chrono::{NaiveDate, NaiveTime};
 use indexmap::IndexMap;
 use regex::Regex;
@@ -431,6 +432,10 @@ impl Selector {
                     ("list", ContentNode::ListItem(_)) => true,
                     ("enum", ContentNode::EnumItem { .. }) => true,
                     ("text", ContentNode::Text(_)) => true,
+                    ("cite", ContentNode::Citation { .. }) => true,
+                    ("ref", ContentNode::Reference { .. }) => true,
+                    ("label", ContentNode::LabelDef(_)) => true,
+                    ("bibliography", ContentNode::Bibliography { .. }) => true,
                     // Element variant matches by name
                     (elem_name, ContentNode::Element { name: n, .. }) if elem_name == n => true,
                     // FuncCall matches by function name
@@ -507,6 +512,63 @@ impl Selector {
                 let mut fields = IndexMap::new();
                 if let Some(n) = number {
                     fields.insert("number".to_string(), Value::Int(*n));
+                }
+                fields
+            }
+            ContentNode::Citation {
+                keys,
+                mode,
+                supplement,
+            } => {
+                let mut fields = IndexMap::new();
+                fields.insert(
+                    "keys".to_string(),
+                    Value::Array(keys.iter().cloned().map(Value::Str).collect()),
+                );
+                fields.insert(
+                    "mode".to_string(),
+                    Value::Str(
+                        match mode {
+                            CitationMode::Normal => "normal",
+                            CitationMode::AuthorInText => "prose",
+                            CitationMode::SuppressAuthor => "year",
+                            CitationMode::NoParen => "author",
+                        }
+                        .to_string(),
+                    ),
+                );
+                if let Some(supplement) = supplement {
+                    fields.insert("supplement".to_string(), Value::Str(supplement.clone()));
+                }
+                fields
+            }
+            ContentNode::Reference { target, ref_type } => {
+                let mut fields = IndexMap::new();
+                fields.insert("target".to_string(), Value::Str(target.clone()));
+                fields.insert(
+                    "kind".to_string(),
+                    Value::Str(
+                        match ref_type {
+                            ReferenceType::Basic => "basic",
+                            ReferenceType::Named => "named",
+                            ReferenceType::Page => "page",
+                            ReferenceType::Equation => "equation",
+                        }
+                        .to_string(),
+                    ),
+                );
+                fields
+            }
+            ContentNode::LabelDef(label) => {
+                let mut fields = IndexMap::new();
+                fields.insert("label".to_string(), Value::Str(label.clone()));
+                fields
+            }
+            ContentNode::Bibliography { file, style } => {
+                let mut fields = IndexMap::new();
+                fields.insert("file".to_string(), Value::Str(file.clone()));
+                if let Some(style) = style {
+                    fields.insert("style".to_string(), Value::Str(style.clone()));
                 }
                 fields
             }
@@ -1214,6 +1276,21 @@ pub enum ContentNode {
     },
     /// A label
     Label(String),
+    /// A preserved citation node.
+    Citation {
+        keys: Vec<String>,
+        mode: CitationMode,
+        supplement: Option<String>,
+    },
+    /// A preserved reference node.
+    Reference {
+        target: String,
+        ref_type: ReferenceType,
+    },
+    /// A preserved label definition node.
+    LabelDef(String),
+    /// A preserved bibliography node.
+    Bibliography { file: String, style: Option<String> },
     /// A function call that couldn't be fully evaluated
     FuncCall { name: String, args: Vec<Arg> },
     /// Raw Typst source that should be passed through unchanged
@@ -1259,6 +1336,97 @@ impl ShowRule {
             priority,
         }
     }
+}
+
+pub(crate) fn normalize_ref_target_text(text: &str) -> String {
+    text.trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string()
+}
+
+pub(crate) fn normalize_supplement_text(text: &str) -> Option<String> {
+    let normalized = text
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+pub(crate) fn citation_content_value(
+    keys: Vec<String>,
+    mode: CitationMode,
+    supplement: Option<String>,
+) -> EvalResult<Value> {
+    let keys: Vec<String> = keys
+        .into_iter()
+        .map(|key| normalize_ref_target_text(&key))
+        .filter(|key| !key.is_empty())
+        .collect();
+
+    if keys.is_empty() {
+        return Err(EvalError::argument(
+            "cite expects at least one label argument".to_string(),
+        ));
+    }
+
+    Ok(Value::Content(vec![ContentNode::Citation {
+        keys,
+        mode,
+        supplement: supplement.and_then(|value| normalize_supplement_text(&value)),
+    }]))
+}
+
+pub(crate) fn reference_content_value(target: String, ref_type: ReferenceType) -> Value {
+    Value::Content(vec![ContentNode::Reference {
+        target: normalize_ref_target_text(&target),
+        ref_type,
+    }])
+}
+
+pub(crate) fn label_content_value(label: String) -> Value {
+    Value::Content(vec![ContentNode::LabelDef(normalize_ref_target_text(
+        &label,
+    ))])
+}
+
+pub(crate) fn bibliography_content_value(file: String, style: Option<String>) -> EvalResult<Value> {
+    let file = file.trim().to_string();
+    if file.is_empty() {
+        return Err(EvalError::argument(
+            "bibliography expects a file argument".to_string(),
+        ));
+    }
+
+    let style = style.and_then(|value| {
+        let trimmed = value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim()
+            .to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+
+    Ok(Value::Content(vec![ContentNode::Bibliography {
+        file,
+        style,
+    }]))
 }
 
 impl ContentNode {
@@ -1317,6 +1485,40 @@ impl ContentNode {
                 format!("#{}({})", name, args.join(", "))
             }
             ContentNode::Label(l) => format!("<{}>", l),
+            ContentNode::Citation {
+                keys,
+                mode,
+                supplement,
+            } => {
+                let mut group = CiteGroup::new();
+                group.suffix = supplement
+                    .clone()
+                    .and_then(|value| normalize_supplement_text(&value));
+                for key in keys {
+                    group.push(Citation::with_mode(key.clone(), *mode));
+                }
+                citation_to_typst(&group)
+            }
+            ContentNode::Reference { target, ref_type } => match ref_type {
+                ReferenceType::Equation => {
+                    let target = if target.starts_with("eq-") {
+                        target.clone()
+                    } else {
+                        format!("eq-{}", target)
+                    };
+                    format!("@{}", target)
+                }
+                ReferenceType::Page => format!("#locate(loc => {{@{}.page()}})", target),
+                _ => format!("#ref(<{}>)", target),
+            },
+            ContentNode::LabelDef(l) => format!("#label(<{}>)", l),
+            ContentNode::Bibliography { file, style } => {
+                if let Some(style) = style {
+                    format!("#bibliography(\"{}\", style: {})", file, style)
+                } else {
+                    format!("#bibliography(\"{}\")", file)
+                }
+            }
             ContentNode::FuncCall { name, args } => {
                 let args_str: Vec<String> = args
                     .iter()

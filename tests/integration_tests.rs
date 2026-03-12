@@ -2347,9 +2347,294 @@ mod t2l_named_args {
     }
 }
 
+mod t2l_citation_refs {
+    use super::*;
+
+    #[test]
+    fn test_cite_forms_and_reference_helpers() {
+        assert_eq!(
+            typst_to_latex_with_options(r#"#cite(<knuth>)"#, &T2LOptions::default()).trim(),
+            r#"\cite{knuth}"#
+        );
+        assert_eq!(
+            typst_to_latex_with_options(r#"#cite(<knuth>, form: "prose")"#, &T2LOptions::default())
+                .trim(),
+            r#"\citet{knuth}"#
+        );
+        assert_eq!(
+            typst_to_latex_with_options(r#"#cite(<knuth>, form: "year")"#, &T2LOptions::default())
+                .trim(),
+            r#"\citeyear{knuth}"#
+        );
+        assert_eq!(
+            typst_to_latex_with_options(
+                r#"#cite(<knuth>, form: "author")"#,
+                &T2LOptions::default()
+            )
+            .trim(),
+            r#"\citeauthor{knuth}"#
+        );
+        assert_eq!(
+            typst_to_latex_with_options(r#"#cite(<a>, <b>)"#, &T2LOptions::default()).trim(),
+            r#"\cite{a, b}"#
+        );
+        assert_eq!(
+            typst_to_latex_with_options(r#"#ref(<eq-energy>)"#, &T2LOptions::default()).trim(),
+            r#"\ref{eq-energy}"#
+        );
+        assert_eq!(
+            typst_to_latex_with_options(r#"#label(<eq-energy>)"#, &T2LOptions::default()).trim(),
+            r#"\label{eq-energy}"#
+        );
+        assert_eq!(typst_to_latex("@knuth").trim(), r#"\ref{knuth}"#);
+    }
+}
+
+mod l2t_citation_refs {
+    use super::*;
+
+    #[test]
+    fn test_l2t_citation_variants() {
+        assert_eq!(
+            latex_to_typst(r#"\cite{knuth}"#).trim(),
+            r#"#cite(<knuth>)"#
+        );
+
+        let citet = latex_to_typst(r#"\citet{knuth}"#);
+        assert!(
+            citet.contains(r#"#cite(<knuth>, form: "prose")"#),
+            "got: {}",
+            citet
+        );
+
+        let citeyear = latex_to_typst(r#"\citeyear{knuth}"#);
+        assert!(
+            citeyear.contains(r#"#cite(<knuth>, form: "year")"#),
+            "got: {}",
+            citeyear
+        );
+        assert!(
+            !citeyear.contains("<>") && !citeyear.contains("k n u t h"),
+            "got: {}",
+            citeyear
+        );
+
+        let citeauthor = latex_to_typst(r#"\citeauthor{knuth}"#);
+        assert!(
+            citeauthor.contains(r#"#cite(<knuth>, form: "author")"#),
+            "got: {}",
+            citeauthor
+        );
+        assert!(
+            !citeauthor.contains("<>") && !citeauthor.contains("k n u t h"),
+            "got: {}",
+            citeauthor
+        );
+
+        let roundtrip = typst_to_latex(latex_to_typst(r#"\cite{knuth}"#).trim());
+        assert_eq!(roundtrip.trim(), r#"\cite{knuth}"#);
+    }
+
+    #[test]
+    fn test_l2t_reference_variants() {
+        assert_eq!(latex_to_typst(r#"\eqref{energy}"#).trim(), "@eq-energy");
+        assert_eq!(latex_to_typst(r#"\ref{fig:one}"#).trim(), "@fig-one");
+        let pageref = latex_to_typst(r#"\pageref{fig:one}"#);
+        assert!(
+            pageref.contains("#locate") && pageref.contains("@fig-one.page()"),
+            "got: {}",
+            pageref
+        );
+    }
+}
+
 // ============================================================================
 // Escaped punctuation regressions - Typst to LaTeX
 // ============================================================================
+
+mod citation_edge_cases {
+    use super::*;
+
+    #[test]
+    fn test_t2l_citation_edge_cases() {
+        assert_eq!(
+            typst_to_latex_with_options(
+                r#"#cite(<a>, <b>, form: "prose")"#,
+                &T2LOptions::default()
+            )
+            .trim(),
+            r#"\citet{a, b}"#
+        );
+        assert_eq!(
+            typst_to_latex_with_options(
+                r#"#cite(<a>, supplement: [pp. 3-4])"#,
+                &T2LOptions::default()
+            )
+            .trim(),
+            r#"\cite[pp. 3-4]{a}"#
+        );
+        assert_eq!(
+            typst_to_latex_with_options(
+                r#"#cite(<a>, form: "author", supplement: [ch. 2])"#,
+                &T2LOptions::default()
+            )
+            .trim(),
+            r#"\citeauthor[ch. 2]{a}"#
+        );
+    }
+
+    #[test]
+    fn test_l2t_citation_edge_cases() {
+        let citep = latex_document_to_typst(r#"See \citep[see][ch. 2]{a,b}."#);
+        assert!(
+            citep.contains(r#"See see #cite(<a>, <b>, supplement: [ch. 2])."#),
+            "got: {}",
+            citep
+        );
+
+        let citep_single = latex_document_to_typst(r#"See \citep[see]{a}."#);
+        assert!(
+            citep_single.contains(r#"See #cite(<a>, supplement: [see])."#),
+            "got: {}",
+            citep_single
+        );
+
+        let citeauthor_star = latex_to_typst(r#"\citeauthor*{a}"#);
+        assert!(
+            citeauthor_star.contains(r#"#cite(<a>, form: "author")"#)
+                && !citeauthor_star.starts_with('*'),
+            "got: {}",
+            citeauthor_star
+        );
+
+        let citeyearpar = latex_to_typst(r#"\citeyearpar{a}"#);
+        assert!(
+            citeyearpar.contains(r#"#cite(<a>, form: "year")"#),
+            "got: {}",
+            citeyearpar
+        );
+
+        let nameref = latex_document_to_typst(r#"See \nameref{sec:intro}."#);
+        assert!(nameref.contains("See @sec-intro."), "got: {}", nameref);
+    }
+}
+
+mod t2l_minieval_semantic_refs {
+    use super::*;
+    use tylax::{
+        core::typst2latex::expand_macros, typst_to_latex_with_diagnostics, typst_to_latex_with_eval,
+    };
+
+    #[test]
+    fn test_expand_macros_keeps_citation_typst_via_shared_serializer() {
+        assert_eq!(
+            expand_macros(r#"#cite(<knuth>)"#).unwrap().trim(),
+            r#"#cite(<knuth>)"#
+        );
+        assert_eq!(
+            expand_macros(r#"#cite(<knuth>, form: "author", supplement: [ch. 2])"#)
+                .unwrap()
+                .trim(),
+            r#"#cite(<knuth>, form: "author", supplement: [ch. 2])"#
+        );
+    }
+
+    #[test]
+    fn test_minieval_preserves_citation_ref_label_and_bibliography() {
+        let opts = T2LOptions::full_document();
+
+        let cite = typst_to_latex_with_eval(r#"#cite(<knuth>)"#, &opts);
+        assert!(cite.contains(r#"\cite{knuth}"#), "got: {}", cite);
+
+        let cite_prose = typst_to_latex_with_eval(r#"#cite(<knuth>, form: "prose")"#, &opts);
+        assert!(
+            cite_prose.contains(r#"\citet{knuth}"#),
+            "got: {}",
+            cite_prose
+        );
+
+        let rf = typst_to_latex_with_eval(r#"#ref(<eq-energy>)"#, &opts);
+        assert!(rf.contains(r#"\ref{eq-energy}"#), "got: {}", rf);
+
+        let label = typst_to_latex_with_eval(r#"#label(<eq-energy>)"#, &opts);
+        assert!(label.contains(r#"\label{eq-energy}"#), "got: {}", label);
+
+        let bib =
+            typst_to_latex_with_diagnostics(r#"#bibliography("refs.bib", style: plain)"#, &opts);
+        assert!(
+            bib.output.contains(r#"\bibliographystyle{plain}"#),
+            "got: {}",
+            bib.output
+        );
+        assert!(
+            bib.output.contains(r#"\bibliography{refs}"#),
+            "got: {}",
+            bib.output
+        );
+        assert!(
+            bib.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            bib.format_warnings()
+        );
+    }
+
+    #[test]
+    fn test_minieval_preserves_dynamic_citation_and_reference_values() {
+        let opts = T2LOptions::full_document();
+
+        let cite = typst_to_latex_with_eval("#let k = <knuth>\n#cite(k)", &opts);
+        assert!(cite.contains(r#"\cite{knuth}"#), "got: {}", cite);
+
+        let rf = typst_to_latex_with_eval("#let lab = <eq-energy>\n#ref(lab)", &opts);
+        assert!(rf.contains(r#"\ref{eq-energy}"#), "got: {}", rf);
+
+        let looped = typst_to_latex_with_eval("#for k in (<a>, <b>) [#cite(k)]", &opts);
+        assert!(looped.contains(r#"\cite{a}\cite{b}"#), "got: {}", looped);
+        assert!(
+            !looped.contains("[<a>]") && !looped.contains("[<b>]"),
+            "got: {}",
+            looped
+        );
+
+        let spaced_refs = typst_to_latex_with_eval("@a @b", &opts);
+        assert!(
+            spaced_refs.contains(r#"\ref{a} \ref{b}"#),
+            "got: {}",
+            spaced_refs
+        );
+
+        let spaced_cites = typst_to_latex_with_eval("#cite(<a>) #cite(<b>)", &opts);
+        assert!(
+            spaced_cites.contains(r#"\cite{a} \cite{b}"#),
+            "got: {}",
+            spaced_cites
+        );
+
+        let sentence_refs = typst_to_latex_with_eval("X @a @b Y", &opts);
+        assert!(
+            sentence_refs.contains(r#"X \ref{a} \ref{b} Y"#),
+            "got: {}",
+            sentence_refs
+        );
+    }
+
+    #[test]
+    fn test_diagnostics_preserves_bare_reference_and_spacing() {
+        let opts = T2LOptions::default();
+
+        let bare = typst_to_latex_with_diagnostics("@knuth", &opts);
+        assert_eq!(bare.output.trim(), r#"\ref{knuth}"#);
+
+        let sentence = typst_to_latex_with_diagnostics("See @knuth.", &opts);
+        assert_eq!(sentence.output.trim(), r#"See \ref{knuth}."#);
+
+        let refs = typst_to_latex_with_diagnostics("@a @b", &opts);
+        assert_eq!(refs.output.trim(), r#"\ref{a} \ref{b}"#);
+
+        let cites = typst_to_latex_with_diagnostics(r#"#cite(<a>) #cite(<b>)"#, &opts);
+        assert_eq!(cites.output.trim(), r#"\cite{a} \cite{b}"#);
+    }
+}
 
 mod t2l_escaped_punctuation {
     use super::*;
