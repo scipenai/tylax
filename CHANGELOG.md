@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-03-12
+
+This release unifies citation, reference, and label semantics across both LaTeX→Typst and Typst→LaTeX conversion. Citations now stay explicit as `#cite(...)` on the Typst side, bare `@key` consistently remains reference-first on the T2L path, and the shared refs layer now drives more of the conversion logic in both directions.
+
+MiniEval also preserves `cite`, `ref`, `label`, and `bibliography` as semantic content nodes instead of reconstructing them from generic function calls. That makes dynamic cases like `#let k = <knuth>; #cite(k)` and loop-expanded citations round-trip cleanly and fixes a number of malformed citation/reference outputs.
+
 ## [0.3.3] - 2026-03-08
 
 ### Fixed
@@ -99,7 +105,8 @@ This release is a major overhaul of the core conversion logic, introducing prope
 - CLI tool (`t2l`)
 - Structured error handling with warnings
 
-[Unreleased]: https://github.com/scipenai/tylax/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/scipenai/tylax/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/scipenai/tylax/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/scipenai/tylax/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/scipenai/tylax/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/scipenai/tylax/compare/v0.3.0...v0.3.1
