@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-04-03
+
+### Fixed
+- **L2T mathop**: `\mathop{\mathrm{Tr}}` now emits `op("Tr")` instead of `class("large", ...)` fallback.
+- **L2T sqrt**: Nested `frac()` commas no longer trigger spurious brace wrapping.
+- **T2L Assignment**: `:=`, `=:`, `::=` emit `\mathrel{:=}` without requiring mathtools.
+- **T2L Subscripts**: Multiline big-operator subscripts use `\substack{}`.
+
+### Added
+- **T2L Math Spacing**: `#h(1cm)` emits `\hspace{1cm}` in math mode.
+
+### Changed
+- **T2L MathSegment**: Inline `#expr` in math preserved as structured nodes instead of pre-stringified.
+
 ## [0.3.4] - 2026-03-12
 
 This release unifies citation, reference, and label semantics across both LaTeX→Typst and Typst→LaTeX conversion. Citations now stay explicit as `#cite(...)` on the Typst side, bare `@key` consistently remains reference-first on the T2L path, and the shared refs layer now drives more of the conversion logic in both directions.
@@ -105,7 +119,8 @@ This release is a major overhaul of the core conversion logic, introducing prope
 - CLI tool (`t2l`)
 - Structured error handling with warnings
 
-[Unreleased]: https://github.com/scipenai/tylax/compare/v0.3.4...HEAD
+[Unreleased]: https://github.com/scipenai/tylax/compare/v0.3.5...HEAD
+[0.3.5]: https://github.com/scipenai/tylax/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/scipenai/tylax/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/scipenai/tylax/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/scipenai/tylax/compare/v0.3.1...v0.3.2
