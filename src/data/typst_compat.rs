@@ -236,6 +236,7 @@ lazy_static! {
         m.insert("op", MathHandler::Special);
         m.insert("display", MathHandler::Special);
         m.insert("inline", MathHandler::Special);
+        m.insert("h", MathHandler::Special);
         m.insert("set", MathHandler::Special);
         m.insert("Set", MathHandler::Special);
 

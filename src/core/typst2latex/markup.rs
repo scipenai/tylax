@@ -3,13 +3,14 @@
 //! Handles document structure, text formatting, and non-math content.
 
 use super::context::{ConvertContext, EnvironmentContext, TokenType};
-use super::engine::ContentNode;
+use super::engine::{render_math_segments_to_typst_source, ContentNode};
 use super::math::convert_math_node;
 use super::table::{LatexCell, LatexCellAlign, LatexHLine, LatexTableGenerator};
 use super::utils::{
     count_heading_markers, escape_latex_text, extract_length_value, format_latex_color_command,
     get_raw_text_with_lang, get_simple_text, get_string_content, is_display_math,
-    is_string_or_content, normalize_typst_color_expr, parse_angle_value, FuncArgs,
+    is_string_or_content, normalize_typst_color_expr, parse_angle_value, parse_spacing_spec,
+    FuncArgs, SpacingSpec,
 };
 use crate::data::typst_compat::{
     get_heading_command, is_math_func_in_markup, MarkupHandler, TYPST_MARKUP_HANDLERS,
@@ -19,7 +20,7 @@ use crate::features::refs::{
     CiteGroup, Reference,
 };
 use crate::tikz::{convert_cetz_to_tikz, is_cetz_code};
-use typst_syntax::{SyntaxKind, SyntaxNode};
+use typst_syntax::{parse_math, SyntaxKind, SyntaxNode};
 
 /// Languages supported by the listings package (case-insensitive check)
 /// This is a subset of commonly used languages that listings supports by default
@@ -126,6 +127,31 @@ fn flush_typst_chunk(buffer: &mut String, ctx: &mut ConvertContext) {
     buffer.clear();
 }
 
+fn emit_rendered_math(ctx: &mut ConvertContext, math_content: &str, is_block: bool) {
+    let in_table = ctx.is_in_env(&EnvironmentContext::Table);
+
+    if math_content.trim().is_empty() {
+        return;
+    }
+
+    let has_alignment = has_unescaped_alignment(math_content);
+
+    if !in_table && has_alignment {
+        ctx.push("\\begin{align}\n");
+        ctx.push(math_content);
+        ctx.push("\n\\end{align}");
+    } else if is_block && !in_table {
+        ctx.push("\\[\n");
+        ctx.push(math_content);
+        ctx.push("\n\\]");
+    } else {
+        ctx.push("$");
+        ctx.push(math_content);
+        ctx.push("$");
+    }
+    ctx.last_token = TokenType::Command;
+}
+
 pub fn convert_content_nodes_to_latex(nodes: &[ContentNode], ctx: &mut ConvertContext) {
     let mut buffer = String::new();
 
@@ -190,6 +216,17 @@ pub fn convert_content_nodes_to_latex(nodes: &[ContentNode], ctx: &mut ConvertCo
                 ));
                 ctx.push_line(&format!(r"\bibliography{{{}}}", bib_name));
                 ctx.last_token = TokenType::Command;
+            }
+            ContentNode::Math { segments, block } => {
+                flush_typst_chunk(&mut buffer, ctx);
+                let math_source = render_math_segments_to_typst_source(segments);
+                let root = parse_math(&math_source);
+                let mut math_ctx = ConvertContext::new();
+                math_ctx.options = ctx.options.clone();
+                math_ctx.in_math = true;
+                convert_math_node(&root, &mut math_ctx);
+                let math_content = math_ctx.finalize().trim().to_string();
+                emit_rendered_math(ctx, &math_content, *block);
             }
             other => buffer.push_str(&other.to_typst()),
         }
@@ -535,31 +572,7 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
             }
             let math_content = math_ctx.finalize().trim().to_string();
 
-            // Skip empty math expressions to avoid LaTeX errors
-            if math_content.is_empty() {
-                return;
-            }
-
-            // Check if the converted content has alignment markers
-            // If it has & outside of \begin{cases}, use align environment
-            // But NEVER use align inside a table cell (LR mode)
-            let has_alignment = has_unescaped_alignment(&math_content);
-
-            if !in_table && has_alignment {
-                // Always use align environment for equations with alignment markers
-                ctx.push("\\begin{align}\n");
-                ctx.push(&math_content);
-                ctx.push("\n\\end{align}");
-            } else if is_block {
-                ctx.push("\\[\n");
-                ctx.push(&math_content);
-                ctx.push("\n\\]");
-            } else {
-                ctx.push("$");
-                ctx.push(&math_content);
-                ctx.push("$");
-            }
-            ctx.last_token = TokenType::Command;
+            emit_rendered_math(ctx, &math_content, is_block);
         }
 
         SyntaxKind::Math => {
@@ -913,16 +926,12 @@ fn handle_special_markup_func(func_name: &str, children: &[&SyntaxNode], ctx: &m
         "h" => {
             if let Some(args) = children.get(1) {
                 let arg_text = args.text().to_string();
-                // Parse the spacing value
-                if arg_text.contains("fr") {
-                    // Fractional units (1fr, 2fr) -> flexible space
-                    ctx.push("\\hfill");
-                } else if let Some(value) = extract_length_value(&arg_text) {
-                    // Fixed length units (em, pt, cm, mm, in)
-                    ctx.push(&format!("\\hspace{{{}}}", value));
-                } else {
-                    // Fallback for unknown formats
-                    ctx.push("\\hfill");
+                match parse_spacing_spec(&arg_text) {
+                    Some(SpacingSpec::Flex(_)) => ctx.push("\\hfill"),
+                    Some(SpacingSpec::Fixed(value)) => {
+                        ctx.push(&format!("\\hspace{{{}}}", value));
+                    }
+                    None => ctx.push("\\hfill"),
                 }
             }
         }

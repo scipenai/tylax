@@ -1,6 +1,7 @@
 use super::context::{ConvertContext, TokenType};
 use super::math_ir::{
-    MathCaseRow, MathCommand, MathEnvironment, MathIr, MathSpacing, MathStyleMode,
+    normalize_math_ir, MathCaseRow, MathCommand, MathEnvironment, MathIr, MathSpacing,
+    MathStyleMode,
 };
 
 pub fn emit_math_ir(ir: &MathIr, ctx: &mut ConvertContext) {
@@ -10,6 +11,7 @@ pub fn emit_math_ir(ir: &MathIr, ctx: &mut ConvertContext) {
                 emit_math_ir(item, ctx);
             }
         }
+        MathIr::Linebreak => emit_linebreak(ctx),
         MathIr::Symbol(symbol) => emit_symbol(symbol, ctx),
         MathIr::Ident(ident) => ctx.push_with_spacing(ident, TokenType::Letter),
         MathIr::Number(number) => ctx.push_with_spacing(number, TokenType::Number),
@@ -168,11 +170,11 @@ fn emit_attachment(attachment: &MathIr, ctx: &mut ConvertContext) {
 
     if let Some(bottom) = bottom.as_deref() {
         ctx.push("_");
-        emit_script_content(bottom, ctx);
+        emit_script_content_for_base(bottom, Some(base), ctx);
     }
     if let Some(top) = top.as_deref() {
         ctx.push("^");
-        emit_script_content(top, ctx);
+        emit_script_content_for_base(top, Some(base), ctx);
     }
 
     if top_right.is_some() || bottom_right.is_some() {
@@ -201,13 +203,13 @@ fn emit_script(
     if let Some(sub) = sub {
         ctx.push("_");
         ctx.last_token = TokenType::Operator;
-        emit_script_content(sub, ctx);
+        emit_script_content_for_base(sub, Some(base), ctx);
     }
 
     if let Some(sup) = sup {
         ctx.push("^");
         ctx.last_token = TokenType::Operator;
-        emit_script_content(sup, ctx);
+        emit_script_content_for_base(sup, Some(base), ctx);
     }
 }
 
@@ -296,10 +298,78 @@ fn can_strip_wrapping_left_right_parens(rendered: &str) -> bool {
     depth == 0
 }
 
-fn emit_script_content(ir: &MathIr, ctx: &mut ConvertContext) {
+fn script_seq_or_single(items: Vec<MathIr>) -> MathIr {
+    if items.is_empty() {
+        MathIr::empty()
+    } else if items.len() == 1 {
+        items.into_iter().next().unwrap_or_else(MathIr::empty)
+    } else {
+        MathIr::Seq(items)
+    }
+}
+
+fn split_top_level_script_lines(ir: &MathIr) -> Option<Vec<MathIr>> {
     let ir = strip_grouping_parentheses_for_script(ir);
-    let mut rendered = emit_math_ir_to_string(ir, ctx).trim().to_string();
-    rendered = strip_grouping_parentheses_from_rendered_script(rendered);
+    let MathIr::Seq(items) = ir else {
+        return None;
+    };
+
+    let mut saw_linebreak = false;
+    let mut current = Vec::new();
+    let mut lines = Vec::new();
+
+    for item in items {
+        match item {
+            MathIr::Linebreak => {
+                saw_linebreak = true;
+                let line = normalize_math_ir(script_seq_or_single(std::mem::take(&mut current)));
+                if !line.is_empty() {
+                    lines.push(line);
+                }
+            }
+            other => current.push(other.clone()),
+        }
+    }
+
+    let line = normalize_math_ir(script_seq_or_single(current));
+    if !line.is_empty() {
+        lines.push(line);
+    }
+
+    if saw_linebreak {
+        Some(lines)
+    } else {
+        None
+    }
+}
+
+fn render_script_fragment(ir: &MathIr, ctx: &ConvertContext) -> String {
+    let ir = strip_grouping_parentheses_for_script(ir);
+    let rendered = emit_math_ir_to_string(ir, ctx).trim().to_string();
+    strip_grouping_parentheses_from_rendered_script(rendered)
+}
+
+const LIMITS_LIKE_SYMBOLS: &[&str] = &[
+    r"\sum", r"\prod", r"\int", r"\oint", r"\iint", r"\iiint", r"\lim", r"\limsup", r"\liminf",
+    r"\max", r"\min", r"\sup", r"\inf",
+];
+
+fn is_limits_like_symbol(symbol: &str) -> bool {
+    LIMITS_LIKE_SYMBOLS.contains(&symbol)
+}
+
+fn is_limits_like_base(base: &MathIr) -> bool {
+    match base {
+        MathIr::Limits(_) => true,
+        MathIr::Symbol(symbol) => is_limits_like_symbol(symbol),
+        MathIr::Apply { callee, .. } => is_limits_like_base(callee),
+        MathIr::Style { content, .. } => is_limits_like_base(content),
+        MathIr::Delimited { open, .. } => open.starts_with(r"\mathop{"),
+        _ => false,
+    }
+}
+
+fn emit_rendered_script_content(rendered: &str, ctx: &mut ConvertContext) {
     if rendered.is_empty() {
         return;
     }
@@ -311,13 +381,45 @@ fn emit_script_content(ir: &MathIr, ctx: &mut ConvertContext) {
             .map(|ch| ch.is_alphanumeric())
             .unwrap_or(false)
     {
-        ctx.push(&rendered);
+        ctx.push(rendered);
     } else {
         ctx.push("{");
-        ctx.push(&rendered);
+        ctx.push(rendered);
         ctx.push("}");
     }
     ctx.last_token = TokenType::Command;
+}
+
+fn emit_script_content_for_base(ir: &MathIr, base: Option<&MathIr>, ctx: &mut ConvertContext) {
+    if let Some(base) = base {
+        if is_limits_like_base(base) {
+            if let Some(lines) = split_top_level_script_lines(ir) {
+                let rendered_lines: Vec<String> = lines
+                    .iter()
+                    .map(|line| render_script_fragment(line, ctx))
+                    .filter(|line| !line.is_empty())
+                    .collect();
+
+                if rendered_lines.len() > 1 {
+                    let joined = strip_grouping_parentheses_from_rendered_script(
+                        rendered_lines.join(r" \\ "),
+                    );
+                    ctx.push(r"{\substack{");
+                    ctx.push(&joined);
+                    ctx.push("}}");
+                    ctx.last_token = TokenType::Command;
+                    return;
+                }
+            }
+        }
+    }
+
+    emit_script_content(ir, ctx);
+}
+
+fn emit_script_content(ir: &MathIr, ctx: &mut ConvertContext) {
+    let rendered = render_script_fragment(ir, ctx);
+    emit_rendered_script_content(&rendered, ctx);
 }
 
 fn emit_command(command: &MathCommand, ctx: &mut ConvertContext) {
@@ -387,6 +489,10 @@ fn emit_case_row(row: &MathCaseRow, ctx: &mut ConvertContext) {
     }
 }
 
+fn emit_linebreak(ctx: &mut ConvertContext) {
+    emit_raw_literal(" \\\n", ctx);
+}
+
 fn emit_raw_literal(text: &str, ctx: &mut ConvertContext) {
     ctx.push(text);
     let last_non_space = text.chars().rev().find(|ch| !ch.is_whitespace());
@@ -418,7 +524,55 @@ fn delimiter_token_type(delim: &str, is_open: bool) -> TokenType {
 
 #[cfg(test)]
 mod tests {
-    use super::{can_strip_wrapping_left_right_parens, can_strip_wrapping_plain_parens};
+    use super::{
+        can_strip_wrapping_left_right_parens, can_strip_wrapping_plain_parens,
+        emit_math_ir_to_string, ConvertContext, MathIr, MathSpacing,
+    };
+
+    #[test]
+    fn test_linebreak_ir_preserves_plain_math_emission() {
+        let result = emit_math_ir_to_string(
+            &MathIr::Seq(vec![
+                MathIr::Ident("i".to_string()),
+                MathIr::Linebreak,
+                MathIr::Ident("j".to_string()),
+            ]),
+            &ConvertContext::new(),
+        );
+
+        assert!(
+            result.contains("i \\\n") && result.contains("j"),
+            "linebreak IR should still emit a raw LaTeX linebreak in plain math, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_limits_attachment_multiline_bottom_uses_substack() {
+        let result = emit_math_ir_to_string(
+            &MathIr::Attachment {
+                base: Box::new(MathIr::Symbol(r"\sum".to_string())),
+                top: Some(Box::new(MathIr::Ident("n".to_string()))),
+                bottom: Some(Box::new(MathIr::Seq(vec![
+                    MathIr::Ident("i".to_string()),
+                    MathIr::Spacing(MathSpacing::Soft),
+                    MathIr::Linebreak,
+                    MathIr::Ident("j".to_string()),
+                ]))),
+                top_left: None,
+                top_right: None,
+                bottom_left: None,
+                bottom_right: None,
+            },
+            &ConvertContext::new(),
+        );
+
+        assert!(
+            result.contains(r#"\sum_{\substack{i \\ j}}^n"#),
+            "limits-like attachment bottom should use substack, got: {}",
+            result
+        );
+    }
 
     #[test]
     fn test_strip_plain_grouping_parentheses_requires_outer_pair() {

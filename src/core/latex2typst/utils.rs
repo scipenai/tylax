@@ -265,6 +265,30 @@ pub fn extract_curly_inner_content(node: &SyntaxNode) -> String {
     content
 }
 
+pub fn contains_top_level_separator(text: &str, separator: char) -> bool {
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+
+    for ch in text.chars() {
+        match ch {
+            '(' => paren_depth += 1,
+            ')' if paren_depth > 0 => paren_depth -= 1,
+            '[' => bracket_depth += 1,
+            ']' if bracket_depth > 0 => bracket_depth -= 1,
+            '{' => brace_depth += 1,
+            '}' if brace_depth > 0 => brace_depth -= 1,
+            _ => {}
+        }
+
+        if ch == separator && paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
+            return true;
+        }
+    }
+
+    false
+}
+
 // =============================================================================
 // Caption Text Conversion
 // =============================================================================

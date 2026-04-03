@@ -1,7 +1,8 @@
 use super::context::T2LOptions;
 use super::math::render_lr_to_latex_string;
 use super::utils::{
-    get_simple_text, is_content_node, normalize_typst_color_expr, FuncArgs, UNICODE_TO_LATEX,
+    get_simple_text, is_content_node, normalize_typst_color_expr, parse_spacing_spec, FuncArgs,
+    SpacingSpec, UNICODE_TO_LATEX,
 };
 use crate::data::maps::{DELIMITER_MAP, TYPST_TO_TEX};
 use crate::data::typst_compat::{MathHandler, TYPST_MATH_HANDLERS};
@@ -53,6 +54,7 @@ pub enum MathEnvironment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MathIr {
     Seq(Vec<MathIr>),
+    Linebreak,
     Symbol(String),
     Ident(String),
     Number(String),
@@ -92,6 +94,15 @@ pub enum MathIr {
     RawLiteral(String),
 }
 
+fn normalize_package_sensitive_math_tex(tex: &str) -> &str {
+    match tex {
+        "coloneqq" => r"\mathrel{:=}",
+        "eqqcolon" => r"\mathrel{=:}",
+        "Coloneqq" => r"\mathrel{::=}",
+        other => other,
+    }
+}
+
 impl MathIr {
     pub fn empty() -> Self {
         MathIr::Seq(vec![])
@@ -112,7 +123,7 @@ pub fn build_math_ir(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
         SyntaxKind::FieldAccess => build_field_access(node),
         SyntaxKind::Space => MathIr::Spacing(MathSpacing::Soft),
         SyntaxKind::Escape => build_escape(node),
-        SyntaxKind::Linebreak => MathIr::RawLiteral(" \\\\\n".to_string()),
+        SyntaxKind::Linebreak => MathIr::Linebreak,
         SyntaxKind::MathAttach => build_math_attach(node, options),
         SyntaxKind::FuncCall => build_func_call(node, options),
         SyntaxKind::MathFrac => build_math_frac(node, options),
@@ -288,7 +299,9 @@ fn build_math_ident(node: &SyntaxNode) -> MathIr {
     }
 
     if let Some(tex) = TYPST_TO_TEX.get(text_str) {
-        return MathIr::Symbol(with_leading_backslash(tex));
+        return MathIr::Symbol(with_leading_backslash(
+            normalize_package_sensitive_math_tex(tex),
+        ));
     }
 
     if text_str.len() == 1 {
@@ -307,7 +320,9 @@ fn build_field_access(node: &SyntaxNode) -> MathIr {
     let full_text_str = full_text.as_str();
 
     if let Some(tex) = TYPST_TO_TEX.get(full_text_str) {
-        return MathIr::Symbol(with_leading_backslash(tex));
+        return MathIr::Symbol(with_leading_backslash(
+            normalize_package_sensitive_math_tex(tex),
+        ));
     }
 
     if full_text_str == "square.stroked" || full_text_str == "square.filled" {
@@ -480,7 +495,9 @@ fn build_func_call(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
 
 fn build_callable_ir(func_str: &str, args: Vec<MathIr>) -> MathIr {
     let callee = if let Some(tex) = TYPST_TO_TEX.get(func_str) {
-        MathIr::Symbol(with_leading_backslash(tex))
+        MathIr::Symbol(with_leading_backslash(
+            normalize_package_sensitive_math_tex(tex),
+        ))
     } else {
         MathIr::Command(MathCommand {
             latex: r"\operatorname".to_string(),
@@ -557,6 +574,17 @@ fn build_special_func_call(
             content: Box::new(seq_or_single(
                 args.iter().map(|arg| build_math_ir(arg, options)).collect(),
             )),
+        }),
+        "h" => args.first().and_then(|arg| {
+            let arg_text = get_simple_text(arg);
+            match parse_spacing_spec(&arg_text) {
+                Some(SpacingSpec::Fixed(value)) => Some(MathIr::Command(MathCommand {
+                    latex: r"\hspace".to_string(),
+                    args: vec![MathIr::RawLiteral(value)],
+                    optional_arg: None,
+                })),
+                Some(SpacingSpec::Flex(_)) | None => None,
+            }
         }),
         "op" => {
             let name = args
@@ -842,12 +870,25 @@ fn build_math_delimited(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
 fn build_generic(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
     let children: Vec<&SyntaxNode> = node.children().collect();
     if !children.is_empty() {
-        return seq_or_single(
-            children
-                .into_iter()
-                .map(|child| build_math_ir(child, options))
-                .collect(),
-        );
+        let mut items = Vec::new();
+        let mut index = 0;
+
+        while index < children.len() {
+            let child = children[index];
+            if child.kind() == SyntaxKind::Hash && index + 1 < children.len() {
+                let next = children[index + 1];
+                if next.kind() == SyntaxKind::FuncCall {
+                    items.push(build_math_ir(next, options));
+                    index += 2;
+                    continue;
+                }
+            }
+
+            items.push(build_math_ir(child, options));
+            index += 1;
+        }
+
+        return seq_or_single(items);
     }
 
     let text = node.text();
@@ -857,7 +898,9 @@ fn build_generic(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
     }
 
     if let Some(tex) = TYPST_TO_TEX.get(text_str) {
-        return MathIr::Symbol(with_leading_backslash(tex));
+        return MathIr::Symbol(with_leading_backslash(
+            normalize_package_sensitive_math_tex(tex),
+        ));
     }
 
     MathIr::Ident(convert_unicode_in_text(text_str))

@@ -523,4 +523,37 @@ Math: $\norm{\xvec} = \sqrt{\inner{\xvec}{\xvec}}$
             result
         );
     }
+
+    #[test]
+    fn test_sqrt_with_nested_fraction_commas_does_not_add_braces() {
+        let input = r#"\sqrt{\frac{\partial f^2}{\partial x}+\frac{\partial f^2}{\partial y}}"#;
+        let result = latex_to_typst(input);
+        assert!(
+            !result.contains("sqrt({"),
+            "nested frac commas should not force extra sqrt braces, got: {}",
+            result
+        );
+        assert!(
+            result.contains("frac("),
+            "sqrt over fraction sum should still contain frac calls, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_sqrt_with_nested_fraction_sum_no_extra_braces() {
+        let input = r#"\sqrt{\frac{a}{b}+\frac{c}{d}}"#;
+        let result = latex_to_typst(input);
+        assert!(
+            !result.contains("sqrt({"),
+            "nested fractions should not force extra sqrt braces, got: {}",
+            result
+        );
+        assert!(
+            result.contains("sqrt(")
+                && (result.matches("frac(").count() >= 2 || result.contains("/")),
+            "expected nested fractions to remain as valid root content, got: {}",
+            result
+        );
+    }
 }

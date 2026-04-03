@@ -1,9 +1,65 @@
 //! Integration tests for Tylax full document conversion
 
+use std::io::Write;
+use std::process::{Command, Stdio};
+
 use tylax::{
     convert_auto, convert_auto_document, detect_format, latex_document_to_typst, latex_to_typst,
-    typst_to_latex, typst_to_latex_with_options, T2LOptions,
+    typst_to_latex, typst_to_latex_with_diagnostics, typst_to_latex_with_options, T2LOptions,
 };
+
+fn run_t2l_cli(input: &str) -> String {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_t2l"))
+        .arg("--direction")
+        .arg("t2l")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn t2l CLI");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("t2l CLI stdin unavailable")
+        .write_all(input.as_bytes())
+        .expect("failed to write CLI input");
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for t2l CLI output");
+    assert!(
+        output.status.success(),
+        "t2l CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    String::from_utf8(output.stdout).expect("CLI output was not valid UTF-8")
+}
+
+fn normalize_output(output: &str) -> &str {
+    output.trim_end_matches('\n')
+}
+
+fn assert_t2l_paths_match(input: &str) -> String {
+    let options = typst_to_latex_with_options(input, &T2LOptions::default());
+    let diagnostics = typst_to_latex_with_diagnostics(input, &T2LOptions::default()).output;
+    let cli = run_t2l_cli(input);
+
+    assert_eq!(
+        normalize_output(&options),
+        normalize_output(&diagnostics),
+        "with_options and with_diagnostics diverged for input:\n{}",
+        input
+    );
+    assert_eq!(
+        normalize_output(&options),
+        normalize_output(&cli),
+        "with_options and CLI diverged for input:\n{}",
+        input
+    );
+
+    options
+}
 
 // ============================================================================
 // Math Mode Tests - LaTeX to Typst
@@ -357,6 +413,121 @@ mod l2t_math {
             res1.contains("limits(op(\"argmin\"))"),
             "Strict check failed for operatorname: {}",
             res1
+        );
+    }
+
+    #[test]
+    fn test_mathop_upright_text_becomes_operator() {
+        let result = latex_to_typst(r"$f(X)=\mathop{\mathrm{Tr}} (ZX)$");
+        assert!(
+            result.contains(r#"op("Tr")"#),
+            "mathop over upright Tr should become op(\"Tr\"), got: {}",
+            result
+        );
+        assert!(
+            !result.contains(r#"class("large", upright(Tr))"#),
+            "mathop over upright Tr should not stay as class(\"large\", upright(Tr)), got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_mathop_operator_like_variants() {
+        let rm = latex_to_typst(r"$\mathop{\rm Tr}$");
+        assert!(
+            rm.contains(r#"op("Tr")"#),
+            "mathop over legacy rm Tr should become op(\"Tr\"), got: {}",
+            rm
+        );
+
+        let bare = latex_to_typst(r"$\mathop{Tr}$");
+        assert!(
+            bare.contains(r#"op("Tr")"#),
+            "mathop over bare Tr should become op(\"Tr\"), got: {}",
+            bare
+        );
+
+        let operatorname = latex_to_typst(r"$\mathop{\operatorname{diag}} x$");
+        assert!(
+            operatorname.contains(r#"op("diag") x"#) || operatorname.contains(r#"op("diag")  x"#),
+            "mathop over nested operatorname diag should become op(\"diag\"), got: {}",
+            operatorname
+        );
+
+        let argmax = latex_to_typst(r"$\mathop{\mathrm{argmax}}$");
+        assert!(
+            argmax.contains(r#"op("argmax")"#),
+            "mathop over upright argmax should become op(\"argmax\"), got: {}",
+            argmax
+        );
+    }
+
+    #[test]
+    fn test_mathop_text_wrappers_become_operator() {
+        let text = latex_to_typst(r"$\mathop{\text{Tr}}$");
+        assert!(
+            text.contains(r#"op("Tr")"#),
+            "mathop over text Tr should become op(\"Tr\"), got: {}",
+            text
+        );
+
+        let textnormal = latex_to_typst(r"$\mathop{\textnormal{Tr}}$");
+        assert!(
+            textnormal.contains(r#"op("Tr")"#),
+            "mathop over textnormal Tr should become op(\"Tr\"), got: {}",
+            textnormal
+        );
+
+        let textrm = latex_to_typst(r"$\mathop{\textrm{Tr}}$");
+        assert!(
+            textrm.contains(r#"op("Tr")"#),
+            "mathop over textrm Tr should become op(\"Tr\"), got: {}",
+            textrm
+        );
+    }
+
+    #[test]
+    fn test_mathop_complex_cases_keep_fallback() {
+        let plus = latex_to_typst(r"$\mathop{A+B}$");
+        assert!(
+            plus.contains(r#"class("large""#) && !plus.contains(r#"op("A+B")"#),
+            "mathop over A+B should keep class fallback, got: {}",
+            plus
+        );
+
+        let frac = latex_to_typst(r"$\mathop{\frac12}$");
+        assert!(
+            frac.contains(r#"class("large""#) && !frac.contains(r#"op("12")"#),
+            "mathop over frac should keep class fallback, got: {}",
+            frac
+        );
+
+        let sum = latex_to_typst(r"$\mathop{\sum}$");
+        assert!(
+            sum.contains(r#"class("large""#) && !sum.contains(r#"op("sum")"#),
+            "mathop over sum should keep class fallback, got: {}",
+            sum
+        );
+
+        let lr = latex_to_typst(r"$\mathop{\left( x \right)}$");
+        assert!(
+            lr.contains(r#"class("large""#),
+            "mathop over left-right group should keep class fallback, got: {}",
+            lr
+        );
+
+        let bold = latex_to_typst(r"$\mathop{\mathbf{T}}$");
+        assert!(
+            bold.contains(r#"class("large""#) && !bold.contains(r#"op("T")"#),
+            "mathop over bold T should not be treated as operator name, got: {}",
+            bold
+        );
+
+        let differential = latex_to_typst(r"$\mathop{\mathrm{d}}$");
+        assert!(
+            !differential.contains(r#"op("d")"#) && !differential.contains(r#"op("dif")"#),
+            "mathop over upright d should not be promoted to op(...), got: {}",
+            differential
         );
     }
 }
@@ -2796,6 +2967,63 @@ mod t2l_escaped_punctuation {
     }
 
     #[test]
+    fn test_multiline_big_operator_subscript_uses_substack() {
+        let result =
+            typst_to_latex_with_options("$sum_(i = 1 \\ j = 1)^n A_(i j)$", &T2LOptions::default());
+
+        assert!(
+            result.contains(r#"\sum_{\substack{i = 1 \\ j = 1}}^n"#),
+            "multiline big-operator subscript should use substack, got: {}",
+            result
+        );
+        assert!(
+            !result.contains(r#"\sum_{i = 1 \\"#),
+            "multiline big-operator subscript should not stay as a raw multiline brace group, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_multiline_big_operator_subscript_is_consistent_across_paths() {
+        let result = assert_t2l_paths_match("$sum_(i = 1 \\ j = 1)^n A_(i j)$");
+        assert!(
+            result.contains(r#"\sum_{\substack{i = 1 \\ j = 1}}^n"#),
+            "multiline big-operator subscript should stay on the substack path, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_multiline_limits_operator_subscript_uses_substack() {
+        let result = typst_to_latex_with_options(
+            r#"$limits(op("argmax"))_(x \ y)$"#,
+            &T2LOptions::default(),
+        );
+
+        assert!(
+            result.contains(r#"\operatorname{argmax}_{\substack{x \\ y}}"#),
+            "multiline limits() subscript should use substack, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_multiline_non_limits_subscript_keeps_plain_brace_group() {
+        let result = typst_to_latex_with_options("$A_(i \\ j)$", &T2LOptions::default());
+
+        assert!(
+            !result.contains(r#"\substack"#),
+            "non-limits multiline subscript should not use substack, got: {}",
+            result
+        );
+        assert!(
+            result.contains("A_{i \\\n") && result.contains("j}"),
+            "non-limits multiline subscript should still emit a plain multiline brace group, got: {}",
+            result
+        );
+    }
+
+    #[test]
     fn test_matrix_delim_named_arg_maps_to_pmatrix() {
         let result =
             typst_to_latex_with_options(r#"$mat(delim: "(", 1, 2; 3, 4)$"#, &T2LOptions::default());
@@ -2936,6 +3164,136 @@ mod t2l_math_ir_tranche2 {
             relation.contains(r#"\mathrel{x}"#),
             r"class(relation, x) should emit \mathrel, got: {}",
             relation
+        );
+    }
+
+    #[test]
+    fn test_assignment_like_relations_use_package_free_output() {
+        let assign = typst_to_latex_with_options("$a := b$", &T2LOptions::default());
+        let rev_assign = typst_to_latex_with_options("$a =: b$", &T2LOptions::default());
+        let double_assign = typst_to_latex_with_options("$a ::= b$", &T2LOptions::default());
+
+        assert!(
+            assign.contains(r#"\mathrel{:=}"#) && !assign.contains(r#"\coloneqq"#),
+            ":= should emit package-free relation output, got: {}",
+            assign
+        );
+        assert!(
+            rev_assign.contains(r#"\mathrel{=:}"#) && !rev_assign.contains(r#"\eqqcolon"#),
+            "=: should emit package-free relation output, got: {}",
+            rev_assign
+        );
+        assert!(
+            double_assign.contains(r#"\mathrel{::=}"#) && !double_assign.contains(r#"\Coloneqq"#),
+            "::= should emit package-free relation output, got: {}",
+            double_assign
+        );
+    }
+
+    #[test]
+    fn test_assignment_like_relations_are_consistent_across_paths() {
+        let result = assert_t2l_paths_match("$a := b$");
+        assert!(
+            result.contains(r#"\mathrel{:=}"#) && !result.contains(r#"\coloneqq"#),
+            "assignment-like relations should stay package-free across all paths, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_full_document_assignment_like_relations_do_not_require_mathtools() {
+        let result = typst_to_latex_with_options("$a := b$", &T2LOptions::full_document());
+        assert!(
+            result.contains(r#"\mathrel{:=}"#),
+            "full document := should still use package-free output, got: {}",
+            result
+        );
+        assert!(
+            !result.contains(r#"\usepackage{mathtools}"#),
+            "full document default preamble should not add mathtools, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_math_h_fixed_lengths_emit_hspace() {
+        let cm = typst_to_latex_with_options("$a #h(1cm) b$", &T2LOptions::default());
+        let em = typst_to_latex_with_options("$a #h(1em) b$", &T2LOptions::default());
+        let issue = typst_to_latex_with_options(
+            r#"The competitive ratio is defined as:
+
+$
+  "CR"((x_i)_(i in ZZ), t) :=  (sum_(j <= k) y_j)  <= r_k #h(1cm)
+  v_k sum_(j >= i) z_j / v_j >= v_k z_p/v_p = r_k
+$"#,
+            &T2LOptions::default(),
+        );
+
+        assert!(
+            cm.contains(r#"\hspace{1cm}"#),
+            "math h(1cm) should emit hspace, got: {}",
+            cm
+        );
+        assert!(
+            em.contains(r#"\hspace{1em}"#),
+            "math h(1em) should emit hspace, got: {}",
+            em
+        );
+        assert!(
+            issue.contains(r#"\hspace{1cm}"#),
+            "display math example should emit hspace, got: {}",
+            issue
+        );
+    }
+
+    #[test]
+    fn test_math_h_fixed_lengths_are_consistent_across_paths() {
+        let inline = assert_t2l_paths_match("$a #h(1cm) b$");
+        assert!(
+            inline.contains(r#"\hspace{1cm}"#),
+            "inline h(1cm) should become hspace across all paths, got: {}",
+            inline
+        );
+
+        let display = assert_t2l_paths_match(
+            r#"The competitive ratio is defined as:
+
+$
+  "CR"((x_i)_(i in ZZ), t) :=  (sum_(j <= k) y_j)  <= r_k #h(1cm)
+  v_k sum_(j >= i) z_j / v_j >= v_k z_p/v_p = r_k
+$"#,
+        );
+        assert!(
+            display.contains(r#"\hspace{1cm}"#),
+            "display-math h(1cm) should become hspace across all paths, got: {}",
+            display
+        );
+
+        let list_item = assert_t2l_paths_match(
+            r#"- We look first at constraint $x_(i,k)$ when $k < p$. $
+    sum_(j:i <= j <= k) y_j = r_k - r_(i-1) <= r_k #h(1cm)
+    v_k sum_(j >= i) z_j / v_j >= v_k z_p/v_p = r_k
+  $"#,
+        );
+        assert!(
+            list_item.contains(r#"\hspace{1cm}"#),
+            "list-item math h(1cm) should become hspace across all paths, got: {}",
+            list_item
+        );
+    }
+
+    #[test]
+    fn test_math_h_fr_keeps_fallback_behavior() {
+        let result = typst_to_latex_with_options("$a #h(1fr) b$", &T2LOptions::default());
+        assert!(
+            result.contains(r#"\operatorname{h}"#),
+            "unsupported math h(1fr) should keep callable fallback, got: {}",
+            result
+        );
+        assert!(
+            !result.contains(r#"\hspace{1fr}"#) && !result.contains(r#"\hfill"#),
+            "unsupported math h(1fr) should not invent fixed or flex spacing, got: {}",
+            result
         );
     }
 

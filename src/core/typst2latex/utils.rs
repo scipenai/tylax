@@ -7,6 +7,12 @@ use lazy_static::lazy_static;
 use std::collections::HashMap;
 use typst_syntax::{SyntaxKind, SyntaxNode};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpacingSpec {
+    Fixed(String),
+    Flex(String),
+}
+
 lazy_static! {
     /// Unicode math characters to LaTeX command mapping
     pub static ref UNICODE_TO_LATEX: HashMap<char, &'static str> = {
@@ -503,6 +509,26 @@ pub fn extract_length_value(text: &str) -> Option<String> {
         let num_part = text.trim_end_matches('%').trim();
         if let Ok(percent) = num_part.parse::<f64>() {
             return Some(format!("{:.2}\\textwidth", percent / 100.0));
+        }
+    }
+
+    None
+}
+
+pub fn parse_spacing_spec(text: &str) -> Option<SpacingSpec> {
+    let trimmed = text
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+
+    if let Some(value) = extract_length_value(trimmed) {
+        return Some(SpacingSpec::Fixed(value));
+    }
+
+    if let Some(number) = trimmed.strip_suffix("fr").map(str::trim) {
+        if number.parse::<f64>().is_ok() {
+            return Some(SpacingSpec::Flex(format!("{}fr", number)));
         }
     }
 

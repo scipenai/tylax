@@ -21,7 +21,7 @@ use super::context::{
     ConversionMode, EnvironmentContext, LatexConverter, MacroDef, PendingCitation, PendingOperator,
     PendingReference,
 };
-use super::utils::{sanitize_label, to_roman_numeral};
+use super::utils::{contains_top_level_separator, sanitize_label, to_roman_numeral};
 use crate::features::images::ImageAttributes;
 use crate::features::refs::{
     citation_mode_from_latex_command, citation_to_typst, label_to_typst, reference_to_typst,
@@ -57,6 +57,100 @@ fn optional_args_to_prefix_suffix(optional_args: &[String]) -> (Option<String>, 
         [only] => (None, Some(only.clone())),
         [prefix, suffix, ..] => (Some(prefix.clone()), Some(suffix.clone())),
     }
+}
+
+fn normalize_operator_name_text(text: &str) -> Option<String> {
+    let trimmed = text
+        .trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .trim();
+
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let normalized: String = trimmed
+        .split_whitespace()
+        .filter(|part| !matches!(*part, "thin" | "med" | "thick" | "quad" | "wide"))
+        .collect();
+
+    if normalized.is_empty() {
+        return None;
+    }
+
+    if normalized
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '.' || c == '\'')
+    {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+fn extract_wrapped_operator_name(arg: &str) -> Option<String> {
+    let trimmed = arg.trim();
+
+    if let Some(name) = trimmed
+        .strip_prefix("op(\"")
+        .and_then(|rest| rest.strip_suffix("\")"))
+    {
+        return normalize_operator_name_text(name);
+    }
+
+    if let Some(inner) = trimmed
+        .strip_prefix("upright(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        return normalize_operator_name_text(inner);
+    }
+
+    if let Some(inner) = trimmed
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        return normalize_operator_name_text(inner);
+    }
+
+    None
+}
+
+fn extract_plain_operator_name_from_raw(raw_arg: &str) -> Option<String> {
+    let trimmed = raw_arg.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if !trimmed.contains('\\') {
+        return normalize_operator_name_text(trimmed);
+    }
+
+    if let Some(rest) = trimmed.strip_prefix(r"\rm") {
+        let rest = rest.trim();
+        if !rest.is_empty() && !rest.contains('\\') {
+            return normalize_operator_name_text(rest);
+        }
+    }
+
+    None
+}
+
+fn extract_operator_like_name(raw_arg: &str, converted_arg: &str) -> Option<String> {
+    if let Some(name) = extract_wrapped_operator_name(converted_arg) {
+        return Some(name);
+    }
+
+    if let Some(name) = extract_plain_operator_name_from_raw(raw_arg) {
+        return Some(name);
+    }
+
+    None
+}
+
+fn extract_explicit_operator_name(converted_arg: &str) -> Option<String> {
+    extract_wrapped_operator_name(converted_arg)
+        .or_else(|| normalize_operator_name_text(converted_arg))
 }
 
 fn emit_citation_group(
@@ -264,7 +358,7 @@ fn lookup_symbol(name: &str) -> Option<&'static str> {
 #[inline]
 fn protect_comma(content: &str) -> String {
     let trimmed = content.trim();
-    if trimmed.contains(',') {
+    if contains_top_level_separator(trimmed, ',') {
         format!("{{{}}}", trimmed)
     } else {
         trimmed.to_string()
@@ -638,18 +732,13 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
 
             // Try to get the argument (if parsed as part of the command)
             if let Some(content) = conv.convert_required_arg(&cmd, 0) {
-                // Preserve original behavior for generic operator names:
-                // only remove whitespace from the converted argument.
-                let clean_content: String =
-                    content.chars().filter(|c| !c.is_whitespace()).collect();
-                // For argmin/argmax detection, ignore spacing keywords that may
-                // appear when \, \: \; \quad \qquad are converted to Typst.
-                let normalized = clean_content
-                    .replace("thin", "")
-                    .replace("med", "")
-                    .replace("thick", "")
-                    .replace("quad", "")
-                    .replace("wide", "");
+                // Explicit operator commands opt into operator-name recovery.
+                let clean_content =
+                    extract_explicit_operator_name(&content).unwrap_or_else(|| {
+                        content.chars().filter(|c| !c.is_whitespace()).collect()
+                    });
+                let normalized = normalize_operator_name_text(&clean_content)
+                    .unwrap_or_else(|| clean_content.clone());
 
                 let op_name = if normalized == "argmin" {
                     "argmin"
@@ -2260,8 +2349,16 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             }
         }
         "mathop" => {
+            let raw_arg = conv.get_required_arg_with_braces(&cmd, 0);
             if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
-                let _ = write!(output, "class(\"large\", {}) ", arg);
+                if let Some(op_name) = raw_arg
+                    .as_deref()
+                    .and_then(|raw| extract_operator_like_name(raw, &arg))
+                {
+                    let _ = write!(output, "op(\"{}\") ", op_name);
+                } else {
+                    let _ = write!(output, "class(\"large\", {}) ", arg);
+                }
             }
         }
         "mathord" => {

@@ -12,9 +12,9 @@ use std::sync::Arc;
 use super::data;
 use super::value::{
     bibliography_content_value, citation_content_value, label_content_value,
-    normalize_ref_target_text, reference_content_value, Alignment, Arg, Arguments, Closure, Color,
-    ContentNode, Counter, DateTime, EvalError, EvalResult, HorizAlign, Length, LengthUnit,
-    Selector, State, Value, VertAlign, WrappedRegex,
+    normalize_ref_target_text, reference_content_value, render_math_segments_to_typst_source,
+    Alignment, Arg, Arguments, Closure, Color, ContentNode, Counter, DateTime, EvalError,
+    EvalResult, HorizAlign, Length, LengthUnit, Selector, State, Value, VertAlign, WrappedRegex,
 };
 use super::vfs::VirtualFileSystem;
 
@@ -1629,9 +1629,12 @@ fn content_node_to_fields(node: &ContentNode) -> IndexMap<String, Value> {
             fields.insert("block".to_string(), Value::Bool(*block));
             fields
         }
-        ContentNode::Math { content, block } => {
+        ContentNode::Math { segments, block } => {
             let mut fields = IndexMap::new();
-            fields.insert("body".to_string(), Value::Str(content.clone()));
+            fields.insert(
+                "body".to_string(),
+                Value::Str(render_math_segments_to_typst_source(segments)),
+            );
             fields.insert("block".to_string(), Value::Bool(*block));
             fields
         }
@@ -1731,7 +1734,7 @@ fn content_node_to_text(node: &ContentNode) -> String {
         ContentNode::EnumItem { content, .. } => content.iter().map(content_node_to_text).collect(),
         ContentNode::Heading { content, .. } => content.iter().map(content_node_to_text).collect(),
         ContentNode::Raw { text, .. } => text.clone(),
-        ContentNode::Math { content, .. } => content.clone(),
+        ContentNode::Math { segments, .. } => render_math_segments_to_typst_source(segments),
         ContentNode::Element { fields, .. } => fields
             .get("body")
             .and_then(|v| {

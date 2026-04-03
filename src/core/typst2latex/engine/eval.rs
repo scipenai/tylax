@@ -18,8 +18,8 @@ use super::scope::Scopes;
 use super::value::{
     bibliography_content_value, citation_content_value, label_content_value,
     normalize_ref_target_text, reference_content_value, Alignment, Arguments, Closure, ContentNode,
-    Direction, EvalError, EvalErrorKind, EvalResult, HorizAlign, Selector, ShowRule, SourceSpan,
-    Value, VertAlign,
+    Direction, EvalError, EvalErrorKind, EvalResult, HorizAlign, MathSegment, Selector, ShowRule,
+    SourceSpan, Value, VertAlign,
 };
 use super::vfs::{NoopVfs, VirtualFileSystem};
 
@@ -581,15 +581,15 @@ impl MiniEval {
             }
             ast::Expr::Equation(eq) => {
                 // Evaluate hash expressions inside math content
-                let content = self.eval_math_content(eq.body().to_untyped())?;
+                let segments = self.eval_math_content(eq.body().to_untyped())?;
                 let block = eq.block();
-                Ok(Value::Content(vec![ContentNode::Math { content, block }]))
+                Ok(Value::Content(vec![ContentNode::Math { segments, block }]))
             }
             ast::Expr::Math(math) => {
                 // Evaluate hash expressions inside math content
-                let content = self.eval_math_content(math.to_untyped())?;
+                let segments = self.eval_math_content(math.to_untyped())?;
                 Ok(Value::Content(vec![ContentNode::Math {
-                    content,
+                    segments,
                     block: false,
                 }]))
             }
@@ -2106,12 +2106,24 @@ impl MiniEval {
     ///
     /// This function traverses a Math AST node and evaluates any embedded
     /// hash expressions (like `#n` in `$F_#n$`), returning the expanded math string.
-    fn eval_math_content(&mut self, node: &SyntaxNode) -> EvalResult<String> {
+    fn eval_math_content(&mut self, node: &SyntaxNode) -> EvalResult<Vec<MathSegment>> {
         use SyntaxKind::*;
 
-        let mut result = String::new();
+        let mut result = Vec::new();
         let children: Vec<_> = node.children().collect();
         let mut i = 0;
+
+        let push_source = |segments: &mut Vec<MathSegment>, text: &str| {
+            if text.is_empty() {
+                return;
+            }
+
+            if let Some(MathSegment::Source(existing)) = segments.last_mut() {
+                existing.push_str(text);
+            } else {
+                segments.push(MathSegment::Source(text.to_string()));
+            }
+        };
 
         while i < children.len() {
             let child = &children[i];
@@ -2126,13 +2138,9 @@ impl MiniEval {
                             Ident => {
                                 let name = expr_node.text().to_string();
                                 if let Some(value) = self.scopes.get(&name) {
-                                    // Use display_in_math to avoid nested $ symbols
-                                    // e.g., if value is Math("x"), output "x" not "$x$"
-                                    result.push_str(&value.display_in_math());
+                                    result.push(MathSegment::Evaluated(value.clone()));
                                 } else {
-                                    // Preserve original if undefined
-                                    result.push('#');
-                                    result.push_str(&name);
+                                    push_source(&mut result, &format!("#{}", name));
                                 }
                                 i += 2; // Skip both Hash and Ident
                                 continue;
@@ -2144,15 +2152,25 @@ impl MiniEval {
                                     if let Some(expr) = inner.cast::<ast::Expr>() {
                                         match self.eval_expr(expr) {
                                             Ok(value) => {
-                                                // Use display_in_math to avoid nested $ symbols
-                                                result.push_str(&value.display_in_math());
+                                                result.push(MathSegment::Evaluated(value));
                                             }
                                             Err(_) => {
-                                                // Preserve original on error
-                                                result.push_str(expr_node.text().as_str());
+                                                push_source(
+                                                    &mut result,
+                                                    &format!("#{}", expr_node.text()),
+                                                );
                                             }
                                         }
                                         break;
+                                    }
+                                }
+                                if !matches!(result.last(), Some(MathSegment::Evaluated(_))) {
+                                    // No inner expression found; preserve the original source.
+                                    if !expr_node
+                                        .children()
+                                        .any(|inner| inner.cast::<ast::Expr>().is_some())
+                                    {
+                                        push_source(&mut result, &format!("#{}", expr_node.text()));
                                     }
                                 }
                                 i += 2; // Skip both Hash and Parenthesized
@@ -2163,27 +2181,29 @@ impl MiniEval {
                                 if let Some(expr) = expr_node.cast::<ast::Expr>() {
                                     match self.eval_expr(expr) {
                                         Ok(value) => {
-                                            // Use display_in_math to avoid nested $ symbols
-                                            result.push_str(&value.display_in_math());
+                                            result.push(MathSegment::Evaluated(value));
                                         }
                                         Err(_) => {
-                                            // Preserve original on error
-                                            result.push('#');
-                                            result.push_str(expr_node.text().as_str());
+                                            push_source(
+                                                &mut result,
+                                                &format!("#{}", expr_node.text()),
+                                            );
                                         }
                                     }
+                                } else {
+                                    push_source(&mut result, &format!("#{}", expr_node.text()));
                                 }
                                 i += 2;
                                 continue;
                             }
                             _ => {
                                 // Unknown expression type after hash, keep as is
-                                result.push('#');
+                                push_source(&mut result, "#");
                             }
                         }
                     } else {
                         // Hash at end with nothing after
-                        result.push('#');
+                        push_source(&mut result, "#");
                     }
                 }
                 // Default strategy: if node has children, recurse; otherwise use raw text.
@@ -2191,10 +2211,10 @@ impl MiniEval {
                 _ => {
                     if child.children().next().is_some() {
                         // Container node - recurse to find any nested #expr
-                        result.push_str(&self.eval_math_content(child)?);
+                        result.extend(self.eval_math_content(child)?);
                     } else {
                         // Leaf node (no children) - use raw text
-                        result.push_str(child.text().as_str());
+                        push_source(&mut result, child.text().as_str());
                     }
                 }
             }
@@ -2356,6 +2376,45 @@ pub fn expand_macros_with_warnings(source: &str) -> EvalResult<ExpandResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_math_content_preserves_h_func_call_as_structured_segments() {
+        let result = expand_macros_with_warnings("$a #h(1cm) b$").unwrap();
+
+        assert!(
+            !result.output.contains("[1cm]"),
+            "structured math output should not regress to h([1cm]), got: {}",
+            result.output
+        );
+
+        let ContentNode::Math { segments, block } = &result.nodes[0] else {
+            panic!("expected a math content node, got: {:?}", result.nodes);
+        };
+
+        assert!(!block, "inline math should not be marked as block math");
+        assert_eq!(
+            segments.len(),
+            3,
+            "unexpected math segments: {:?}",
+            segments
+        );
+        assert_eq!(segments[0], MathSegment::Source("a ".to_string()));
+        assert_eq!(segments[2], MathSegment::Source(" b".to_string()));
+
+        match &segments[1] {
+            MathSegment::Evaluated(Value::Content(nodes)) => {
+                assert!(
+                    matches!(
+                        nodes.first(),
+                        Some(ContentNode::FuncCall { name, .. }) if name == "h"
+                    ),
+                    "expected the evaluated segment to preserve h(...) as a func call, got: {:?}",
+                    nodes
+                );
+            }
+            other => panic!("expected an evaluated h(...) segment, got: {:?}", other),
+        }
+    }
 
     #[test]
     fn test_simple_let() {

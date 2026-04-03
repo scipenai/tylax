@@ -61,10 +61,11 @@ mod vfs;
 pub use data::{parse_csv, parse_json, parse_toml, parse_yaml};
 pub use eval::{expand_macros, expand_macros_with_warnings, EvalWarning, ExpandResult, MiniEval};
 pub use scope::{Scope, Scopes};
+pub(crate) use value::render_math_segments_to_typst_source;
 pub use value::{
     Alignment, Arg, Arguments, Closure, Color, ContentNode, Counter, DateTime, Direction,
-    EvalError, EvalErrorKind, EvalResult, HorizAlign, Length, LengthUnit, Selector, SourceSpan,
-    Symbol, ValType, Value, VertAlign, WrappedRegex,
+    EvalError, EvalErrorKind, EvalResult, HorizAlign, Length, LengthUnit, MathSegment, Selector,
+    SourceSpan, Symbol, ValType, Value, VertAlign, WrappedRegex,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use vfs::RealVfs;

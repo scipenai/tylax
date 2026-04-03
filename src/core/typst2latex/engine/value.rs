@@ -502,9 +502,12 @@ impl Selector {
                 fields.insert("block".to_string(), Value::Bool(*block));
                 fields
             }
-            ContentNode::Math { content, block } => {
+            ContentNode::Math { segments, block } => {
                 let mut fields = IndexMap::new();
-                fields.insert("body".to_string(), Value::Str(content.clone()));
+                fields.insert(
+                    "body".to_string(),
+                    Value::Str(render_math_segments_to_typst_source(segments)),
+                );
                 fields.insert("block".to_string(), Value::Bool(*block));
                 fields
             }
@@ -1164,11 +1167,7 @@ impl Value {
     /// instead of outputting `$content$`, it outputs just `content`.
     /// This prevents nested `$` symbols when expanding `#x` inside math like `$... #x ...$`.
     pub fn display_in_math(&self) -> String {
-        match self {
-            Value::Content(nodes) => nodes.iter().map(|n| n.to_typst_in_math()).collect(),
-            // For all other types, delegate to regular display
-            _ => self.display(),
-        }
+        value_to_typst_math_expr(self)
     }
 
     /// Convert to content nodes.
@@ -1241,7 +1240,10 @@ pub enum ContentNode {
         block: bool,
     },
     /// Math equation
-    Math { content: String, block: bool },
+    Math {
+        segments: Vec<MathSegment>,
+        block: bool,
+    },
     /// A heading
     Heading {
         level: u8,
@@ -1310,6 +1312,15 @@ pub enum Arg {
     Named(String, Value),
     /// Spread argument
     Spread(Value),
+}
+
+/// A structured fragment of math content.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MathSegment {
+    /// Raw math source that was not produced by evaluating a `#expr`.
+    Source(String),
+    /// A value produced by evaluating a `#expr` inside math.
+    Evaluated(Value),
 }
 
 // ============================================================================
@@ -1429,6 +1440,93 @@ pub(crate) fn bibliography_content_value(file: String, style: Option<String>) ->
     }]))
 }
 
+pub(crate) fn render_math_segments_to_typst_source(segments: &[MathSegment]) -> String {
+    segments
+        .iter()
+        .map(|segment| match segment {
+            MathSegment::Source(text) => text.clone(),
+            MathSegment::Evaluated(value) => value_to_typst_math_expr(value),
+        })
+        .collect()
+}
+
+fn render_func_call_source(name: &str, args: &[Arg], prefix_hash: bool, in_math: bool) -> String {
+    let args_str: Vec<String> = args
+        .iter()
+        .map(|arg| match arg {
+            Arg::Pos(value) => {
+                if in_math {
+                    value_to_typst_math_arg(value)
+                } else {
+                    value_to_typst_arg(value)
+                }
+            }
+            Arg::Named(key, value) => {
+                let rendered = if in_math {
+                    value_to_typst_math_arg(value)
+                } else {
+                    value_to_typst_arg(value)
+                };
+                format!("{}: {}", key, rendered)
+            }
+            Arg::Spread(value) => {
+                let rendered = if in_math {
+                    value_to_typst_math_arg(value)
+                } else {
+                    value_to_typst_arg(value)
+                };
+                format!("..{}", rendered)
+            }
+        })
+        .collect();
+    let hash = if prefix_hash { "#" } else { "" };
+    format!("{}{}({})", hash, name, args_str.join(", "))
+}
+
+pub(crate) fn func_call_to_typst_source(name: &str, args: &[Arg]) -> String {
+    render_func_call_source(name, args, true, false)
+}
+
+fn func_call_to_typst_code_source(name: &str, args: &[Arg]) -> String {
+    render_func_call_source(name, args, false, false)
+}
+
+pub(crate) fn func_call_to_typst_math_source(name: &str, args: &[Arg]) -> String {
+    render_func_call_source(name, args, true, true)
+}
+
+fn func_call_to_typst_math_code_source(name: &str, args: &[Arg]) -> String {
+    render_func_call_source(name, args, false, true)
+}
+
+pub(crate) fn value_to_typst_math_expr(value: &Value) -> String {
+    match value {
+        Value::Content(nodes) => nodes.iter().map(|node| node.to_typst_in_math()).collect(),
+        _ => value_to_typst_arg(value),
+    }
+}
+
+fn value_to_typst_math_arg(value: &Value) -> String {
+    match value {
+        Value::Content(nodes) => {
+            if nodes.len() == 1 {
+                match &nodes[0] {
+                    ContentNode::FuncCall { name, args } => {
+                        return func_call_to_typst_math_code_source(name, args);
+                    }
+                    ContentNode::Math { segments, .. } => {
+                        return render_math_segments_to_typst_source(segments);
+                    }
+                    _ => {}
+                }
+            }
+
+            nodes.iter().map(|node| node.to_typst_in_math()).collect()
+        }
+        _ => value_to_typst_arg(value),
+    }
+}
+
 impl ContentNode {
     /// Convert this content node back to Typst source code.
     pub fn to_typst(&self) -> String {
@@ -1453,7 +1551,8 @@ impl ContentNode {
                     format!("`{}`", text)
                 }
             }
-            ContentNode::Math { content, block } => {
+            ContentNode::Math { segments, block } => {
+                let content = render_math_segments_to_typst_source(segments);
                 if *block {
                     format!("$ {} $", content)
                 } else {
@@ -1519,17 +1618,7 @@ impl ContentNode {
                     format!("#bibliography(\"{}\")", file)
                 }
             }
-            ContentNode::FuncCall { name, args } => {
-                let args_str: Vec<String> = args
-                    .iter()
-                    .map(|arg| match arg {
-                        Arg::Pos(v) => value_to_typst_arg(v),
-                        Arg::Named(k, v) => format!("{}: {}", k, value_to_typst_arg(v)),
-                        Arg::Spread(v) => format!("..{}", value_to_typst_arg(v)),
-                    })
-                    .collect();
-                format!("#{}({})", name, args_str.join(", "))
-            }
+            ContentNode::FuncCall { name, args } => func_call_to_typst_source(name, args),
             ContentNode::RawSource(s) => s.clone(),
             ContentNode::State { key, default } => {
                 format!(
@@ -1560,7 +1649,8 @@ impl ContentNode {
     pub fn to_typst_in_math(&self) -> String {
         match self {
             // For Math nodes, output just the content without $ delimiters
-            ContentNode::Math { content, .. } => content.clone(),
+            ContentNode::Math { segments, .. } => render_math_segments_to_typst_source(segments),
+            ContentNode::FuncCall { name, args } => func_call_to_typst_math_source(name, args),
             // For all other nodes, use regular to_typst()
             _ => self.to_typst(),
         }
@@ -1600,8 +1690,8 @@ pub fn value_to_typst_arg(v: &Value) -> String {
             // If content contains a single function call, output it directly without []
             // This avoids wrapping like [#table(...)] which breaks nested conversion
             if nodes.len() == 1 {
-                if let ContentNode::FuncCall { .. } = &nodes[0] {
-                    return nodes[0].to_typst();
+                if let ContentNode::FuncCall { name, args } = &nodes[0] {
+                    return func_call_to_typst_code_source(name, args);
                 }
             }
             let inner: String = nodes.iter().map(|n| n.to_typst()).collect();
@@ -1921,3 +2011,58 @@ impl From<EvalErrorKind> for EvalError {
 pub type EvalResult<T> = Result<T, EvalError>;
 
 // ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_func_call_to_typst_uses_code_syntax_for_nested_calls() {
+        let nested = ContentNode::FuncCall {
+            name: "h".to_string(),
+            args: vec![Arg::Pos(Value::Content(vec![ContentNode::FuncCall {
+                name: "image".to_string(),
+                args: vec![Arg::Pos(Value::Str("x.png".to_string()))],
+            }]))],
+        };
+
+        assert_eq!(nested.to_typst(), r#"#h(image("x.png"))"#);
+    }
+
+    #[test]
+    fn test_math_nodes_serialize_preserved_func_calls_without_bracket_wrapping() {
+        let math = ContentNode::Math {
+            segments: vec![
+                MathSegment::Source("a ".to_string()),
+                MathSegment::Evaluated(Value::Content(vec![ContentNode::FuncCall {
+                    name: "h".to_string(),
+                    args: vec![Arg::Pos(Value::Length(Length::exact(1.0, LengthUnit::Cm)))],
+                }])),
+                MathSegment::Source(" b".to_string()),
+            ],
+            block: false,
+        };
+
+        assert_eq!(math.to_typst(), "$a #h(1cm) b$");
+        assert_eq!(math.to_typst_in_math(), "a #h(1cm) b");
+    }
+
+    #[test]
+    fn test_func_call_to_typst_math_source_serializes_common_spacing_args() {
+        let fixed = func_call_to_typst_math_source(
+            "h",
+            &[Arg::Pos(Value::Length(Length::exact(1.0, LengthUnit::Cm)))],
+        );
+        let flex = func_call_to_typst_math_source("h", &[Arg::Pos(Value::Fraction(1.0))]);
+        let plain = func_call_to_typst_math_source(
+            "h",
+            &[Arg::Pos(Value::Content(vec![ContentNode::Text(
+                "foo".to_string(),
+            )]))],
+        );
+
+        assert_eq!(fixed, "#h(1cm)");
+        assert_eq!(flex, "#h(1fr)");
+        assert_eq!(plain, "#h(foo)");
+    }
+}
