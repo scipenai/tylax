@@ -1,0 +1,13 @@
+[package]
+name = "tylax-python"
+version.workspace = true
+edition = "2021"
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py310"] }
+tylax = { path = "../..", default-features = false }

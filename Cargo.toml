@@ -1,6 +1,14 @@
+[workspace]
+members = [".", "bindings/python"]
+default-members = ["."]
+resolver = "2"
+
+[workspace.package]
+version = "0.3.5"
+
 [package]
 name = "tylax"
-version = "0.3.5"
+version.workspace = true
 edition = "2021"
 description = "Tylax - High-performance bidirectional LaTeX ↔ Typst converter"
 license = "Apache-2.0"
@@ -15,7 +23,8 @@ exclude = [
     "pkg/**/*",
     "examples/**/*",
     "Dockerfile",
-    "docker-compose.yml"
+    "docker-compose.yml",
+    "bindings/**/*"
 ]
 
 [lib]

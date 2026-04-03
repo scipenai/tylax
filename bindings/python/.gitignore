@@ -1,0 +1,16 @@
+# Build artifacts
+dist/
+target/
+*.so
+*.pyd
+*.pdb
+*.dll
+
+# Python caches
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Maturin / pip
+*.egg-info/
+.eggs/

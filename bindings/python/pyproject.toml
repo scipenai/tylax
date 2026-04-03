@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "tylax"
+description = "High-performance bidirectional LaTeX <-> Typst converter"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+readme = "README.md"
+keywords = ["latex", "typst", "converter", "math", "typesetting"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Text Processing :: Markup :: LaTeX",
+    "License :: OSI Approved :: Apache Software License",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/scipenai/tylax"
+Repository = "https://github.com/scipenai/tylax"
+Issues = "https://github.com/scipenai/tylax/issues"
+Changelog = "https://github.com/scipenai/tylax/blob/main/CHANGELOG.md"
+
+[tool.maturin]
+module-name = "tylax._native"
+manifest-path = "Cargo.toml"
+python-source = "python"

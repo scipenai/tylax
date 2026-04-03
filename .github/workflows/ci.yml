@@ -24,7 +24,7 @@ jobs:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
-        run: cargo test --release --all-features
+        run: cargo test -p tylax --release --all-features
 
   clippy:
     name: Clippy
@@ -36,7 +36,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Run clippy
-        run: cargo clippy --all-features -- -D warnings
+        run: cargo clippy -p tylax --all-features -- -D warnings
 
   fmt:
     name: Format
@@ -62,3 +62,26 @@ jobs:
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       - name: Build WASM
         run: wasm-pack build --target web --features wasm --no-default-features
+
+  python:
+    name: Python Bindings
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build tools
+        run: pip install maturin pytest
+      - name: Build wheel
+        run: maturin build --release --manifest-path bindings/python/Cargo.toml --out dist
+      - name: Install wheel
+        run: pip install dist/*.whl
+        shell: bash
+      - name: Run tests
+        run: pytest bindings/python/tests/ -v
