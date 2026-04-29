@@ -808,7 +808,13 @@ impl LatexConverter {
             }
             TokenApostrophe => output.push('\''),
             TokenComma => output.push(','),
-            TokenSlash => output.push('/'),
+            TokenSlash => {
+                if matches!(self.state.mode, ConversionMode::Math) {
+                    output.push_str("\\/");
+                } else {
+                    output.push('/');
+                }
+            }
             TokenAsterisk => {
                 if let Some(ref mut op) = self.state.pending_op {
                     op.is_limits = true;
@@ -1040,6 +1046,8 @@ impl LatexConverter {
         result = result.replace(" ,", ",");
         result = result.replace("( ", "(");
         result = result.replace(" )", ")");
+        result = result.replace(" \\/", "\\/");
+        result = result.replace("\\/ ", "\\/");
         result = result.replace(" ^", "^");
         result = result.replace(" _", "_");
 
@@ -1059,6 +1067,8 @@ impl LatexConverter {
         result = result.replace(" )", ")");
         result = result.replace(" (", "(");
         result = result.replace(" [", "[");
+        result = result.replace(" \\/", "\\/");
+        result = result.replace("\\/ ", "\\/");
         result = result.replace(" ^", "^");
         result = result.replace(" _", "_");
 
