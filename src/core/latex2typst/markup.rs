@@ -2079,8 +2079,8 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "overset" => {
             // \overset{top}{base} -> limits(base)^(top)
             // Special optimization: \overset{\text{def}}{=} -> eq.def
-            let top = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            let base = conv.convert_required_arg(&cmd, 1).unwrap_or_default();
+            let top = conv.convert_required_term_arg(&cmd, 0).unwrap_or_default();
+            let base = conv.convert_required_term_arg(&cmd, 1).unwrap_or_default();
             let top_trimmed = top.trim().replace("\"", "");
             if (top_trimmed == "def" || top_trimmed.contains("def"))
                 && (base.trim() == "=" || base.trim() == "eq")
@@ -2092,14 +2092,14 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "underset" => {
             // \underset{bottom}{base} -> limits(base)_(bottom)
-            let bottom = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            let base = conv.convert_required_arg(&cmd, 1).unwrap_or_default();
+            let bottom = conv.convert_required_term_arg(&cmd, 0).unwrap_or_default();
+            let base = conv.convert_required_term_arg(&cmd, 1).unwrap_or_default();
             let _ = write!(output, "limits({})_({}) ", base, bottom);
         }
         "stackrel" => {
             // \stackrel{top}{relation} -> limits(relation)^(top)
-            let top = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            let base = conv.convert_required_arg(&cmd, 1).unwrap_or_default();
+            let top = conv.convert_required_term_arg(&cmd, 0).unwrap_or_default();
+            let base = conv.convert_required_term_arg(&cmd, 1).unwrap_or_default();
             let _ = write!(output, "limits({})^({}) ", base, top);
         }
         "substack" => {
