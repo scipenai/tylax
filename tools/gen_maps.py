@@ -25,7 +25,7 @@ from pathlib import Path
 SYMBOL_MAP = {
     # Greek lowercase
     "alpha": "alpha", "beta": "beta", "gamma": "gamma", "delta": "delta",
-    "epsilon": "epsilon", "varepsilon": "epsilon.alt", "zeta": "zeta",
+    "epsilon": "epsilon.alt", "varepsilon": "epsilon", "zeta": "zeta",
     "eta": "eta", "theta": "theta", "vartheta": "theta.alt",
     "iota": "iota", "kappa": "kappa", "lambda": "lambda", "mu": "mu",
     "nu": "nu", "xi": "xi", "pi": "pi", "varpi": "pi.alt",
@@ -220,7 +220,7 @@ COMMANDS_WITH_ARGS = {
 TYPST_TO_TEX = {
     # Greek lowercase
     "alpha": "alpha", "beta": "beta", "gamma": "gamma", "delta": "delta",
-    "epsilon": "epsilon", "epsilon.alt": "varepsilon", "zeta": "zeta",
+    "epsilon": "varepsilon", "epsilon.alt": "epsilon", "zeta": "zeta",
     "eta": "eta", "theta": "theta", "theta.alt": "vartheta",
     "iota": "iota", "kappa": "kappa", "lambda": "lambda", "mu": "mu",
     "nu": "nu", "xi": "xi", "pi": "pi", "pi.alt": "varpi",

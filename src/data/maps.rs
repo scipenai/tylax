@@ -406,7 +406,7 @@ lazy_static! {
         }));
         m.insert("epsilon".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("epsilon".to_string()),
+            alias: Some("epsilon.alt".to_string()),
         }));
         m.insert("equiv".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -1050,7 +1050,7 @@ lazy_static! {
         }));
         m.insert("varepsilon".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("epsilon.alt".to_string()),
+            alias: Some("epsilon".to_string()),
         }));
         m.insert("varnothing".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -1889,8 +1889,8 @@ pub static TYPST_TO_TEX: phf::Map<&'static str, &'static str> = phf_map! {
     "beta" => "beta",
     "gamma" => "gamma",
     "delta" => "delta",
-    "epsilon" => "epsilon",
-    "epsilon.alt" => "varepsilon",
+    "epsilon" => "varepsilon",
+    "epsilon.alt" => "epsilon",
     "zeta" => "zeta",
     "eta" => "eta",
     "theta" => "theta",
