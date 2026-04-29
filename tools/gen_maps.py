@@ -187,7 +187,7 @@ COMMANDS_WITH_ARGS = {
     # Misc math (1 arg)
     "pmod": 1, "pod": 1, "displaylines": 1, "set": 1, "Set": 1,
     "sqrt": 1, "not": 1, "phantom": 1, "cancel": 1, "bcancel": 1,
-    "boxed": 1, "fbox": 1,
+    "boxed": 1, "fbox": 1, "hspace": 1,
     
     # Fractions and roots (2 args)
     "frac": 2, "dfrac": 2, "tfrac": 2, "cfrac": 2, "binom": 2,

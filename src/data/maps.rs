@@ -481,8 +481,8 @@ lazy_static! {
             alias: Some("arrow.r.hook".to_string()),
         }));
         m.insert("hspace".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("#h".to_string()),
+            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
+            alias: None,
         }));
         m.insert("iff".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
