@@ -555,10 +555,8 @@ pub fn parse_typst_image(content: &str) -> Option<(String, ImageAttributes)> {
                         attrs.alt = Some(alt);
                     }
                 }
-                "fit" => {
-                    if value.contains("stretch") {
-                        attrs.keepaspectratio = false;
-                    }
+                "fit" if value.contains("stretch") => {
+                    attrs.keepaspectratio = false;
                 }
                 _ => {}
             }

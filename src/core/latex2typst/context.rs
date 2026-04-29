@@ -1081,7 +1081,7 @@ impl LatexConverter {
         result = result.replace(" ^", "^");
         result = result.replace(" _", "_");
 
-        result
+        result.trim().to_string()
     }
 
     /// Fix missing spaces before Typst symbol names.
