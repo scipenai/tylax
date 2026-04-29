@@ -326,6 +326,12 @@ mod l2t_math {
     }
 
     #[test]
+    fn test_dots_commands() {
+        assert_eq!(latex_to_typst(r"\ldots").trim(), "...");
+        assert_eq!(latex_to_typst(r"\cdots").trim(), "dots.c");
+    }
+
+    #[test]
     fn test_text_in_math() {
         let result = latex_to_typst(r"\text{hello}");
         assert!(!result.contains("Error"));
