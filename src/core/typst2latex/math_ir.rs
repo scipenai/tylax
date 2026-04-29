@@ -386,25 +386,23 @@ fn build_math_attach(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
         }
 
         match children[index].kind() {
-            SyntaxKind::Hat => {
+            SyntaxKind::Hat
                 if index + 1 < children.len()
                     && children[index + 1].kind() != SyntaxKind::Hat
-                    && children[index + 1].kind() != SyntaxKind::Underscore
-                {
-                    sup = Some(Box::new(build_math_ir(children[index + 1], options)));
-                    index += 2;
-                    continue;
-                }
+                    && children[index + 1].kind() != SyntaxKind::Underscore =>
+            {
+                sup = Some(Box::new(build_math_ir(children[index + 1], options)));
+                index += 2;
+                continue;
             }
-            SyntaxKind::Underscore => {
+            SyntaxKind::Underscore
                 if index + 1 < children.len()
                     && children[index + 1].kind() != SyntaxKind::Hat
-                    && children[index + 1].kind() != SyntaxKind::Underscore
-                {
-                    sub = Some(Box::new(build_math_ir(children[index + 1], options)));
-                    index += 2;
-                    continue;
-                }
+                    && children[index + 1].kind() != SyntaxKind::Underscore =>
+            {
+                sub = Some(Box::new(build_math_ir(children[index + 1], options)));
+                index += 2;
+                continue;
             }
             _ => {}
         }
@@ -964,10 +962,8 @@ fn build_environment(args_node: &SyntaxNode, name: &str, options: &T2LOptions) -
     for child in args_node.children() {
         match child.kind() {
             SyntaxKind::Named => {}
-            SyntaxKind::Semicolon => {
-                if !current_row.is_empty() {
-                    rows.push(std::mem::take(&mut current_row));
-                }
+            SyntaxKind::Semicolon if !current_row.is_empty() => {
+                rows.push(std::mem::take(&mut current_row));
             }
             SyntaxKind::Comma
             | SyntaxKind::Space

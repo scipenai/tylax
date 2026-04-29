@@ -101,6 +101,18 @@ mod l2t_math {
     }
 
     #[test]
+    fn test_literal_math_slash_is_escaped() {
+        assert_eq!(latex_to_typst("a/b").trim(), r"a\/b");
+        assert_eq!(latex_to_typst("$a/b$").trim(), r"$a\/b$");
+    }
+
+    #[test]
+    fn test_fraction_with_unbraced_term_arguments() {
+        assert_eq!(latex_to_typst(r"\frac{a}b").trim(), "a/b");
+        assert_eq!(latex_to_typst(r"\frac12").trim(), "1/2");
+    }
+
+    #[test]
     fn test_sqrt() {
         let result = latex_to_typst(r"\sqrt{x}");
         assert!(result.contains("sqrt") || result.contains("root"));
@@ -134,12 +146,40 @@ mod l2t_math {
     }
 
     #[test]
+    fn test_overset_with_unbraced_symbol_base() {
+        assert_eq!(
+            latex_to_typst(r"\overset{p}\sim").trim(),
+            "limits(tilde)^(p)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\overset{p}{\sim}").trim(),
+            "limits(tilde)^(p)"
+        );
+    }
+
+    #[test]
     fn test_matrices() {
         let result = latex_to_typst(r"\begin{pmatrix} a & b \\ c & d \end{pmatrix}");
         assert!(!result.contains("Error"));
 
         let result = latex_to_typst(r"\begin{bmatrix} 1 & 2 \\ 3 & 4 \end{bmatrix}");
         assert!(!result.contains("Error"));
+    }
+
+    #[test]
+    fn test_cases_escapes_source_commas() {
+        let result = latex_to_typst(
+            r"\begin{cases}
+        0,& i\ne j,\\
+        1,& i=j.
+        \end{cases}",
+        );
+
+        assert!(
+            result.contains(r"cases(0\,& i != j\,, 1\,& i = j .)"),
+            "source commas inside cases should be escaped, got: {}",
+            result
+        );
     }
 
     #[test]
@@ -323,6 +363,12 @@ mod l2t_math {
                 result
             );
         }
+    }
+
+    #[test]
+    fn test_dots_commands() {
+        assert_eq!(latex_to_typst(r"\ldots").trim(), "...");
+        assert_eq!(latex_to_typst(r"\cdots").trim(), "dots.c");
     }
 
     #[test]
@@ -2610,6 +2656,10 @@ mod l2t_citation_refs {
     fn test_l2t_reference_variants() {
         assert_eq!(latex_to_typst(r#"\eqref{energy}"#).trim(), "@eq-energy");
         assert_eq!(latex_to_typst(r#"\ref{fig:one}"#).trim(), "@fig-one");
+        assert_eq!(
+            latex_to_typst(r#"\hyperref[intro]{custom text}"#).trim(),
+            "#link(<intro>)[custom text]"
+        );
         let pageref = latex_to_typst(r#"\pageref{fig:one}"#);
         assert!(
             pageref.contains("#locate") && pageref.contains("@fig-one.page()"),

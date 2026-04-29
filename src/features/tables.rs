@@ -313,9 +313,9 @@ fn extract_colspecs(input: &str) -> Option<Vec<ColSpec>> {
                 has_left_border = false;
                 colspecs.push(spec);
             }
-            '*' => {
+            '*'
                 // *{n}{spec} - repeat specification
-                if chars.peek() == Some(&'{') {
+                if chars.peek() == Some(&'{') => {
                     if let Some(count) = extract_repeat_count(&mut chars) {
                         if let Some(repeat_spec) = extract_repeat_spec(&mut chars) {
                             for _ in 0..count {
@@ -341,13 +341,11 @@ fn extract_colspecs(input: &str) -> Option<Vec<ColSpec>> {
                         }
                     }
                 }
-            }
-            '@' | '>' | '<' | '!' => {
+            '@' | '>' | '<' | '!'
                 // Skip these specifications
-                if chars.peek() == Some(&'{') {
+                if chars.peek() == Some(&'{') => {
                     skip_braced_content(&mut chars);
                 }
-            }
             _ => {}
         }
     }

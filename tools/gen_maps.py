@@ -25,7 +25,7 @@ from pathlib import Path
 SYMBOL_MAP = {
     # Greek lowercase
     "alpha": "alpha", "beta": "beta", "gamma": "gamma", "delta": "delta",
-    "epsilon": "epsilon", "varepsilon": "epsilon.alt", "zeta": "zeta",
+    "epsilon": "epsilon.alt", "varepsilon": "epsilon", "zeta": "zeta",
     "eta": "eta", "theta": "theta", "vartheta": "theta.alt",
     "iota": "iota", "kappa": "kappa", "lambda": "lambda", "mu": "mu",
     "nu": "nu", "xi": "xi", "pi": "pi", "varpi": "pi.alt",
@@ -187,7 +187,7 @@ COMMANDS_WITH_ARGS = {
     # Misc math (1 arg)
     "pmod": 1, "pod": 1, "displaylines": 1, "set": 1, "Set": 1,
     "sqrt": 1, "not": 1, "phantom": 1, "cancel": 1, "bcancel": 1,
-    "boxed": 1, "fbox": 1,
+    "boxed": 1, "fbox": 1, "hspace": 1,
     
     # Fractions and roots (2 args)
     "frac": 2, "dfrac": 2, "tfrac": 2, "cfrac": 2, "binom": 2,
@@ -220,7 +220,7 @@ COMMANDS_WITH_ARGS = {
 TYPST_TO_TEX = {
     # Greek lowercase
     "alpha": "alpha", "beta": "beta", "gamma": "gamma", "delta": "delta",
-    "epsilon": "epsilon", "epsilon.alt": "varepsilon", "zeta": "zeta",
+    "epsilon": "varepsilon", "epsilon.alt": "epsilon", "zeta": "zeta",
     "eta": "eta", "theta": "theta", "theta.alt": "vartheta",
     "iota": "iota", "kappa": "kappa", "lambda": "lambda", "mu": "mu",
     "nu": "nu", "xi": "xi", "pi": "pi", "pi.alt": "varpi",
