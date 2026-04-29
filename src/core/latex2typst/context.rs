@@ -807,7 +807,16 @@ impl LatexConverter {
                 }
             }
             TokenApostrophe => output.push('\''),
-            TokenComma => output.push(','),
+            TokenComma => {
+                if matches!(self.state.current_env(), EnvironmentContext::Cases) {
+                    while output.ends_with(char::is_whitespace) {
+                        output.pop();
+                    }
+                    output.push_str("\\,");
+                } else {
+                    output.push(',');
+                }
+            }
             TokenSlash => {
                 if matches!(self.state.mode, ConversionMode::Math) {
                     output.push_str("\\/");
