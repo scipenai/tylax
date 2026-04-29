@@ -651,6 +651,19 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             let text = conv.get_required_arg(&cmd, 1).unwrap_or_else(|| url.clone());
             let _ = write!(output, "#link(\"{}\")[{}]", url, text);
         }
+        "hyperref" => {
+            let previous_mode = conv.state.mode;
+            conv.state.mode = ConversionMode::Text;
+            let text = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            conv.state.mode = previous_mode;
+
+            if let Some(label) = conv.get_optional_arg(&cmd, 0) {
+                let clean_label = sanitize_label(&label);
+                let _ = write!(output, "#link(<{}>)[{}]", clean_label, text);
+            } else {
+                output.push_str(&text);
+            }
+        }
 
         // Footnotes
         "footnote" => {

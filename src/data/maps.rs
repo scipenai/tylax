@@ -1331,6 +1331,10 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
             alias: None,
         }));
+        m.insert("hyperref".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },
+            alias: None,
+        }));
         m.insert("label".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
             alias: None,
