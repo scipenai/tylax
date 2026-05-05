@@ -313,40 +313,36 @@ fn extract_colspecs(input: &str) -> Option<Vec<ColSpec>> {
                 has_left_border = false;
                 colspecs.push(spec);
             }
-            '*' => {
-                // *{n}{spec} - repeat specification
-                if chars.peek() == Some(&'{') {
-                    if let Some(count) = extract_repeat_count(&mut chars) {
-                        if let Some(repeat_spec) = extract_repeat_spec(&mut chars) {
-                            for _ in 0..count {
-                                // Parse the repeated spec
-                                for rc in repeat_spec.chars() {
-                                    if rc == '|' {
-                                        if colspecs.is_empty() {
-                                            has_left_border = true;
-                                        } else if let Some(last) = colspecs.last_mut() {
-                                            last.has_right_border = true;
-                                        }
-                                    } else if "lcr".contains(rc) {
-                                        let spec = ColSpec {
-                                            alignment: Alignment::from_latex_char(rc),
-                                            has_left_border,
-                                            ..Default::default()
-                                        };
-                                        has_left_border = false;
-                                        colspecs.push(spec);
+            // *{n}{spec} - repeat specification
+            '*' if chars.peek() == Some(&'{') => {
+                if let Some(count) = extract_repeat_count(&mut chars) {
+                    if let Some(repeat_spec) = extract_repeat_spec(&mut chars) {
+                        for _ in 0..count {
+                            // Parse the repeated spec
+                            for rc in repeat_spec.chars() {
+                                if rc == '|' {
+                                    if colspecs.is_empty() {
+                                        has_left_border = true;
+                                    } else if let Some(last) = colspecs.last_mut() {
+                                        last.has_right_border = true;
                                     }
+                                } else if "lcr".contains(rc) {
+                                    let spec = ColSpec {
+                                        alignment: Alignment::from_latex_char(rc),
+                                        has_left_border,
+                                        ..Default::default()
+                                    };
+                                    has_left_border = false;
+                                    colspecs.push(spec);
                                 }
                             }
                         }
                     }
                 }
             }
-            '@' | '>' | '<' | '!' => {
-                // Skip these specifications
-                if chars.peek() == Some(&'{') {
-                    skip_braced_content(&mut chars);
-                }
+            // Skip these specifications when followed by `{...}`
+            '@' | '>' | '<' | '!' if chars.peek() == Some(&'{') => {
+                skip_braced_content(&mut chars);
             }
             _ => {}
         }

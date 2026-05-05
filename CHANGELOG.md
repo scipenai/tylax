@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-05-05
+
+### Fixed
+- **T2L primes**: `$f'(x)$` preserves the prime; `MathPrimes` is a first-class field on the `Script` IR.
+- **T2L fractions**: `$(2 pi) / 3$` emits `\frac{2 \pi}{3}`; implicit grouping parens around fraction operands are stripped at the syntax-tree level.
+- **TikZ**: full LaTeX documents preserve every `\draw` inside `\begin{tikzpicture}...\end{tikzpicture}`; picture body extraction now uses `find`/`rfind` instead of `trim_*_matches`.
+
+### Added
+- **L2T preamble control**: `L2TOptions::preamble` (`PreambleMode { Default, None, Custom(String) }`) gates the `#set page` / `#set heading` / `#set math.equation` block. Document metadata and title block are unaffected.
+- **T2L wrapper control**: `T2LOptions::wrapper` (`DocumentWrapperMode { Default, BodyOnly, Custom { before_body, after_body } }`). `from_template` parses single-string templates with a `{body}` placeholder.
+- **CLI**: `--no-preamble`, `--preamble <FILE>`, `--wrapper <FILE>`.
+- **Python**: `L2TOptions(preamble, preamble_omit)`, `T2LOptions(wrapper, wrapper_omit)`. Conflicts and missing `{body}` raise `ValueError`.
+- **WASM**: `L2TConvertOptions.preamble` / `no_preamble`, `T2LConvertOptions.wrapper` / `no_preamble`.
+- **`tylax::batch`** (native only): `convert_batch(&BatchOptions) -> Result<BatchReport, BatchError>`. Plan-then-execute, output-collision detection, `globset` excludes.
+- **CLI**: `t2l batch --recursive`, `t2l batch --exclude <GLOB>` (repeatable).
+
+### Changed
+- **CLI**: replaced unicode glyphs (`✓`, `↔`, `→`) with ASCII for Windows console compatibility.
+
 ## [0.3.5] - 2026-04-03
 
 ### Fixed
@@ -119,7 +138,8 @@ This release is a major overhaul of the core conversion logic, introducing prope
 - CLI tool (`t2l`)
 - Structured error handling with warnings
 
-[Unreleased]: https://github.com/scipenai/tylax/compare/v0.3.5...HEAD
+[Unreleased]: https://github.com/scipenai/tylax/compare/v0.3.6...HEAD
+[0.3.6]: https://github.com/scipenai/tylax/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/scipenai/tylax/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/scipenai/tylax/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/scipenai/tylax/compare/v0.3.2...v0.3.3
