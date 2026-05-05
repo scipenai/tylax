@@ -116,3 +116,93 @@ def test_diagnostics_warning_structure():
         assert isinstance(w.kind, str)
         assert isinstance(w.message, str)
         assert w.span is None or isinstance(w.span, tylax.Span)
+
+
+# ---- Preamble / wrapper customization ----
+
+
+SAMPLE_LATEX_DOC = r"""\documentclass{article}
+\title{Sample}
+\author{Alice}
+\begin{document}
+\section{Intro}
+Hello.
+\end{document}"""
+
+
+def test_l2t_preamble_default_emits_set_rules():
+    out = tylax.latex_to_typst(SAMPLE_LATEX_DOC, document=True)
+    assert "#set page(" in out
+    assert "#set heading(" in out
+    assert "#set math.equation(" in out
+
+
+def test_l2t_preamble_omit_drops_set_rules_but_keeps_metadata_and_title():
+    opts = tylax.L2TOptions(preamble_omit=True)
+    out = tylax.latex_to_typst(SAMPLE_LATEX_DOC, document=True, options=opts)
+    assert "#set page(" not in out
+    assert "#set heading(" not in out
+    assert "#set math.equation(" not in out
+    # metadata block must remain
+    assert "#set document(" in out and "Sample" in out and "Alice" in out
+    # title block must remain
+    assert "#align(center)[" in out
+
+
+def test_l2t_preamble_custom_replaces_default():
+    opts = tylax.L2TOptions(preamble='#set text(font: "New Roman")')
+    out = tylax.latex_to_typst(SAMPLE_LATEX_DOC, document=True, options=opts)
+    assert "#set text(font:" in out
+    assert "#set page(" not in out
+
+
+def test_t2l_wrapper_default_emits_full_document():
+    out = tylax.typst_to_latex("= Hi\n\nbody", document=True)
+    assert "\\documentclass{" in out
+    assert "\\usepackage{amsmath}" in out
+    assert "\\begin{document}" in out
+    assert "\\end{document}" in out
+
+
+def test_t2l_wrapper_omit_drops_documentclass_and_packages():
+    opts = tylax.T2LOptions(wrapper_omit=True)
+    out = tylax.typst_to_latex("= Hi\n\nbody", document=True, options=opts)
+    assert "\\documentclass" not in out
+    assert "\\usepackage" not in out
+    assert "\\begin{document}" not in out
+    assert "\\end{document}" not in out
+    assert "\\section{" in out
+
+
+def test_t2l_wrapper_custom_inserts_body_at_placeholder():
+    template = "\\documentclass{minimal}\n\\begin{document}\n{body}\n\\end{document}\n"
+    opts = tylax.T2LOptions(wrapper=template)
+    out = tylax.typst_to_latex("= Hi", document=True, options=opts)
+    assert out.startswith("\\documentclass{minimal}")
+    assert "\\section{" in out
+    assert out.rstrip().endswith("\\end{document}")
+    assert "\\usepackage{amsmath}" not in out
+
+
+def test_t2l_wrapper_missing_body_placeholder_raises_value_error():
+    import pytest
+
+    opts = tylax.T2LOptions(wrapper="\\documentclass{article}\nno placeholder")
+    with pytest.raises(ValueError):
+        tylax.typst_to_latex("= Hi", document=True, options=opts)
+
+
+def test_l2t_preamble_omit_and_preamble_conflict_raises_value_error():
+    import pytest
+
+    opts = tylax.L2TOptions(preamble="X", preamble_omit=True)
+    with pytest.raises(ValueError):
+        tylax.latex_to_typst(SAMPLE_LATEX_DOC, document=True, options=opts)
+
+
+def test_t2l_wrapper_omit_and_wrapper_conflict_raises_value_error():
+    import pytest
+
+    opts = tylax.T2LOptions(wrapper="x{body}y", wrapper_omit=True)
+    with pytest.raises(ValueError):
+        tylax.typst_to_latex("= Hi", document=True, options=opts)

@@ -13,7 +13,8 @@ mod table;
 mod utils;
 
 pub use context::{
-    ConversionMode, ConversionState, EnvironmentContext, L2TOptions, LatexConverter, MERGED_SPEC,
+    ConversionMode, ConversionState, EnvironmentContext, L2TOptions, LatexConverter, PreambleMode,
+    MERGED_SPEC,
 };
 
 // =============================================================================
@@ -319,6 +320,15 @@ pub fn latex_math_to_typst_with_eval(input: &str) -> String {
 /// ```
 pub fn latex_to_typst_with_diagnostics(input: &str) -> ConversionResult {
     let mut converter = LatexConverter::new();
+    converter.convert_document_with_diagnostics(input)
+}
+
+/// Convert LaTeX to Typst with full diagnostics and custom options
+pub fn latex_to_typst_with_diagnostics_options(
+    input: &str,
+    options: L2TOptions,
+) -> ConversionResult {
+    let mut converter = LatexConverter::with_options(options);
     converter.convert_document_with_diagnostics(input)
 }
 

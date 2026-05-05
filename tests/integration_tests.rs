@@ -40,6 +40,273 @@ fn normalize_output(output: &str) -> &str {
     output.trim_end_matches('\n')
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+mod batch_conversion_tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use tylax::batch::{convert_batch, BatchDirection, BatchError, BatchFileStatus, BatchOptions};
+    use tylax::{DocumentWrapperMode, L2TOptions, PreambleMode, T2LOptions};
+
+    struct TempProject {
+        root: PathBuf,
+    }
+
+    impl TempProject {
+        fn new(name: &str) -> Self {
+            let mut root = std::env::temp_dir();
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos();
+            root.push(format!("tylax-{name}-{nonce}"));
+            fs::create_dir_all(&root).expect("temp project should be created");
+            Self { root }
+        }
+
+        fn path(&self, relative: &str) -> PathBuf {
+            self.root.join(relative)
+        }
+
+        fn write(&self, relative: &str, content: &str) {
+            let path = self.path(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("parent directory should be created");
+            }
+            fs::write(path, content).expect("fixture should be written");
+        }
+
+        fn read(&self, relative: &str) -> String {
+            fs::read_to_string(self.path(relative)).expect("fixture output should be readable")
+        }
+    }
+
+    impl Drop for TempProject {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn ok_files(report: &tylax::batch::BatchReport) -> Vec<String> {
+        let mut files = report
+            .results
+            .iter()
+            .filter_map(|result| match &result.status {
+                BatchFileStatus::Converted => result
+                    .output_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.to_string()),
+                BatchFileStatus::Failed(_) => None,
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    }
+
+    fn options(input: &Path, output: &Path) -> BatchOptions {
+        BatchOptions {
+            input: input.to_path_buf(),
+            output_dir: output.to_path_buf(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn batch_non_recursive_converts_only_top_level_matching_files() {
+        let project = TempProject::new("batch-non-recursive");
+        project.write("top.typ", "Hello");
+        project.write("nested/child.typ", "Nested");
+        project.write("notes.md", "skip");
+
+        let output = project.path("out");
+        let mut opts = options(&project.root, &output);
+        opts.direction = BatchDirection::TypstToLatex;
+
+        let report = convert_batch(&opts).expect("batch conversion should succeed");
+
+        assert_eq!(report.success_count, 1);
+        assert_eq!(report.error_count, 0);
+        assert!(output.join("top.tex").exists());
+        assert!(!output.join("nested/child.tex").exists());
+        assert_eq!(ok_files(&report), vec!["top.tex"]);
+    }
+
+    #[test]
+    fn batch_recursive_preserves_relative_tree() {
+        let project = TempProject::new("batch-recursive");
+        project.write("Root/Intro.typ", "Intro");
+        project.write("Root/Chapter/Section.typ", "Section");
+
+        let output = project.path("converted");
+        let mut opts = options(&project.root, &output);
+        opts.direction = BatchDirection::TypstToLatex;
+        opts.recursive = true;
+
+        let report = convert_batch(&opts).expect("batch conversion should succeed");
+
+        assert_eq!(report.success_count, 2);
+        assert_eq!(report.error_count, 0);
+        assert!(output.join("Root/Intro.tex").exists());
+        assert!(output.join("Root/Chapter/Section.tex").exists());
+    }
+
+    #[test]
+    fn batch_recursive_skips_existing_nested_output_directory() {
+        let project = TempProject::new("batch-recursive-output");
+        project.write("Root/Intro.typ", "Intro");
+        project.write("out/old.typ", "old generated output");
+
+        let output = project.path("out");
+        let mut opts = options(&project.root, &output);
+        opts.direction = BatchDirection::TypstToLatex;
+        opts.recursive = true;
+
+        let report = convert_batch(&opts).expect("batch conversion should succeed");
+
+        assert_eq!(report.success_count, 1);
+        assert!(output.join("Root/Intro.tex").exists());
+        assert!(!output.join("out/old.tex").exists());
+    }
+
+    #[test]
+    fn batch_auto_handles_mixed_sources_and_skips_unrelated_files() {
+        let project = TempProject::new("batch-auto");
+        project.write("paper.typ", "Typst body");
+        project.write("equation.tex", r"\frac{a}{b}");
+        project.write("refs.bib", "@book{a}");
+        project.write("README.md", "skip");
+
+        let output = project.path("out");
+        let mut opts = options(&project.root, &output);
+        opts.direction = BatchDirection::Auto;
+
+        let report = convert_batch(&opts).expect("batch conversion should succeed");
+
+        assert_eq!(report.success_count, 2);
+        assert_eq!(report.error_count, 0);
+        assert!(output.join("paper.tex").exists());
+        assert!(output.join("equation.typ").exists());
+        assert!(!output.join("refs.bib").exists());
+        assert!(!output.join("README.md").exists());
+    }
+
+    #[test]
+    fn batch_exclude_globs_skip_files_and_prune_directories() {
+        let project = TempProject::new("batch-exclude");
+        project.write("Root/Keep.typ", "Keep");
+        project.write("Root/Draft.typ", "Draft");
+        project.write("ProjectTemplate/Math.typ", "Template");
+
+        let output = project.path("out");
+        let mut opts = options(&project.root, &output);
+        opts.direction = BatchDirection::TypstToLatex;
+        opts.recursive = true;
+        opts.excludes = vec![
+            "Root/**/Draft.typ".to_string(),
+            "ProjectTemplate/**".to_string(),
+        ];
+
+        let report = convert_batch(&opts).expect("batch conversion should succeed");
+
+        assert_eq!(report.success_count, 1);
+        assert_eq!(report.error_count, 0);
+        assert!(output.join("Root/Keep.tex").exists());
+        assert!(!output.join("Root/Draft.tex").exists());
+        assert!(!output.join("ProjectTemplate/Math.tex").exists());
+    }
+
+    #[test]
+    fn batch_detects_output_collisions_before_writing() {
+        let project = TempProject::new("batch-collision");
+        project.write("same.typ", "Typst");
+        project.write("same.tex", r"\alpha");
+
+        let output = project.path("out");
+        let mut opts = options(&project.root, &output);
+        opts.direction = BatchDirection::Auto;
+        opts.output_extension = Some("out".to_string());
+
+        let err = convert_batch(&opts).expect_err("same stem should collide");
+
+        assert!(matches!(err, BatchError::OutputCollision { .. }));
+        assert!(!output.join("same.out").exists());
+    }
+
+    #[test]
+    fn batch_options_are_used_for_converted_documents() {
+        let project = TempProject::new("batch-options");
+        project.write("doc.typ", "= Hi\n\nbody");
+        project.write(
+            "doc.tex",
+            r"\documentclass{article}\begin{document}\section{Hi}body\end{document}",
+        );
+
+        let t2l_output = project.path("out-t2l");
+        let mut t2l = options(&project.path("doc.typ"), &t2l_output);
+        t2l.direction = BatchDirection::TypstToLatex;
+        t2l.full_document = true;
+        t2l.t2l_options = T2LOptions {
+            wrapper: DocumentWrapperMode::BodyOnly,
+            ..Default::default()
+        };
+
+        convert_batch(&t2l).expect("t2l batch should succeed");
+        let t2l_doc = project.read("out-t2l/doc.tex");
+        assert!(!t2l_doc.contains(r"\documentclass"));
+        assert!(t2l_doc.contains(r"\section{"));
+        assert!(t2l_doc.contains("Hi"));
+
+        let l2t_output = project.path("out-l2t");
+        let mut l2t = options(&project.path("doc.tex"), &l2t_output);
+        l2t.direction = BatchDirection::LatexToTypst;
+        l2t.full_document = true;
+        l2t.l2t_options = L2TOptions {
+            preamble: PreambleMode::None,
+            ..Default::default()
+        };
+
+        convert_batch(&l2t).expect("l2t batch should succeed");
+        let l2t_doc = project.read("out-l2t/doc.typ");
+        assert!(!l2t_doc.contains("#set page"));
+        assert!(l2t_doc.contains("= Hi"));
+    }
+
+    #[test]
+    fn cli_batch_accepts_recursive_and_exclude_flags() {
+        let project = TempProject::new("batch-cli");
+        project.write("Root/Keep.typ", "Keep");
+        project.write("Root/Draft.typ", "Draft");
+        project.write("ProjectTemplate/Math.typ", "Template");
+
+        let output = project.path("out");
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_t2l"))
+            .arg("batch")
+            .arg(&project.root)
+            .arg("--output-dir")
+            .arg(&output)
+            .arg("--direction")
+            .arg("t2l")
+            .arg("--recursive")
+            .arg("--exclude")
+            .arg("ProjectTemplate/**")
+            .arg("--exclude")
+            .arg("Root/**/Draft.typ")
+            .output()
+            .expect("t2l batch CLI should run");
+
+        assert!(
+            result.status.success(),
+            "batch CLI failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(output.join("Root/Keep.tex").exists());
+        assert!(!output.join("Root/Draft.tex").exists());
+        assert!(!output.join("ProjectTemplate/Math.tex").exists());
+    }
+}
+
 fn assert_t2l_paths_match(input: &str) -> String {
     let options = typst_to_latex_with_options(input, &T2LOptions::default());
     let diagnostics = typst_to_latex_with_diagnostics(input, &T2LOptions::default()).output;
@@ -1055,6 +1322,68 @@ canvas({
         let cetz = convert_tikz_to_cetz(tikz);
         assert!(cetz.contains("content"));
         assert!(cetz.contains("Hello"));
+    }
+
+    #[test]
+    fn test_tikz_full_document_preamble_does_not_eat_first_command() {
+        // Regression: when given a full LaTeX document, the picture body
+        // must be extracted from inside \begin{tikzpicture}...\end{tikzpicture}.
+        // Previously the preamble was concatenated with the first \draw,
+        // causing the first \draw to be silently dropped.
+        let tex = r"\documentclass[tikz,border=10pt]{standalone}
+\usepackage{xcolor}
+\begin{document}
+\begin{tikzpicture}[font=\sffamily]
+    \draw[->, >=stealth, thick, black] (0,0) -- (0,7.5) node[above=10pt, font=\Large\bfseries] {how long?};
+    \draw[->, >=stealth, thick, black] (0.5,0) -- (8,0) node[right=10pt, font=\Large\bfseries] {for who?};
+\end{tikzpicture}
+\end{document}
+";
+        let cetz = convert_tikz_to_cetz(tex);
+        assert!(
+            cetz.contains("(0, 0)") && cetz.contains("(0, 7.5)"),
+            "vertical axis (0,0)->(0,7.5) should survive, got: {}",
+            cetz
+        );
+        assert!(
+            cetz.contains("(0.5, 0)") && cetz.contains("(8, 0)"),
+            "horizontal axis (0.5,0)->(8,0) should survive, got: {}",
+            cetz
+        );
+        assert!(
+            cetz.contains("how long?") && cetz.contains("for who?"),
+            "both node labels should be present, got: {}",
+            cetz
+        );
+        assert_eq!(
+            cetz.matches("line(").count(),
+            2,
+            "two line() calls expected, got: {}",
+            cetz
+        );
+        assert!(
+            !cetz.contains(r"\documentclass") && !cetz.contains(r"\usepackage"),
+            "preamble must not leak into output, got: {}",
+            cetz
+        );
+    }
+
+    #[test]
+    fn test_tikz_picture_level_options_are_stripped() {
+        // The optional [font=\sffamily] after \begin{tikzpicture} should be
+        // removed and not interfere with command parsing.
+        let tikz = r"\begin{tikzpicture}[font=\sffamily]\draw (0,0) -- (1,1);\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(
+            cetz.contains("line(") && cetz.contains("(0, 0)") && cetz.contains("(1, 1)"),
+            "drawing should survive picture-level options, got: {}",
+            cetz
+        );
+        assert!(
+            !cetz.contains("font") && !cetz.contains("sffamily"),
+            "picture-level font option should not appear in output, got: {}",
+            cetz
+        );
     }
 }
 
@@ -3008,6 +3337,34 @@ mod t2l_escaped_punctuation {
     }
 
     #[test]
+    fn test_fraction_grouping_parentheses_are_not_emitted() {
+        let numerator = assert_t2l_paths_match("$(2 pi) / 3$");
+        let denominator = assert_t2l_paths_match("$1 / (2 pi)$");
+        let visible = assert_t2l_paths_match("$(2 pi) + 3$");
+
+        assert!(
+            numerator.contains(r"\frac{2 \pi}{3}"),
+            "fraction grouping parentheses should be absorbed, got: {}",
+            numerator
+        );
+        assert!(
+            !numerator.contains(r"\frac{(2 \pi)}{3}"),
+            "fraction grouping parentheses should not be emitted, got: {}",
+            numerator
+        );
+        assert!(
+            denominator.contains(r"\frac{1}{2 \pi}"),
+            "denominator grouping parentheses should be absorbed, got: {}",
+            denominator
+        );
+        assert!(
+            visible.contains(r"\left(2 \pi\right) + 3"),
+            "ordinary visible parentheses should remain emitted, got: {}",
+            visible
+        );
+    }
+
+    #[test]
     fn test_multiline_non_limits_subscript_keeps_plain_brace_group() {
         let result = typst_to_latex_with_options("$A_(i \\ j)$", &T2LOptions::default());
 
@@ -3457,6 +3814,71 @@ mod t2l_math_structured_ir {
             primes.contains("'''"),
             "primes(3) should emit three primes, got: {}",
             primes
+        );
+    }
+
+    #[test]
+    fn test_attached_primes_are_preserved() {
+        let standalone = typst_to_latex_with_options("$'$", &T2LOptions::default());
+        let single = typst_to_latex_with_options("$x'$", &T2LOptions::default());
+        let double = typst_to_latex_with_options("$x''$", &T2LOptions::default());
+        let with_subscript = typst_to_latex_with_options("$x'_i$", &T2LOptions::default());
+        let with_superscript = typst_to_latex_with_options("$f'^2$", &T2LOptions::default());
+        let subscript_prime = typst_to_latex_with_options("$x_i'$", &T2LOptions::default());
+        let superscript_prime = typst_to_latex_with_options("$x^2'$", &T2LOptions::default());
+        let applied = typst_to_latex_with_options("$f'(x)$", &T2LOptions::default());
+        let consistent_subscript_prime = assert_t2l_paths_match("$x_i'$");
+        let consistent_superscript_prime = assert_t2l_paths_match("$x^2'$");
+
+        assert!(
+            standalone.contains("'"),
+            "standalone prime should be preserved, got: {}",
+            standalone
+        );
+        assert!(
+            single.contains("x'"),
+            "attached single prime should be preserved, got: {}",
+            single
+        );
+        assert!(
+            double.contains("x''"),
+            "attached double prime should be preserved, got: {}",
+            double
+        );
+        assert!(
+            with_subscript.contains("x'_i") || with_subscript.contains("x'_{i}"),
+            "attached prime with subscript should be preserved, got: {}",
+            with_subscript
+        );
+        assert!(
+            with_superscript.contains("f'^2") || with_superscript.contains("f'^{2}"),
+            "attached prime with superscript should be preserved, got: {}",
+            with_superscript
+        );
+        assert!(
+            subscript_prime.contains("i'"),
+            "prime inside subscript should be preserved, got: {}",
+            subscript_prime
+        );
+        assert!(
+            superscript_prime.contains("2'"),
+            "prime inside superscript should be preserved, got: {}",
+            superscript_prime
+        );
+        assert!(
+            consistent_subscript_prime.contains("i'"),
+            "prime inside subscript should be consistent across paths, got: {}",
+            consistent_subscript_prime
+        );
+        assert!(
+            consistent_superscript_prime.contains("2'"),
+            "prime inside superscript should be consistent across paths, got: {}",
+            consistent_superscript_prime
+        );
+        assert!(
+            applied.contains("f'"),
+            "attached prime before function args should be preserved, got: {}",
+            applied
         );
     }
 
@@ -4361,6 +4783,154 @@ mod t2l_symbol_mappings {
             count > 400,
             "Expected 400+ TYPST_TO_TEX mappings after extension, got {}",
             count
+        );
+    }
+}
+
+// ============================================================================
+// Preamble / wrapper customization
+// ============================================================================
+
+mod preamble_customization {
+    use tylax::{
+        latex_document_to_typst_with_options, typst_to_latex_with_options, DocumentWrapperMode,
+        L2TOptions, PreambleMode, T2LOptions,
+    };
+
+    fn sample_l2t_doc() -> &'static str {
+        r"\documentclass{article}
+\title{Sample}
+\author{Alice}
+\begin{document}
+\section{Intro}
+Hello.
+\end{document}"
+    }
+
+    #[test]
+    fn test_l2t_preamble_default_emits_set_rules() {
+        let out = latex_document_to_typst_with_options(sample_l2t_doc(), &L2TOptions::default());
+        assert!(out.contains("#set page(paper:"));
+        assert!(out.contains("#set heading(numbering:"));
+        assert!(out.contains("#set math.equation(numbering:"));
+    }
+
+    #[test]
+    fn test_l2t_preamble_none_drops_set_rules_but_keeps_metadata_and_title() {
+        let opts = L2TOptions {
+            preamble: PreambleMode::None,
+            ..Default::default()
+        };
+        let out = latex_document_to_typst_with_options(sample_l2t_doc(), &opts);
+        assert!(
+            !out.contains("#set page("),
+            "page set rule should be dropped, got: {}",
+            out
+        );
+        assert!(
+            !out.contains("#set heading("),
+            "heading set rule should be dropped, got: {}",
+            out
+        );
+        assert!(
+            !out.contains("#set math.equation("),
+            "math.equation set rule should be dropped, got: {}",
+            out
+        );
+        // metadata block must remain
+        assert!(
+            out.contains("#set document(") && out.contains("Sample") && out.contains("Alice"),
+            "title metadata should survive PreambleMode::None, got: {}",
+            out
+        );
+        // visible title block must remain
+        assert!(
+            out.contains("#align(center)["),
+            "title block should survive PreambleMode::None, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn test_l2t_preamble_custom_replaces_default() {
+        let opts = L2TOptions {
+            preamble: PreambleMode::Custom("#set text(font: \"New Roman\")".to_string()),
+            ..Default::default()
+        };
+        let out = latex_document_to_typst_with_options(sample_l2t_doc(), &opts);
+        assert!(out.contains("#set text(font:"));
+        assert!(
+            !out.contains("#set page("),
+            "default page set rule should be replaced, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn test_t2l_wrapper_default_emits_full_document() {
+        let opts = T2LOptions::full_document();
+        let out = typst_to_latex_with_options("= Hi\n\nbody", &opts);
+        assert!(out.contains("\\documentclass{"));
+        assert!(out.contains("\\usepackage{amsmath}"));
+        assert!(out.contains("\\begin{document}"));
+        assert!(out.contains("\\end{document}"));
+    }
+
+    #[test]
+    fn test_t2l_wrapper_body_only_drops_documentclass_and_packages() {
+        let opts = T2LOptions {
+            full_document: true,
+            wrapper: DocumentWrapperMode::BodyOnly,
+            ..T2LOptions::full_document()
+        };
+        let out = typst_to_latex_with_options("= Hi\n\nbody", &opts);
+        assert!(
+            !out.contains("\\documentclass"),
+            "BodyOnly should drop documentclass, got: {}",
+            out
+        );
+        assert!(
+            !out.contains("\\usepackage"),
+            "BodyOnly should drop \\usepackage, got: {}",
+            out
+        );
+        assert!(
+            !out.contains("\\begin{document}") && !out.contains("\\end{document}"),
+            "BodyOnly should drop document begin/end, got: {}",
+            out
+        );
+        assert!(out.contains("\\section{"), "body must remain, got: {}", out);
+    }
+
+    #[test]
+    fn test_t2l_wrapper_custom_inserts_body_at_placeholder() {
+        let wrapper = DocumentWrapperMode::from_template(
+            "\\documentclass{minimal}\n\\begin{document}\n{body}\n\\end{document}\n",
+        )
+        .expect("template should parse");
+        let opts = T2LOptions {
+            full_document: true,
+            wrapper,
+            ..T2LOptions::full_document()
+        };
+        let out = typst_to_latex_with_options("= Hi", &opts);
+        assert!(out.starts_with("\\documentclass{minimal}"));
+        assert!(out.contains("\\section{"));
+        assert!(out.trim_end().ends_with("\\end{document}"));
+        assert!(
+            !out.contains("\\usepackage{amsmath}"),
+            "custom wrapper should not include default packages, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn test_t2l_wrapper_template_missing_body_placeholder_errors() {
+        let result = DocumentWrapperMode::from_template("\\documentclass{article}\nno placeholder");
+        assert!(
+            result.is_err(),
+            "missing {{body}} placeholder must error, got: {:?}",
+            result
         );
     }
 }

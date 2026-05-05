@@ -1,17 +1,20 @@
-//! Tylax CLI - High-performance bidirectional LaTeX ↔ Typst converter
+//! Tylax CLI - High-performance bidirectional LaTeX <-> Typst converter
 
 #[cfg(feature = "cli")]
 use clap::{Parser, Subcommand, ValueEnum};
+#[cfg(feature = "cli")]
 use std::fs;
+#[cfg(feature = "cli")]
 use std::io::{self, Read, Write};
-use std::path::Path;
+#[cfg(feature = "cli")]
 use tylax::{
+    batch::{convert_batch, BatchDirection, BatchFileStatus, BatchOptions},
     convert_auto, convert_auto_document, detect_format,
     diagnostics::{check_latex, format_diagnostics},
-    latex_document_to_typst, latex_to_typst, latex_to_typst_with_diagnostics,
+    latex_document_to_typst, latex_to_typst, latex_to_typst_with_diagnostics_options,
     tikz::{convert_cetz_to_tikz, convert_tikz_to_cetz, is_cetz_code},
     typst_document_to_latex, typst_to_latex, typst_to_latex_with_diagnostics, CliDiagnostic,
-    T2LOptions,
+    DocumentWrapperMode, L2TOptions, PreambleMode, T2LOptions,
 };
 
 #[cfg(feature = "cli")]
@@ -19,7 +22,7 @@ use tylax::{
 #[command(name = "t2l")]
 #[command(author = "SciPenAI")]
 #[command(version)]
-#[command(about = "Tylax - High-performance bidirectional LaTeX ↔ Typst converter", long_about = None)]
+#[command(about = "Tylax - High-performance bidirectional LaTeX <-> Typst converter", long_about = None)]
 struct Cli {
     /// Subcommand to run
     #[command(subcommand)]
@@ -72,6 +75,23 @@ struct Cli {
     /// Embed warnings as comments in the output file
     #[arg(long)]
     embed_warnings: bool,
+
+    /// Drop the preamble. L2T: omit `#set page/heading/math.equation`.
+    /// T2L: emit only the converted body, no `\documentclass` /
+    /// packages / `\begin{document}` wrapper.
+    #[arg(long, conflicts_with_all = ["preamble", "wrapper"])]
+    no_preamble: bool,
+
+    /// Path to a file whose contents replace the default Typst style
+    /// preamble (only meaningful for L2T direction).
+    #[arg(long, value_name = "FILE")]
+    preamble: Option<String>,
+
+    /// Path to a file used as the LaTeX wrapper template (only
+    /// meaningful for T2L direction). The file must contain the literal
+    /// `{body}` placeholder marking where the converted body is inserted.
+    #[arg(long, value_name = "FILE")]
+    wrapper: Option<String>,
 }
 
 #[cfg(feature = "cli")]
@@ -139,6 +159,14 @@ enum Commands {
         /// File extension for output files
         #[arg(short, long)]
         extension: Option<String>,
+
+        /// Recursively convert matching files under the input directory
+        #[arg(long)]
+        recursive: bool,
+
+        /// Exclude files or directories by relative glob, repeatable
+        #[arg(long, value_name = "GLOB")]
+        exclude: Vec<String>,
     },
 
     /// Show version and feature info
@@ -239,10 +267,18 @@ fn main() -> io::Result<()> {
     // Determine if this is a full document based on content or flag
     let is_full_document = cli.full_document || is_latex_document(&input);
 
+    // Resolve preamble/wrapper flags into PreambleMode / DocumentWrapperMode.
+    let preamble_mode = resolve_preamble_mode(cli.no_preamble, cli.preamble.as_deref())?;
+    let wrapper_mode = resolve_wrapper_mode(cli.no_preamble, cli.wrapper.as_deref())?;
+
     // Convert with diagnostics - collect warnings as unified CliDiagnostic
     let (result, diagnostics): (String, Vec<CliDiagnostic>) = match direction {
         Direction::L2t => {
-            let conv_result = latex_to_typst_with_diagnostics(&input);
+            let l2t_options = L2TOptions {
+                preamble: preamble_mode,
+                ..Default::default()
+            };
+            let conv_result = latex_to_typst_with_diagnostics_options(&input, l2t_options);
             let diags = conv_result
                 .warnings
                 .into_iter()
@@ -251,10 +287,10 @@ fn main() -> io::Result<()> {
             (conv_result.output, diags)
         }
         Direction::T2l => {
-            let options = if is_full_document {
-                T2LOptions::full_document()
-            } else {
-                T2LOptions::default()
+            let options = T2LOptions {
+                full_document: is_full_document,
+                wrapper: wrapper_mode,
+                ..Default::default()
             };
             if !cli.no_eval {
                 let conv_result = typst_to_latex_with_diagnostics(&input, &options);
@@ -317,10 +353,10 @@ fn main() -> io::Result<()> {
             let mut file = fs::File::create(&path)?;
             writeln!(file, "{}", result)?;
             if diagnostics.is_empty() {
-                eprintln!("✓ Output written to: {}", path);
+                eprintln!("Output written to: {}", path);
             } else {
                 eprintln!(
-                    "⚠ Output written to: {} ({} warning(s))",
+                    "Output written to: {} ({} warning(s))",
                     path,
                     diagnostics.len()
                 );
@@ -416,7 +452,7 @@ fn handle_subcommand(cmd: Commands) -> io::Result<()> {
                 Some(path) => {
                     let mut file = fs::File::create(&path)?;
                     writeln!(file, "{}", result)?;
-                    eprintln!("✓ Output written to: {}", path);
+                    eprintln!("Output written to: {}", path);
                 }
                 None => {
                     println!("{}", result);
@@ -459,7 +495,7 @@ fn handle_subcommand(cmd: Commands) -> io::Result<()> {
                 Some(path) => {
                     let mut file = fs::File::create(&path)?;
                     writeln!(file, "{}", result)?;
-                    eprintln!("✓ TikZ/CeTZ conversion written to: {}", path);
+                    eprintln!("TikZ/CeTZ conversion written to: {}", path);
                 }
                 None => {
                     println!("{}", result);
@@ -473,103 +509,57 @@ fn handle_subcommand(cmd: Commands) -> io::Result<()> {
             direction,
             full_document,
             extension,
+            recursive,
+            exclude,
         } => {
-            // Create output directory if it doesn't exist
-            fs::create_dir_all(&output_dir)?;
-
-            // Determine output extension
-            let out_ext = extension.unwrap_or_else(|| match direction {
-                Direction::L2t => "typ".to_string(),
-                Direction::T2l => "tex".to_string(),
-                Direction::Auto => "out".to_string(),
-            });
-
-            // Find input files
-            let input_path = Path::new(&input);
-            let files: Vec<_> = if input_path.is_dir() {
-                // Read all .tex or .typ files from directory
-                fs::read_dir(input_path)?
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        let path = e.path();
-                        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                        matches!(direction, Direction::L2t) && ext == "tex"
-                            || matches!(direction, Direction::T2l) && ext == "typ"
-                            || matches!(direction, Direction::Auto)
-                    })
-                    .map(|e| e.path())
-                    .collect()
-            } else {
-                // Single file
-                vec![input_path.to_path_buf()]
+            // Batch conversion is handled by the reusable filesystem API.
+            let options = BatchOptions {
+                input: input.into(),
+                output_dir: output_dir.into(),
+                direction: batch_direction(direction),
+                recursive,
+                full_document,
+                output_extension: extension,
+                excludes: exclude,
+                l2t_options: L2TOptions::default(),
+                t2l_options: T2LOptions::default(),
             };
 
-            let mut success_count = 0;
-            let mut error_count = 0;
+            let report = convert_batch(&options)
+                .map_err(|err| io::Error::other(format!("batch conversion failed: {}", err)))?;
 
-            for file_path in files {
-                let filename = file_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("output");
-
-                let output_path = Path::new(&output_dir).join(format!("{}.{}", filename, out_ext));
-
-                match fs::read_to_string(&file_path) {
-                    Ok(content) => {
-                        let result = if full_document {
-                            match direction {
-                                Direction::L2t => latex_document_to_typst(&content),
-                                Direction::T2l => typst_document_to_latex(&content),
-                                Direction::Auto => convert_auto_document(&content).0,
-                            }
-                        } else {
-                            match direction {
-                                Direction::L2t => latex_to_typst(&content),
-                                Direction::T2l => typst_to_latex(&content),
-                                Direction::Auto => convert_auto(&content).0,
-                            }
-                        };
-
-                        match fs::write(&output_path, &result) {
-                            Ok(_) => {
-                                eprintln!("✓ {}", output_path.display());
-                                success_count += 1;
-                            }
-                            Err(e) => {
-                                eprintln!("✗ {} - write error: {}", output_path.display(), e);
-                                error_count += 1;
-                            }
-                        }
+            for result in &report.results {
+                match &result.status {
+                    BatchFileStatus::Converted => {
+                        eprintln!("Converted: {}", result.output_path.display());
                     }
-                    Err(e) => {
-                        eprintln!("✗ {} - read error: {}", file_path.display(), e);
-                        error_count += 1;
+                    BatchFileStatus::Failed(message) => {
+                        eprintln!("Failed: {} - {}", result.output_path.display(), message);
                     }
                 }
             }
 
             eprintln!(
                 "\nBatch conversion complete: {} succeeded, {} failed",
-                success_count, error_count
+                report.success_count, report.error_count
             );
 
-            if error_count > 0 {
+            if report.error_count > 0 {
                 std::process::exit(1);
             }
         }
 
         Commands::Info => {
-            println!("Tylax - High-performance bidirectional LaTeX ↔ Typst converter");
+            println!("Tylax - High-performance bidirectional LaTeX <-> Typst converter");
             println!("Version: {}", env!("CARGO_PKG_VERSION"));
             println!();
             println!("Features:");
-            println!("  ✓ LaTeX → Typst conversion (math + documents)");
-            println!("  ✓ Typst → LaTeX conversion (math + documents)");
-            println!("  ✓ TikZ ↔ CeTZ graphics conversion");
-            println!("  ✓ Batch file processing");
-            println!("  ✓ LaTeX diagnostics and checking");
-            println!("  ✓ Auto-detection of input format");
+            println!("  - LaTeX <-> Typst conversion (math + documents)");
+            println!("  - Typst <-> LaTeX conversion (math + documents)");
+            println!("  - TikZ <-> CeTZ graphics conversion");
+            println!("  - Batch file processing");
+            println!("  - LaTeX diagnostics and checking");
+            println!("  - Auto-detection of input format");
             println!();
             println!("Supported packages:");
             println!("  - amsmath, amssymb, mathtools");
@@ -634,6 +624,15 @@ fn pretty_print(input: &str) -> String {
     result.trim().to_string()
 }
 
+#[cfg(feature = "cli")]
+fn batch_direction(direction: Direction) -> BatchDirection {
+    match direction {
+        Direction::Auto => BatchDirection::Auto,
+        Direction::L2t => BatchDirection::LatexToTypst,
+        Direction::T2l => BatchDirection::TypstToLatex,
+    }
+}
+
 /// Print diagnostics to stderr with optional color coding (unified for L2T and T2L).
 #[cfg(feature = "cli")]
 fn print_diagnostics_to_stderr(diagnostics: &[CliDiagnostic], use_color: bool) {
@@ -679,6 +678,51 @@ fn embed_diagnostics_as_comments(output: &str, diagnostics: &[CliDiagnostic]) ->
     }
 
     result
+}
+
+#[cfg(feature = "cli")]
+fn resolve_preamble_mode(
+    no_preamble: bool,
+    preamble_file: Option<&str>,
+) -> io::Result<PreambleMode> {
+    if no_preamble {
+        return Ok(PreambleMode::None);
+    }
+    if let Some(path) = preamble_file {
+        let contents = fs::read_to_string(path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("failed to read --preamble file '{}': {}", path, e),
+            )
+        })?;
+        return Ok(PreambleMode::Custom(contents));
+    }
+    Ok(PreambleMode::Default)
+}
+
+#[cfg(feature = "cli")]
+fn resolve_wrapper_mode(
+    no_preamble: bool,
+    wrapper_file: Option<&str>,
+) -> io::Result<DocumentWrapperMode> {
+    if no_preamble {
+        return Ok(DocumentWrapperMode::BodyOnly);
+    }
+    if let Some(path) = wrapper_file {
+        let template = fs::read_to_string(path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("failed to read --wrapper file '{}': {}", path, e),
+            )
+        })?;
+        return DocumentWrapperMode::from_template(&template).map_err(|msg| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("--wrapper file '{}': {}", path, msg),
+            )
+        });
+    }
+    Ok(DocumentWrapperMode::Default)
 }
 
 #[cfg(not(feature = "cli"))]

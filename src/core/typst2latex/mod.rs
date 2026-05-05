@@ -13,7 +13,7 @@ mod preprocess;
 mod table;
 mod utils;
 
-pub use context::{ConvertContext, EnvironmentContext, T2LOptions, TokenType};
+pub use context::{ConvertContext, DocumentWrapperMode, EnvironmentContext, T2LOptions, TokenType};
 use engine::ContentNode;
 use typst_syntax::{parse, parse_math};
 
@@ -379,6 +379,24 @@ pub fn typst_to_latex_with_eval(input: &str, options: &T2LOptions) -> String {
 }
 
 fn wrap_in_document(content: &str, options: &T2LOptions) -> String {
+    match &options.wrapper {
+        DocumentWrapperMode::Default => default_wrapper(content, options),
+        DocumentWrapperMode::BodyOnly => content.to_string(),
+        DocumentWrapperMode::Custom {
+            before_body,
+            after_body,
+        } => {
+            let mut doc =
+                String::with_capacity(before_body.len() + content.len() + after_body.len());
+            doc.push_str(before_body);
+            doc.push_str(content);
+            doc.push_str(after_body);
+            doc
+        }
+    }
+}
+
+fn default_wrapper(content: &str, options: &T2LOptions) -> String {
     let mut doc = String::new();
 
     // Document class

@@ -27,7 +27,12 @@ pub fn emit_math_ir(ir: &MathIr, ctx: &mut ConvertContext) {
         MathIr::Limits(content) => emit_math_ir(content, ctx),
         MathIr::Style { mode, content } => emit_style(mode, content, ctx),
         MathIr::Attachment { .. } => emit_attachment(ir, ctx),
-        MathIr::Script { base, sub, sup } => emit_script(base, sub.as_deref(), sup.as_deref(), ctx),
+        MathIr::Script {
+            base,
+            sub,
+            sup,
+            primes,
+        } => emit_script(base, *primes, sub.as_deref(), sup.as_deref(), ctx),
         MathIr::Command(command) => emit_command(command, ctx),
         MathIr::Environment(environment) => emit_environment(environment, ctx),
         MathIr::RawLiteral(text) => emit_raw_literal(text, ctx),
@@ -194,11 +199,17 @@ fn emit_attachment(attachment: &MathIr, ctx: &mut ConvertContext) {
 
 fn emit_script(
     base: &MathIr,
+    primes: usize,
     sub: Option<&MathIr>,
     sup: Option<&MathIr>,
     ctx: &mut ConvertContext,
 ) {
     emit_math_ir(base, ctx);
+
+    if primes > 0 {
+        ctx.push(&"'".repeat(primes));
+        ctx.last_token = TokenType::Punctuation;
+    }
 
     if let Some(sub) = sub {
         ctx.push("_");

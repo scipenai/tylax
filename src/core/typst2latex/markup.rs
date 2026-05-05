@@ -2,7 +2,7 @@
 //!
 //! Handles document structure, text formatting, and non-math content.
 
-use super::context::{ConvertContext, EnvironmentContext, TokenType};
+use super::context::{ConvertContext, EnvironmentContext, T2LOptions, TokenType};
 use super::engine::{render_math_segments_to_typst_source, ContentNode};
 use super::math::convert_math_node;
 use super::table::{LatexCell, LatexCellAlign, LatexHLine, LatexTableGenerator};
@@ -20,7 +20,7 @@ use crate::features::refs::{
     CiteGroup, Reference,
 };
 use crate::tikz::{convert_cetz_to_tikz, is_cetz_code};
-use typst_syntax::{parse_math, SyntaxKind, SyntaxNode};
+use typst_syntax::{SyntaxKind, SyntaxNode};
 
 /// Languages supported by the listings package (case-insensitive check)
 /// This is a subset of commonly used languages that listings supports by default
@@ -220,12 +220,7 @@ pub fn convert_content_nodes_to_latex(nodes: &[ContentNode], ctx: &mut ConvertCo
             ContentNode::Math { segments, block } => {
                 flush_typst_chunk(&mut buffer, ctx);
                 let math_source = render_math_segments_to_typst_source(segments);
-                let root = parse_math(&math_source);
-                let mut math_ctx = ConvertContext::new();
-                math_ctx.options = ctx.options.clone();
-                math_ctx.in_math = true;
-                convert_math_node(&root, &mut math_ctx);
-                let math_content = math_ctx.finalize().trim().to_string();
+                let math_content = convert_math_source_to_latex(&math_source, &ctx.options);
                 emit_rendered_math(ctx, &math_content, *block);
             }
             other => buffer.push_str(&other.to_typst()),
@@ -233,6 +228,31 @@ pub fn convert_content_nodes_to_latex(nodes: &[ContentNode], ctx: &mut ConvertCo
     }
 
     flush_typst_chunk(&mut buffer, ctx);
+}
+
+fn convert_math_source_to_latex(math_source: &str, options: &T2LOptions) -> String {
+    let wrapped = format!("${}$", math_source);
+    let root = typst_syntax::parse(&wrapped);
+    let mut math_ctx = ConvertContext::new();
+    math_ctx.options = options.clone();
+    math_ctx.in_math = true;
+    convert_first_math_child(&root, &mut math_ctx);
+    math_ctx.finalize().trim().to_string()
+}
+
+fn convert_first_math_child(node: &SyntaxNode, ctx: &mut ConvertContext) -> bool {
+    if node.kind() == SyntaxKind::Math {
+        convert_math_node(node, ctx);
+        return true;
+    }
+
+    for child in node.children() {
+        if convert_first_math_child(child, ctx) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Check if a language is supported by the listings package

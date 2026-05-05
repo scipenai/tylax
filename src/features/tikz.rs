@@ -1346,28 +1346,42 @@ fn parse_node(input: &str) -> Option<TikZNode> {
     })
 }
 
-/// Parse a complete TikZ picture into commands
+/// Parse a complete TikZ picture into commands.
+///
+/// Accepts either a bare tikzpicture body or a full LaTeX document/snippet
+/// containing a `\begin{tikzpicture}...\end{tikzpicture}` block (with optional
+/// preamble like `\documentclass`, `\usepackage`, `\begin{document}` around it).
 pub fn parse_tikz_picture(input: &str) -> Vec<TikZCommand> {
-    // Remove \begin{tikzpicture} and \end{tikzpicture}
-    let content = input
-        .trim()
-        .trim_start_matches(r"\begin{tikzpicture}")
-        .trim_end_matches(r"\end{tikzpicture}")
-        .trim();
-
-    // Remove options after \begin{tikzpicture}
-    let content = if content.starts_with('[') {
-        content
-            .find(']')
-            .map(|i| &content[i + 1..])
-            .unwrap_or(content)
-    } else {
-        content
-    };
+    let content = extract_tikzpicture_body(input);
 
     // Use brace-aware command splitter
-    let raw_commands = split_tikz_commands(content);
+    let raw_commands = split_tikz_commands(&content);
     parse_tikz_commands(&raw_commands)
+}
+
+/// Extract the body of a `\begin{tikzpicture}[opts]...\end{tikzpicture}`
+/// block from `input`. If no such block is found, fall back to treating
+/// the whole input as the body (after stripping any leading `[opts]`).
+fn extract_tikzpicture_body(input: &str) -> String {
+    let trimmed = input.trim();
+    const BEGIN: &str = r"\begin{tikzpicture}";
+    const END: &str = r"\end{tikzpicture}";
+
+    let body = if let Some(begin) = trimmed.find(BEGIN) {
+        let after_begin = &trimmed[begin + BEGIN.len()..];
+        let end_rel = after_begin.rfind(END).unwrap_or(after_begin.len());
+        &after_begin[..end_rel]
+    } else {
+        trimmed
+    };
+
+    let body = body.trim();
+    if body.starts_with('[') {
+        if let Some(close) = body.find(']') {
+            return body[close + 1..].trim().to_string();
+        }
+    }
+    body.to_string()
 }
 
 /// Split TikZ content into individual commands, respecting brace nesting

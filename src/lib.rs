@@ -62,25 +62,29 @@ pub mod features;
 /// Utility modules
 pub mod utils;
 
+/// Filesystem batch conversion API (native targets only)
+#[cfg(not(target_arch = "wasm32"))]
+pub mod batch;
+
 /// WASM bindings (feature-gated)
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
 // Re-export core conversion functions
 pub use core::typst2latex;
-pub use core::typst2latex::T2LOptions;
 pub use core::typst2latex::{
     typst_document_to_latex, typst_to_latex, typst_to_latex_with_diagnostics,
     typst_to_latex_with_eval, typst_to_latex_with_options, ConversionResult as T2LConversionResult,
 };
+pub use core::typst2latex::{DocumentWrapperMode, T2LOptions};
 
 pub use core::latex2typst::{
     convert_document_with_ast, convert_document_with_ast_options, convert_math_with_ast,
     convert_math_with_ast_options, convert_with_ast, convert_with_ast_options,
     latex_math_to_typst_with_diagnostics, latex_math_to_typst_with_eval,
-    latex_to_typst_with_diagnostics, latex_to_typst_with_eval, ConversionMode,
-    ConversionResult as L2TConversionResult, ConversionState, EnvironmentContext, L2TOptions,
-    LatexConverter, WarningKind,
+    latex_to_typst_with_diagnostics, latex_to_typst_with_diagnostics_options,
+    latex_to_typst_with_eval, ConversionMode, ConversionResult as L2TConversionResult,
+    ConversionState, EnvironmentContext, L2TOptions, LatexConverter, PreambleMode, WarningKind,
 };
 
 // Re-export data modules

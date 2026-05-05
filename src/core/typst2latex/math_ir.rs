@@ -88,6 +88,7 @@ pub enum MathIr {
         base: Box<MathIr>,
         sub: Option<Box<MathIr>>,
         sup: Option<Box<MathIr>>,
+        primes: usize,
     },
     Command(MathCommand),
     Environment(MathEnvironment),
@@ -158,7 +159,7 @@ pub fn build_math_ir(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
         }),
         SyntaxKind::MathDelimited => build_math_delimited(node, options),
         SyntaxKind::MathPrimes => {
-            let count = node.text().chars().filter(|&c| c == '\'').count();
+            let count = count_math_primes(node);
             MathIr::RawLiteral("'".repeat(count))
         }
         _ => build_generic(node, options),
@@ -226,10 +227,16 @@ pub fn normalize_math_ir(ir: MathIr) -> MathIr {
             bottom_left: bottom_left.map(|item| Box::new(normalize_math_ir(*item))),
             bottom_right: bottom_right.map(|item| Box::new(normalize_math_ir(*item))),
         },
-        MathIr::Script { base, sub, sup } => MathIr::Script {
+        MathIr::Script {
+            base,
+            sub,
+            sup,
+            primes,
+        } => MathIr::Script {
             base: Box::new(normalize_math_ir(*base)),
             sub: sub.map(|item| Box::new(normalize_math_ir(*item))),
             sup: sup.map(|item| Box::new(normalize_math_ir(*item))),
+            primes,
         },
         MathIr::Command(mut command) => {
             command.args = command
@@ -367,7 +374,9 @@ fn build_math_attach(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
         .collect();
 
     let base_idx = children.iter().position(|child| {
-        child.kind() != SyntaxKind::Hat && child.kind() != SyntaxKind::Underscore
+        child.kind() != SyntaxKind::Hat
+            && child.kind() != SyntaxKind::Underscore
+            && child.kind() != SyntaxKind::MathPrimes
     });
 
     let Some(base_idx) = base_idx else {
@@ -377,6 +386,7 @@ fn build_math_attach(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
     let base = Box::new(build_math_ir(children[base_idx], options));
     let mut sub = None;
     let mut sup = None;
+    let mut primes = 0usize;
 
     let mut index = 0;
     while index < children.len() {
@@ -406,13 +416,29 @@ fn build_math_attach(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
                     continue;
                 }
             }
+            SyntaxKind::MathPrimes => {
+                primes += count_math_primes(children[index]);
+                index += 1;
+                continue;
+            }
             _ => {}
         }
 
         index += 1;
     }
 
-    MathIr::Script { base, sub, sup }
+    MathIr::Script {
+        base,
+        sub,
+        sup,
+        primes,
+    }
+}
+
+fn count_math_primes(node: &SyntaxNode) -> usize {
+    node.cast::<typst_syntax::ast::MathPrimes>()
+        .map(|primes| primes.count())
+        .unwrap_or_else(|| node.text().chars().filter(|&c| c == '\'').count())
 }
 
 fn build_func_call(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
@@ -757,39 +783,25 @@ fn build_math_frac(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
         .iter()
         .position(|child| child.kind() == SyntaxKind::Slash);
 
+    let build_side = |side: &[&SyntaxNode]| -> MathIr {
+        let stripped = strip_grouping_parens(side);
+        let items: Vec<MathIr> = stripped
+            .iter()
+            .map(|child| build_math_ir(child, options))
+            .collect();
+        seq_or_single(items)
+    };
+
     let (numerator, denominator) = if let Some(pos) = slash_pos {
         (
-            seq_or_single(
-                children[..pos]
-                    .iter()
-                    .map(|child| build_math_ir(child, options))
-                    .collect(),
-            ),
-            seq_or_single(
-                children[pos + 1..]
-                    .iter()
-                    .map(|child| build_math_ir(child, options))
-                    .collect(),
-            ),
+            build_side(&children[..pos]),
+            build_side(&children[pos + 1..]),
         )
     } else if children.len() >= 2 {
         let mid = children.len() / 2;
-        (
-            seq_or_single(
-                children[..mid]
-                    .iter()
-                    .map(|child| build_math_ir(child, options))
-                    .collect(),
-            ),
-            seq_or_single(
-                children[mid..]
-                    .iter()
-                    .map(|child| build_math_ir(child, options))
-                    .collect(),
-            ),
-        )
-    } else if let Some(child) = children.first() {
-        (build_math_ir(child, options), MathIr::empty())
+        (build_side(&children[..mid]), build_side(&children[mid..]))
+    } else if !children.is_empty() {
+        (build_side(&children[..]), MathIr::empty())
     } else {
         (MathIr::empty(), MathIr::empty())
     };
@@ -799,6 +811,39 @@ fn build_math_frac(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
         args: vec![numerator, denominator],
         optional_arg: None,
     })
+}
+
+/// When a fraction's numerator or denominator is a single parenthesized
+/// group, the parens act as implicit grouping (the `\frac` braces already
+/// group the content) and should be absorbed.
+///
+/// Typst parses `(...)` in fraction operands two ways depending on context:
+///   - as a `MathDelimited` whose first/last children are `LeftParen`/`RightParen`, or
+///   - as a `Math` block whose first/last children are `LeftParen`/`RightParen`.
+///
+/// Both shapes are unwrapped here. Only round parens — `[...]`, `{...}`, `|...|`
+/// are visible delimiters and stay.
+fn strip_grouping_parens<'a>(children: &'a [&'a SyntaxNode]) -> Vec<&'a SyntaxNode> {
+    let meaningful: Vec<&SyntaxNode> = children
+        .iter()
+        .filter(|c| c.kind() != SyntaxKind::Space)
+        .copied()
+        .collect();
+    if meaningful.len() != 1 {
+        return children.to_vec();
+    }
+    let only = meaningful[0];
+    if !matches!(only.kind(), SyntaxKind::Math | SyntaxKind::MathDelimited) {
+        return children.to_vec();
+    }
+    let inner: Vec<&SyntaxNode> = only.children().collect();
+    if inner.len() >= 2
+        && inner.first().map(|c| c.kind()) == Some(SyntaxKind::LeftParen)
+        && inner.last().map(|c| c.kind()) == Some(SyntaxKind::RightParen)
+    {
+        return inner[1..inner.len() - 1].to_vec();
+    }
+    children.to_vec()
 }
 
 fn build_math_root(node: &SyntaxNode, options: &T2LOptions) -> MathIr {

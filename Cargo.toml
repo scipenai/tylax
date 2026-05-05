@@ -67,6 +67,10 @@ serde_yaml = { version = "0.9", optional = true }
 csv = { version = "1.3", optional = true }
 toml = { version = "0.8", optional = true }
 
+# Native-only dependencies (used by `tylax::batch`, which is gated to non-wasm targets)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+globset = "0.4"
+
 [features]
 default = ["cli"]
 cli = ["dep:clap"]

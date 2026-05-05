@@ -27,6 +27,26 @@ use super::utils::{
 // LaTeX → Typst Conversion Options
 // =============================================================================
 
+/// Controls how the *style* preamble (`#set page` / `#set heading` /
+/// `#set math.equation` / `#import polylux`) is emitted at the top of a
+/// converted document.
+///
+/// This does **not** affect document metadata (`#set document(title:..)`)
+/// or the rendered title block — those are derived from the LaTeX source
+/// (`\title`, `\author`) and stay regardless of this setting.
+#[derive(Debug, Clone, Default)]
+pub enum PreambleMode {
+    /// Emit the default style preamble for the detected document class.
+    #[default]
+    Default,
+    /// Emit no style preamble at all. Body content only.
+    None,
+    /// Emit the given string verbatim in place of the default preamble,
+    /// followed by one blank line. The caller is responsible for the
+    /// content (e.g. providing alternative `#set` rules).
+    Custom(String),
+}
+
 /// Options for LaTeX to Typst conversion
 #[derive(Debug, Clone)]
 pub struct L2TOptions {
@@ -59,6 +79,10 @@ pub struct L2TOptions {
     /// When true, macros defined with \newcommand, \def, etc. are expanded
     /// Default: true
     pub expand_macros: bool,
+
+    /// Controls emission of the style preamble in document mode.
+    /// Default: [`PreambleMode::Default`]
+    pub preamble: PreambleMode,
 }
 
 impl Default for L2TOptions {
@@ -71,7 +95,25 @@ impl Default for L2TOptions {
             non_strict: true,
             optimize: true,
             expand_macros: true,
+            preamble: PreambleMode::Default,
         }
+    }
+}
+
+/// Build the default style preamble for the given LaTeX document class.
+fn default_style_preamble(document_class: Option<&str>) -> String {
+    match document_class.unwrap_or("article") {
+        "report" | "book" => "#set page(paper: \"a4\")\n\
+             #set heading(numbering: \"1.1\")\n\
+             #set math.equation(numbering: \"(1)\")\n\n"
+            .to_string(),
+        "beamer" => "#import \"@preview/polylux:0.3.1\": *\n\
+             #set page(paper: \"presentation-16-9\")\n\n"
+            .to_string(),
+        _ => "#set page(paper: \"a4\")\n\
+             #set heading(numbering: \"1.\")\n\
+             #set math.equation(numbering: \"(1)\")\n\n"
+            .to_string(),
     }
 }
 
@@ -84,13 +126,8 @@ impl L2TOptions {
     /// Create options optimized for human readability
     pub fn readable() -> Self {
         Self {
-            prefer_shorthands: true,
-            frac_to_slash: true,
             infty_to_oo: true,
-            keep_spaces: false,
-            non_strict: true,
-            optimize: true,
-            expand_macros: true,
+            ..Self::default()
         }
     }
 
@@ -99,11 +136,8 @@ impl L2TOptions {
         Self {
             prefer_shorthands: false,
             frac_to_slash: false,
-            infty_to_oo: false,
-            keep_spaces: false,
-            non_strict: true,
             optimize: false,
-            expand_macros: true,
+            ..Self::default()
         }
     }
 
@@ -1386,33 +1420,21 @@ impl LatexConverter {
             doc.push_str(")\n\n");
         }
 
-        // Page and heading setup
-        if let Some(ref class) = self.state.document_class {
-            match class.as_str() {
-                "article" => {
-                    doc.push_str("#set page(paper: \"a4\")\n");
-                    doc.push_str("#set heading(numbering: \"1.\")\n");
-                    doc.push_str("#set math.equation(numbering: \"(1)\")\n\n");
-                }
-                "report" | "book" => {
-                    doc.push_str("#set page(paper: \"a4\")\n");
-                    doc.push_str("#set heading(numbering: \"1.1\")\n");
-                    doc.push_str("#set math.equation(numbering: \"(1)\")\n\n");
-                }
-                "beamer" => {
-                    doc.push_str("#import \"@preview/polylux:0.3.1\": *\n");
-                    doc.push_str("#set page(paper: \"presentation-16-9\")\n\n");
-                }
-                _ => {
-                    doc.push_str("#set page(paper: \"a4\")\n");
-                    doc.push_str("#set heading(numbering: \"1.\")\n");
-                    doc.push_str("#set math.equation(numbering: \"(1)\")\n\n");
+        // Style preamble (page / heading / math.equation, plus
+        // class-specific imports). Controlled by L2TOptions.preamble.
+        match &self.options().preamble {
+            PreambleMode::Default => {
+                doc.push_str(&default_style_preamble(
+                    self.state.document_class.as_deref(),
+                ));
+            }
+            PreambleMode::None => {}
+            PreambleMode::Custom(text) => {
+                doc.push_str(text.as_str());
+                if !text.ends_with("\n\n") {
+                    doc.push_str(if text.ends_with('\n') { "\n" } else { "\n\n" });
                 }
             }
-        } else {
-            doc.push_str("#set page(paper: \"a4\")\n");
-            doc.push_str("#set heading(numbering: \"1.\")\n");
-            doc.push_str("#set math.equation(numbering: \"(1)\")\n\n");
         }
 
         // Title block

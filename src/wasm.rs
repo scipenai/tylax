@@ -33,6 +33,14 @@ pub struct L2TConvertOptions {
     /// Apply output optimizations
     #[serde(default = "default_true")]
     pub optimize: bool,
+    /// Drop the Typst style preamble (`#set page/heading/math.equation`).
+    /// Has no effect on metadata or rendered title block.
+    #[serde(default)]
+    pub no_preamble: bool,
+    /// Replace the default style preamble with this string.
+    /// Ignored when `no_preamble` is true.
+    #[serde(default)]
+    pub preamble: Option<String>,
 }
 
 /// Typst to LaTeX conversion options (exposed to WASM)
@@ -51,6 +59,16 @@ pub struct T2LConvertOptions {
     /// Math mode (full_document: false) never uses MiniEval for better performance.
     #[serde(default = "default_true")]
     pub expand_macros: bool,
+    /// Emit only the body — no `\documentclass`, packages, or
+    /// `\begin{document}` wrapper. Has effect only when `full_document`
+    /// is true.
+    #[serde(default)]
+    pub no_preamble: bool,
+    /// LaTeX wrapper template containing the literal `{body}` placeholder.
+    /// If set, replaces the default wrapper. Returns an error result if
+    /// the placeholder is missing. Ignored when `no_preamble` is true.
+    #[serde(default)]
+    pub wrapper: Option<String>,
 }
 
 /// Legacy conversion options for backwards compatibility
@@ -180,12 +198,20 @@ pub fn latex_to_typst_with_options_wasm(input: &str, options: JsValue) -> JsValu
 
     // Convert WASM options to internal L2TOptions using struct update syntax.
     // This ensures new fields with defaults don't cause compile errors.
+    let preamble_mode = if opts.no_preamble {
+        crate::PreambleMode::None
+    } else if let Some(text) = opts.preamble.clone() {
+        crate::PreambleMode::Custom(text)
+    } else {
+        crate::PreambleMode::Default
+    };
     let l2t_opts = crate::L2TOptions {
         prefer_shorthands: opts.prefer_shorthands,
         frac_to_slash: opts.frac_to_slash,
         infty_to_oo: opts.infty_to_oo,
         non_strict: opts.non_strict,
         optimize: opts.optimize,
+        preamble: preamble_mode,
         ..Default::default()
     };
 
@@ -233,14 +259,35 @@ pub fn latex_to_typst_with_options_wasm(input: &str, options: JsValue) -> JsValu
 pub fn typst_to_latex_with_options_wasm(input: &str, options: JsValue) -> JsValue {
     let opts: T2LConvertOptions = serde_wasm_bindgen::from_value(options).unwrap_or_default();
 
+    // Resolve wrapper mode from WASM options. Validation failure (missing
+    // `{body}` placeholder) returns a structured error result rather than
+    // silently appending body content.
+    let wrapper_mode = if opts.no_preamble {
+        crate::DocumentWrapperMode::BodyOnly
+    } else if let Some(template) = opts.wrapper.clone() {
+        match crate::DocumentWrapperMode::from_template(&template) {
+            Ok(m) => m,
+            Err(msg) => {
+                let err = ConvertResult {
+                    output: String::new(),
+                    success: false,
+                    error: Some(format!("invalid wrapper: {}", msg)),
+                    warnings: vec![],
+                };
+                return to_js_value(&err);
+            }
+        }
+    } else {
+        crate::DocumentWrapperMode::Default
+    };
+
     // Convert WASM options to internal T2LOptions
     let t2l_opts = crate::T2LOptions {
         full_document: opts.full_document,
-        document_class: "article".to_string(),
-        title: None,
-        author: None,
         math_only: !opts.full_document,
         block_math_mode: opts.block_math_mode,
+        wrapper: wrapper_mode,
+        ..Default::default()
     };
 
     let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

@@ -24,6 +24,8 @@ class L2TOptions:
     non_strict: bool
     optimize: bool
     expand_macros: bool
+    preamble: str | None
+    preamble_omit: bool
     def __init__(
         self,
         *,
@@ -34,6 +36,8 @@ class L2TOptions:
         non_strict: bool = True,
         optimize: bool = True,
         expand_macros: bool = True,
+        preamble: str | None = None,
+        preamble_omit: bool = False,
     ) -> None: ...
 
 class T2LOptions:
@@ -41,6 +45,8 @@ class T2LOptions:
     title: str | None
     author: str | None
     block_math_mode: bool
+    wrapper: str | None
+    wrapper_omit: bool
     def __init__(
         self,
         *,
@@ -48,6 +54,8 @@ class T2LOptions:
         title: str | None = None,
         author: str | None = None,
         block_math_mode: bool = True,
+        wrapper: str | None = None,
+        wrapper_omit: bool = False,
     ) -> None: ...
 
 def latex_to_typst(

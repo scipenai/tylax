@@ -66,6 +66,11 @@ struct L2TOptions {
     non_strict: bool,
     optimize: bool,
     expand_macros: bool,
+    /// If set, replaces the default `#set page/heading/math.equation`
+    /// block with this string. Ignored when `preamble_omit` is `True`.
+    preamble: Option<String>,
+    /// `True` ⇒ emit no style preamble at all. Takes precedence over `preamble`.
+    preamble_omit: bool,
 }
 
 #[pymethods]
@@ -80,7 +85,10 @@ impl L2TOptions {
         non_strict = true,
         optimize = true,
         expand_macros = true,
+        preamble = None,
+        preamble_omit = false,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         prefer_shorthands: bool,
         frac_to_slash: bool,
@@ -89,6 +97,8 @@ impl L2TOptions {
         non_strict: bool,
         optimize: bool,
         expand_macros: bool,
+        preamble: Option<String>,
+        preamble_omit: bool,
     ) -> Self {
         Self {
             prefer_shorthands,
@@ -98,13 +108,27 @@ impl L2TOptions {
             non_strict,
             optimize,
             expand_macros,
+            preamble,
+            preamble_omit,
         }
     }
 }
 
-impl From<&L2TOptions> for tylax::L2TOptions {
-    fn from(py: &L2TOptions) -> Self {
-        tylax::L2TOptions {
+impl TryFrom<&L2TOptions> for tylax::L2TOptions {
+    type Error = pyo3::PyErr;
+
+    fn try_from(py: &L2TOptions) -> Result<Self, Self::Error> {
+        let preamble = match (py.preamble_omit, py.preamble.as_deref()) {
+            (true, Some(_)) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "preamble_omit=True conflicts with preamble=...; pick one",
+                ));
+            }
+            (true, None) => tylax::PreambleMode::None,
+            (false, Some(text)) => tylax::PreambleMode::Custom(text.to_string()),
+            (false, None) => tylax::PreambleMode::Default,
+        };
+        Ok(tylax::L2TOptions {
             prefer_shorthands: py.prefer_shorthands,
             frac_to_slash: py.frac_to_slash,
             infty_to_oo: py.infty_to_oo,
@@ -112,7 +136,8 @@ impl From<&L2TOptions> for tylax::L2TOptions {
             non_strict: py.non_strict,
             optimize: py.optimize,
             expand_macros: py.expand_macros,
-        }
+            preamble,
+        })
     }
 }
 
@@ -123,6 +148,12 @@ struct T2LOptions {
     title: Option<String>,
     author: Option<String>,
     block_math_mode: bool,
+    /// LaTeX wrapper template. Must contain the literal `{body}` placeholder.
+    /// When set, replaces the default `\documentclass`/packages/`\begin{document}`
+    /// wrapper.
+    wrapper: Option<String>,
+    /// True ⇒ emit only the converted body. Overrides `wrapper`.
+    wrapper_omit: bool,
 }
 
 #[pymethods]
@@ -134,24 +165,53 @@ impl T2LOptions {
         title = None,
         author = None,
         block_math_mode = true,
+        wrapper = None,
+        wrapper_omit = false,
     ))]
     fn new(
         document_class: String,
         title: Option<String>,
         author: Option<String>,
         block_math_mode: bool,
+        wrapper: Option<String>,
+        wrapper_omit: bool,
     ) -> Self {
         Self {
             document_class,
             title,
             author,
             block_math_mode,
+            wrapper,
+            wrapper_omit,
         }
     }
 }
 
-fn build_t2l_options(document: bool, py: Option<&T2LOptions>) -> tylax::T2LOptions {
-    tylax::T2LOptions {
+fn build_l2t_options(py: Option<&L2TOptions>) -> PyResult<tylax::L2TOptions> {
+    match py {
+        Some(o) => tylax::L2TOptions::try_from(o),
+        None => Ok(tylax::L2TOptions::default()),
+    }
+}
+
+fn build_t2l_options(document: bool, py: Option<&T2LOptions>) -> PyResult<tylax::T2LOptions> {
+    let wrapper_omit = py.is_some_and(|o| o.wrapper_omit);
+    let wrapper_template = py.and_then(|o| o.wrapper.clone());
+    let wrapper = match (wrapper_omit, wrapper_template) {
+        (true, Some(_)) => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "wrapper_omit=True conflicts with wrapper=...; pick one",
+            ));
+        }
+        (true, None) => tylax::DocumentWrapperMode::BodyOnly,
+        (false, Some(template)) => {
+            tylax::DocumentWrapperMode::from_template(&template).map_err(|msg| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid wrapper: {}", msg))
+            })?
+        }
+        (false, None) => tylax::DocumentWrapperMode::Default,
+    };
+    Ok(tylax::T2LOptions {
         full_document: document,
         math_only: !document,
         document_class: py
@@ -160,7 +220,8 @@ fn build_t2l_options(document: bool, py: Option<&T2LOptions>) -> tylax::T2LOptio
         title: py.and_then(|o| o.title.clone()),
         author: py.and_then(|o| o.author.clone()),
         block_math_mode: py.map(|o| o.block_math_mode).unwrap_or(true),
-    }
+        wrapper,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -196,24 +257,24 @@ fn map_t2l_warning(w: &tylax::core::typst2latex::ConversionWarning) -> Conversio
 
 #[pyfunction]
 #[pyo3(signature = (text, *, document = false, options = None))]
-fn latex_to_typst(text: &str, document: bool, options: Option<&L2TOptions>) -> String {
-    let opts: tylax::L2TOptions = options.map(Into::into).unwrap_or_default();
-    if document {
+fn latex_to_typst(text: &str, document: bool, options: Option<&L2TOptions>) -> PyResult<String> {
+    let opts = build_l2t_options(options)?;
+    Ok(if document {
         tylax::latex_document_to_typst_with_options(text, &opts)
     } else {
         tylax::latex_to_typst_with_options(text, &opts)
-    }
+    })
 }
 
 #[pyfunction]
 #[pyo3(signature = (text, *, document = false, options = None))]
-fn typst_to_latex(text: &str, document: bool, options: Option<&T2LOptions>) -> String {
-    let opts = build_t2l_options(document, options);
-    if document {
+fn typst_to_latex(text: &str, document: bool, options: Option<&T2LOptions>) -> PyResult<String> {
+    let opts = build_t2l_options(document, options)?;
+    Ok(if document {
         tylax::typst_to_latex_with_eval(text, &opts)
     } else {
         tylax::typst_to_latex_with_options(text, &opts)
-    }
+    })
 }
 
 #[pyfunction]
@@ -222,18 +283,18 @@ fn latex_to_typst_diagnostics(
     text: &str,
     document: bool,
     options: Option<&L2TOptions>,
-) -> ConversionResult {
-    let opts: tylax::L2TOptions = options.map(Into::into).unwrap_or_default();
+) -> PyResult<ConversionResult> {
+    let opts = build_l2t_options(options)?;
     let mut converter = tylax::LatexConverter::with_options(opts);
     let result = if document {
         converter.convert_document_with_diagnostics(text)
     } else {
         converter.convert_math_with_diagnostics(text)
     };
-    ConversionResult {
+    Ok(ConversionResult {
         output: result.output,
         warnings: result.warnings.iter().map(map_l2t_warning).collect(),
-    }
+    })
 }
 
 #[pyfunction]
@@ -242,13 +303,13 @@ fn typst_to_latex_diagnostics(
     text: &str,
     document: bool,
     options: Option<&T2LOptions>,
-) -> ConversionResult {
-    let opts = build_t2l_options(document, options);
+) -> PyResult<ConversionResult> {
+    let opts = build_t2l_options(document, options)?;
     let result = tylax::typst_to_latex_with_diagnostics(text, &opts);
-    ConversionResult {
+    Ok(ConversionResult {
         output: result.output,
         warnings: result.warnings.iter().map(map_t2l_warning).collect(),
-    }
+    })
 }
 
 #[pyfunction]

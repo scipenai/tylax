@@ -4,6 +4,46 @@
 
 use std::collections::HashMap;
 
+/// Controls how the document wrapper (`\documentclass` + `\usepackage`s +
+/// `\begin{document}` ... `\end{document}`) is emitted around the body
+/// when `T2LOptions::full_document` is `true`.
+///
+/// Has no effect when `full_document` is `false` (math-only / fragment mode).
+#[derive(Debug, Clone, Default)]
+pub enum DocumentWrapperMode {
+    /// Emit the default LaTeX wrapper (article class, common packages,
+    /// geometry, `\begin{document}` / `\end{document}`).
+    #[default]
+    Default,
+    /// Emit only the converted body. No `\documentclass`, no packages,
+    /// no `\begin{document}` / `\end{document}`.
+    BodyOnly,
+    /// Emit `before_body` + body + `after_body`. The caller is responsible
+    /// for any `\documentclass`, `\begin{document}` / `\end{document}`,
+    /// and package setup.
+    Custom {
+        before_body: String,
+        after_body: String,
+    },
+}
+
+impl DocumentWrapperMode {
+    /// Build a [`DocumentWrapperMode::Custom`] from a single template
+    /// string containing the literal placeholder `{body}`.
+    ///
+    /// Returns an error if the placeholder is missing — silently appending
+    /// the body would mask user mistakes.
+    pub fn from_template(template: &str) -> Result<Self, &'static str> {
+        match template.split_once("{body}") {
+            Some((before, after)) => Ok(DocumentWrapperMode::Custom {
+                before_body: before.to_string(),
+                after_body: after.to_string(),
+            }),
+            None => Err("wrapper template must contain `{body}` placeholder"),
+        }
+    }
+}
+
 /// Options for Typst to LaTeX conversion
 #[derive(Debug, Clone)]
 pub struct T2LOptions {
@@ -20,6 +60,9 @@ pub struct T2LOptions {
     /// Whether we're in block math mode (affects display/inline conversion)
     /// true = block math mode (default), false = inline math mode
     pub block_math_mode: bool,
+    /// Controls the LaTeX document wrapper when `full_document` is true.
+    /// Default: [`DocumentWrapperMode::Default`].
+    pub wrapper: DocumentWrapperMode,
 }
 
 impl Default for T2LOptions {
@@ -31,6 +74,7 @@ impl Default for T2LOptions {
             author: None,
             math_only: false,
             block_math_mode: true,
+            wrapper: DocumentWrapperMode::Default,
         }
     }
 }
