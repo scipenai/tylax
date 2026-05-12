@@ -257,6 +257,18 @@ mod tests {
     }
 
     #[test]
+    fn test_latex_to_typst_unbraced_command_args() {
+        assert_eq!(latex_to_typst(r"\frac 12"), "1/2");
+        assert_eq!(latex_to_typst(r"\frac 1{1-A}"), "frac(1, 1 - A)");
+        assert_eq!(latex_to_typst(r"\frac {1-A}A"), "frac(1 - A, A)");
+        assert_eq!(latex_to_typst(r"\frac {A+2}{1-A}"), "frac(A + 2, 1 - A)");
+        assert_eq!(latex_to_typst(r"\sqrt 2"), "sqrt(2)");
+        assert_eq!(latex_to_typst(r"\sqrt 12"), "sqrt(1)2");
+        assert_eq!(latex_to_typst(r"\sqrt {12}"), "sqrt(1 2)");
+        assert_eq!(latex_to_typst(r"\sqrt{12}"), "sqrt(1 2)");
+    }
+
+    #[test]
     fn test_typst_to_latex_basic() {
         let result = typst_to_latex("alpha + beta");
         assert!(result.contains("alpha"));

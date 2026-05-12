@@ -897,14 +897,19 @@ impl LatexConverter {
     pub fn get_required_arg(&self, cmd: &CmdItem, index: usize) -> Option<String> {
         let mut required_count = 0;
         for child in cmd.syntax().children() {
-            if child.kind() == SyntaxKind::ClauseArgument {
-                let is_curly = child.children().any(|c| c.kind() == SyntaxKind::ItemCurly);
-                if is_curly {
-                    if required_count == index {
-                        return Some(extract_arg_content(&child));
-                    }
-                    required_count += 1;
+            if child.kind() == SyntaxKind::ClauseArgument
+                && !child
+                    .children()
+                    .any(|c| c.kind() == SyntaxKind::ItemBracket)
+                && !matches!(
+                    child.first_token().map(|t| t.kind()),
+                    Some(SyntaxKind::TokenLBracket)
+                )
+            {
+                if required_count == index {
+                    return Some(extract_arg_content(&child));
                 }
+                required_count += 1;
             }
         }
         None
@@ -914,14 +919,19 @@ impl LatexConverter {
     pub fn get_required_arg_with_braces(&self, cmd: &CmdItem, index: usize) -> Option<String> {
         let mut required_count = 0;
         for child in cmd.syntax().children() {
-            if child.kind() == SyntaxKind::ClauseArgument {
-                let is_curly = child.children().any(|c| c.kind() == SyntaxKind::ItemCurly);
-                if is_curly {
-                    if required_count == index {
-                        return Some(extract_arg_content_with_braces(&child));
-                    }
-                    required_count += 1;
+            if child.kind() == SyntaxKind::ClauseArgument
+                && !child
+                    .children()
+                    .any(|c| c.kind() == SyntaxKind::ItemBracket)
+                && !matches!(
+                    child.first_token().map(|t| t.kind()),
+                    Some(SyntaxKind::TokenLBracket)
+                )
+            {
+                if required_count == index {
+                    return Some(extract_arg_content_with_braces(&child));
                 }
+                required_count += 1;
             }
         }
         None
@@ -950,29 +960,29 @@ impl LatexConverter {
     pub fn convert_required_arg(&mut self, cmd: &CmdItem, index: usize) -> Option<String> {
         let mut required_count = 0;
         for child in cmd.syntax().children() {
-            if child.kind() == SyntaxKind::ClauseArgument {
-                let is_curly = child.children().any(|c| c.kind() == SyntaxKind::ItemCurly);
-                if is_curly {
-                    if required_count == index {
-                        let mut output = String::new();
-                        for arg_child in child.children() {
-                            if arg_child.kind() == SyntaxKind::ItemCurly {
-                                for content in arg_child.children_with_tokens() {
-                                    match content.kind() {
-                                        SyntaxKind::TokenLBrace | SyntaxKind::TokenRBrace => {
-                                            continue
-                                        }
-                                        _ => {
-                                            self.visit_element(content, &mut output);
-                                        }
-                                    }
-                                }
-                            }
+            if child.kind() == SyntaxKind::ClauseArgument
+                && !child
+                    .children()
+                    .any(|c| c.kind() == SyntaxKind::ItemBracket)
+                && !matches!(
+                    child.first_token().map(|t| t.kind()),
+                    Some(SyntaxKind::TokenLBracket)
+                )
+            {
+                if required_count == index {
+                    let mut output = String::new();
+                    for content in child.children_with_tokens() {
+                        match content.kind() {
+                            SyntaxKind::TokenLBrace
+                            | SyntaxKind::TokenRBrace
+                            | SyntaxKind::TokenLBracket
+                            | SyntaxKind::TokenRBracket => continue,
+                            _ => self.visit_element(content, &mut output),
                         }
-                        return Some(output.trim().to_string());
                     }
-                    required_count += 1;
+                    return Some(output.trim().to_string());
                 }
+                required_count += 1;
             }
         }
         None
