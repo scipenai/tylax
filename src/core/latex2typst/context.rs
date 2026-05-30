@@ -392,6 +392,31 @@ pub struct LatexConverter {
     pub(crate) spec: CommandSpec,
 }
 
+/// A `ClauseArgument` is a *required* argument iff it does not carry an
+/// optional-bracket payload. This covers both braced (`{...}`) and unbraced
+/// single-token forms (`\frac 12`, `\frac\alpha\beta`, `\hat x`).
+///
+/// Two signals indicate a *non*-required (optional `[...]`) clause:
+///   - the clause has an `ItemBracket` child (well-formed `[...]`)
+///   - or the clause's first token is `[`, which happens when mitex parses a
+///     command from the merged spec where the user wrote `[` without a matching
+///     `]` consumable within the argument boundary (e.g. `\citep[see]{a}` - the
+///     `[see]` is not part of the required-arg slot in mitex's spec, so the
+///     parser emits a `ClauseArgument` containing only the bare `[` token).
+///     We must reject this case, or downstream code mistakes `"["` for the
+///     real required argument and the citation handler in `markup.rs` is
+///     bypassed.
+fn is_required_clause(child: &SyntaxNode) -> bool {
+    child.kind() == SyntaxKind::ClauseArgument
+        && !child
+            .children()
+            .any(|c| c.kind() == SyntaxKind::ItemBracket)
+        && !matches!(
+            child.first_token().map(|t| t.kind()),
+            Some(SyntaxKind::TokenLBracket)
+        )
+}
+
 impl LatexConverter {
     /// Create a new converter with default options
     pub fn new() -> Self {
@@ -897,14 +922,11 @@ impl LatexConverter {
     pub fn get_required_arg(&self, cmd: &CmdItem, index: usize) -> Option<String> {
         let mut required_count = 0;
         for child in cmd.syntax().children() {
-            if child.kind() == SyntaxKind::ClauseArgument {
-                let is_curly = child.children().any(|c| c.kind() == SyntaxKind::ItemCurly);
-                if is_curly {
-                    if required_count == index {
-                        return Some(extract_arg_content(&child));
-                    }
-                    required_count += 1;
+            if is_required_clause(&child) {
+                if required_count == index {
+                    return Some(extract_arg_content(&child));
                 }
+                required_count += 1;
             }
         }
         None
@@ -914,14 +936,11 @@ impl LatexConverter {
     pub fn get_required_arg_with_braces(&self, cmd: &CmdItem, index: usize) -> Option<String> {
         let mut required_count = 0;
         for child in cmd.syntax().children() {
-            if child.kind() == SyntaxKind::ClauseArgument {
-                let is_curly = child.children().any(|c| c.kind() == SyntaxKind::ItemCurly);
-                if is_curly {
-                    if required_count == index {
-                        return Some(extract_arg_content_with_braces(&child));
-                    }
-                    required_count += 1;
+            if is_required_clause(&child) {
+                if required_count == index {
+                    return Some(extract_arg_content_with_braces(&child));
                 }
+                required_count += 1;
             }
         }
         None
@@ -950,29 +969,21 @@ impl LatexConverter {
     pub fn convert_required_arg(&mut self, cmd: &CmdItem, index: usize) -> Option<String> {
         let mut required_count = 0;
         for child in cmd.syntax().children() {
-            if child.kind() == SyntaxKind::ClauseArgument {
-                let is_curly = child.children().any(|c| c.kind() == SyntaxKind::ItemCurly);
-                if is_curly {
-                    if required_count == index {
-                        let mut output = String::new();
-                        for arg_child in child.children() {
-                            if arg_child.kind() == SyntaxKind::ItemCurly {
-                                for content in arg_child.children_with_tokens() {
-                                    match content.kind() {
-                                        SyntaxKind::TokenLBrace | SyntaxKind::TokenRBrace => {
-                                            continue
-                                        }
-                                        _ => {
-                                            self.visit_element(content, &mut output);
-                                        }
-                                    }
-                                }
-                            }
+            if is_required_clause(&child) {
+                if required_count == index {
+                    let mut output = String::new();
+                    for content in child.children_with_tokens() {
+                        match content.kind() {
+                            SyntaxKind::TokenLBrace
+                            | SyntaxKind::TokenRBrace
+                            | SyntaxKind::TokenLBracket
+                            | SyntaxKind::TokenRBracket => continue,
+                            _ => self.visit_element(content, &mut output),
                         }
-                        return Some(output.trim().to_string());
                     }
-                    required_count += 1;
+                    return Some(output.trim().to_string());
                 }
+                required_count += 1;
             }
         }
         None
