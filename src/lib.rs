@@ -269,6 +269,27 @@ mod tests {
     }
 
     #[test]
+    fn test_latex_to_typst_unbraced_command_args_extended() {
+        // Command tokens as required args - the bug went wider than \frac/\sqrt:
+        // any command taking a required arg was skipped when given an unbraced
+        // command token (before the fix, the converter only counted braced args).
+        assert_eq!(latex_to_typst(r"\frac\alpha\beta"), "alpha/ beta");
+        assert_eq!(latex_to_typst(r"\frac\alpha 2"), "alpha/2");
+        assert_eq!(latex_to_typst(r"\sqrt\alpha"), "sqrt(alpha)");
+
+        // Accent / over-line commands with unbraced single token
+        assert_eq!(latex_to_typst(r"\hat x"), "hat(x)");
+        assert_eq!(latex_to_typst(r"\overline x"), "overline(x)");
+
+        // Optional bracket arg + unbraced required arg combination
+        assert_eq!(latex_to_typst(r"\sqrt[3]2"), "root(3, 2)");
+        assert_eq!(latex_to_typst(r"\sqrt[3]{8}"), "root(3, 8)");
+
+        // \binom with unbraced args
+        assert_eq!(latex_to_typst(r"\binom n k"), "binom(n, k)");
+    }
+
+    #[test]
     fn test_typst_to_latex_basic() {
         let result = typst_to_latex("alpha + beta");
         assert!(result.contains("alpha"));
