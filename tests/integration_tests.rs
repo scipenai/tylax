@@ -650,6 +650,25 @@ mod l2t_math {
     }
 
     #[test]
+    fn test_spacing_commands_consume_dimension_arguments() {
+        // hspace/vspace and their starred variants must be registered as 1-arg
+        // commands so mitex consumes the dimension instead of leaking it
+        // (e.g. "#h()1 e m A" instead of "#h(1em)A").
+        assert!(latex_to_typst(r"\hspace{1em}A").contains("#h(1em)"));
+        assert!(latex_to_typst(r"\hspace*{3em}C").contains("#h(3em)"));
+        assert!(latex_to_typst(r"\vspace{1em}A").contains("#v(1em)"));
+        assert!(latex_to_typst(r"\vspace*{3em}C").contains("#v(3em)"));
+    }
+
+    #[test]
+    fn test_epsilon_variants_map_to_correct_typst_glyphs() {
+        // LaTeX \epsilon is the lunate form (Typst epsilon.alt); \varepsilon is
+        // the curly form (Typst epsilon). The mappings were previously swapped.
+        assert_eq!(latex_to_typst(r"\epsilon").trim(), "epsilon.alt");
+        assert_eq!(latex_to_typst(r"\varepsilon").trim(), "epsilon");
+    }
+
+    #[test]
     fn test_text_in_math() {
         let result = latex_to_typst(r"\text{hello}");
         assert!(!result.contains("Error"));
@@ -868,6 +887,14 @@ mod t2l_math {
         let result = typst_to_latex("alpha + beta = gamma");
         assert!(result.contains("alpha") || result.contains("\\alpha"));
         assert!(result.contains("beta") || result.contains("\\beta"));
+    }
+
+    #[test]
+    fn test_epsilon_variants_map_to_correct_latex_commands() {
+        // Inverse of the L2T mapping: Typst epsilon (curly) -> \varepsilon,
+        // Typst epsilon.alt (lunate) -> \epsilon. Locks the round-trip.
+        assert_eq!(typst_to_latex("$epsilon$").trim(), r"$\varepsilon$");
+        assert_eq!(typst_to_latex("$epsilon.alt$").trim(), r"$\epsilon$");
     }
 
     #[test]
