@@ -669,6 +669,16 @@ mod l2t_math {
     }
 
     #[test]
+    fn test_empty_required_args_are_zws_padded() {
+        // Empty groups must be padded with a zero-width space so the surrounding
+        // Typst construct stays valid: `frac(zws, zws)` not the invalid
+        // `frac(,)`, `sqrt(zws)` not `sqrt()`.
+        assert_eq!(latex_to_typst(r"\frac{}{}").trim(), "zws/zws");
+        assert_eq!(latex_to_typst(r"\sqrt{}").trim(), "sqrt(zws)");
+        assert!(latex_to_typst(r"\overset{}{=}").contains("zws"));
+    }
+
+    #[test]
     fn test_text_in_math() {
         let result = latex_to_typst(r"\text{hello}");
         assert!(!result.contains("Error"));
