@@ -368,6 +368,27 @@ mod l2t_math {
     }
 
     #[test]
+    fn test_math_slash_passes_through_literally() {
+        // Math-mode slash escaping (LaTeX `a/b` -> Typst `a\/b`) is intentionally
+        // deferred: it would change every existing user's math output, so it is
+        // tracked separately as an opt-in L2TOptions toggle. Until then `/` is
+        // emitted literally and must NOT be escaped.
+        let inline = latex_to_typst("$a/b$");
+        assert!(inline.contains('/'), "got: {}", inline);
+        assert!(
+            !inline.contains(r"\/"),
+            "slash must not be escaped, got: {}",
+            inline
+        );
+    }
+
+    #[test]
+    fn test_fraction_with_unbraced_term_arguments() {
+        assert_eq!(latex_to_typst(r"\frac{a}b").trim(), "a/b");
+        assert_eq!(latex_to_typst(r"\frac12").trim(), "1/2");
+    }
+
+    #[test]
     fn test_sqrt() {
         let result = latex_to_typst(r"\sqrt{x}");
         assert!(result.contains("sqrt") || result.contains("root"));
@@ -401,12 +422,40 @@ mod l2t_math {
     }
 
     #[test]
+    fn test_overset_with_unbraced_symbol_base() {
+        assert_eq!(
+            latex_to_typst(r"\overset{p}\sim").trim(),
+            "limits(tilde)^(p)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\overset{p}{\sim}").trim(),
+            "limits(tilde)^(p)"
+        );
+    }
+
+    #[test]
     fn test_matrices() {
         let result = latex_to_typst(r"\begin{pmatrix} a & b \\ c & d \end{pmatrix}");
         assert!(!result.contains("Error"));
 
         let result = latex_to_typst(r"\begin{bmatrix} 1 & 2 \\ 3 & 4 \end{bmatrix}");
         assert!(!result.contains("Error"));
+    }
+
+    #[test]
+    fn test_cases_escapes_source_commas() {
+        let result = latex_to_typst(
+            r"\begin{cases}
+        0,& i\ne j,\\
+        1,& i=j.
+        \end{cases}",
+        );
+
+        assert!(
+            result.contains(r"cases(0\,& i != j\,, 1\,& i = j .)"),
+            "source commas inside cases should be escaped, got: {}",
+            result
+        );
     }
 
     #[test]
@@ -590,6 +639,43 @@ mod l2t_math {
                 result
             );
         }
+    }
+
+    #[test]
+    fn test_dots_commands() {
+        assert_eq!(latex_to_typst(r"\ldots").trim(), "...");
+        // \cdots maps to dots.h.c (horizontal centered dots), aligned with the
+        // mapping merged via #24.
+        assert_eq!(latex_to_typst(r"\cdots").trim(), "dots.h.c");
+    }
+
+    #[test]
+    fn test_spacing_commands_consume_dimension_arguments() {
+        // hspace/vspace and their starred variants must be registered as 1-arg
+        // commands so mitex consumes the dimension instead of leaking it
+        // (e.g. "#h()1 e m A" instead of "#h(1em)A").
+        assert!(latex_to_typst(r"\hspace{1em}A").contains("#h(1em)"));
+        assert!(latex_to_typst(r"\hspace*{3em}C").contains("#h(3em)"));
+        assert!(latex_to_typst(r"\vspace{1em}A").contains("#v(1em)"));
+        assert!(latex_to_typst(r"\vspace*{3em}C").contains("#v(3em)"));
+    }
+
+    #[test]
+    fn test_epsilon_variants_map_to_correct_typst_glyphs() {
+        // LaTeX \epsilon is the lunate form (Typst epsilon.alt); \varepsilon is
+        // the curly form (Typst epsilon). The mappings were previously swapped.
+        assert_eq!(latex_to_typst(r"\epsilon").trim(), "epsilon.alt");
+        assert_eq!(latex_to_typst(r"\varepsilon").trim(), "epsilon");
+    }
+
+    #[test]
+    fn test_empty_required_args_are_zws_padded() {
+        // Empty groups must be padded with a zero-width space so the surrounding
+        // Typst construct stays valid: `frac(zws, zws)` not the invalid
+        // `frac(,)`, `sqrt(zws)` not `sqrt()`.
+        assert_eq!(latex_to_typst(r"\frac{}{}").trim(), "zws/zws");
+        assert_eq!(latex_to_typst(r"\sqrt{}").trim(), "sqrt(zws)");
+        assert!(latex_to_typst(r"\overset{}{=}").contains("zws"));
     }
 
     #[test]
@@ -811,6 +897,14 @@ mod t2l_math {
         let result = typst_to_latex("alpha + beta = gamma");
         assert!(result.contains("alpha") || result.contains("\\alpha"));
         assert!(result.contains("beta") || result.contains("\\beta"));
+    }
+
+    #[test]
+    fn test_epsilon_variants_map_to_correct_latex_commands() {
+        // Inverse of the L2T mapping: Typst epsilon (curly) -> \varepsilon,
+        // Typst epsilon.alt (lunate) -> \epsilon. Locks the round-trip.
+        assert_eq!(typst_to_latex("$epsilon$").trim(), r"$\varepsilon$");
+        assert_eq!(typst_to_latex("$epsilon.alt$").trim(), r"$\epsilon$");
     }
 
     #[test]
@@ -2939,6 +3033,10 @@ mod l2t_citation_refs {
     fn test_l2t_reference_variants() {
         assert_eq!(latex_to_typst(r#"\eqref{energy}"#).trim(), "@eq-energy");
         assert_eq!(latex_to_typst(r#"\ref{fig:one}"#).trim(), "@fig-one");
+        assert_eq!(
+            latex_to_typst(r#"\hyperref[intro]{custom text}"#).trim(),
+            "#link(<intro>)[custom text]"
+        );
         let pageref = latex_to_typst(r#"\pageref{fig:one}"#);
         assert!(
             pageref.contains("#locate") && pageref.contains("@fig-one.page()"),

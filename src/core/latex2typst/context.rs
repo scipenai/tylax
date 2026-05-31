@@ -866,7 +866,16 @@ impl LatexConverter {
                 }
             }
             TokenApostrophe => output.push('\''),
-            TokenComma => output.push(','),
+            TokenComma => {
+                if matches!(self.state.current_env(), EnvironmentContext::Cases) {
+                    while output.ends_with(char::is_whitespace) {
+                        output.pop();
+                    }
+                    output.push_str("\\,");
+                } else {
+                    output.push(',');
+                }
+            }
             TokenSlash => output.push('/'),
             TokenAsterisk => {
                 if let Some(ref mut op) = self.state.pending_op {
@@ -965,7 +974,12 @@ impl LatexConverter {
         None
     }
 
-    /// Convert a required argument - recursively processes the content
+    /// Convert a required argument - recursively processes the content.
+    ///
+    /// Handles both braced (`{...}`) and unbraced single-token arguments. Empty
+    /// groups are padded with a zero-width space by `visit_element`, keeping the
+    /// surrounding Typst construct valid (e.g. `frac(zws, zws)` instead of the
+    /// invalid `frac(,)`).
     pub fn convert_required_arg(&mut self, cmd: &CmdItem, index: usize) -> Option<String> {
         let mut required_count = 0;
         for child in cmd.syntax().children() {
@@ -987,6 +1001,13 @@ impl LatexConverter {
             }
         }
         None
+    }
+
+    /// Convert a required *term* argument such as `b` in `\frac{a}b` or `\sim`
+    /// in `\overset{p}\sim`. Thin alias of [`Self::convert_required_arg`], which
+    /// already handles unbraced single-token terms (and pads empty groups).
+    pub fn convert_required_term_arg(&mut self, cmd: &CmdItem, index: usize) -> Option<String> {
+        self.convert_required_arg(cmd, index)
     }
 
     /// Get a required argument from a command and convert it to Typst
@@ -1089,7 +1110,7 @@ impl LatexConverter {
         result = result.replace(" ^", "^");
         result = result.replace(" _", "_");
 
-        result
+        result.trim().to_string()
     }
 
     /// Fix missing spaces before Typst symbol names.
