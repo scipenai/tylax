@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-07-18
+
+### Fixed
+- **L2T math**: fixed literal slash (`/` to `slash`), brace annotations (`underbrace(x, y)` / `overbrace(x, y)`), escaped commas in `cases`, and current Typst `.o` spellings for circled operators.
+- **L2T commands**: `\hspace`, `\hspace*`, `\vspace`, and `\vspace*` consume dimension arguments; `\hyperref[target]{text}` emits `#link(<target>)[text]`.
+- **L2T physics**: bra-ket commands (`\ket`, `\bra`, `\braket`, `\dyad`, `\expval`, `\mel`, ...) use valid `chevron.l` / `chevron.r` delimiters.
+- **References**: multi-key `\cite{a,b}` splits into separate Typst `#cite(...)` calls, with shared postnotes attached to the last key.
+- **Greek variants**: `\epsilon` / `\varepsilon` map to Typst `epsilon.alt` / `epsilon`, with matching T2L reverse mappings.
+- **T2L line breaks**: aligned Typst math line breaks emit LaTeX `\\`, including from the WASM/web math entrypoint, while inline fragments keep a bare `\`.
+
 ## [0.3.6] - 2026-05-05
 
 ### Fixed
@@ -138,7 +148,8 @@ This release is a major overhaul of the core conversion logic, introducing prope
 - CLI tool (`t2l`)
 - Structured error handling with warnings
 
-[Unreleased]: https://github.com/scipenai/tylax/compare/v0.3.6...HEAD
+[Unreleased]: https://github.com/scipenai/tylax/compare/v0.3.7...HEAD
+[0.3.7]: https://github.com/scipenai/tylax/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/scipenai/tylax/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/scipenai/tylax/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/scipenai/tylax/compare/v0.3.3...v0.3.4
