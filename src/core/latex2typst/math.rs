@@ -2,12 +2,13 @@
 //!
 //! This module handles math formulas, delimiters, and math-specific constructs.
 
-use mitex_parser::syntax::{FormulaItem, SyntaxElement, SyntaxKind, SyntaxNode};
+use mitex_parser::syntax::{CmdItem, FormulaItem, SyntaxElement, SyntaxKind, SyntaxNode};
 use rowan::ast::AstNode;
 use std::fmt::Write;
 
 use super::context::{ConversionMode, LatexConverter};
 use super::environment::{convert_array_with_delim, convert_matrix_with_delim};
+use super::utils::protect_top_level_comma;
 
 /// Convert a math formula ($..$ or $$..$$)
 pub fn convert_formula(conv: &mut LatexConverter, elem: SyntaxElement, output: &mut String) {
@@ -506,6 +507,15 @@ pub fn convert_attachment(conv: &mut LatexConverter, elem: SyntaxElement, output
         _ => return,
     };
 
+    // `\underbrace{body}_{label}` / `\overbrace{body}^{label}` parse as an
+    // attachment whose nucleus is the brace command and whose script is the
+    // label. Typst takes the label as a second positional argument, so fold it
+    // in (`underbrace(body, label)`) instead of emitting a literal script.
+    if let Some(folded) = fold_brace_annotation(conv, &node) {
+        output.push_str(&folded);
+        return;
+    }
+
     let mut is_script = false;
 
     for child in node.children_with_tokens() {
@@ -543,6 +553,89 @@ pub fn convert_attachment(conv: &mut LatexConverter, elem: SyntaxElement, output
             conv.visit_element(child, output);
         }
     }
+}
+
+/// Fold a `\underbrace`/`\overbrace` brace annotation into Typst's second
+/// positional argument.
+///
+/// The attachment parses as `ItemAttachComponent[ ClauseArgument[ ItemCmd ],
+/// marker, script ]`, where the nucleus is the brace command and the script is
+/// the label. Emitting it verbatim yields `underbrace(body)_(label)`, which
+/// renders the label as a real subscript instead of the brace label; Typst
+/// expects `underbrace(body, label)`.
+///
+/// Only the canonical pairings fold: `\underbrace` with `_`, `\overbrace` with
+/// `^`. Any other shape (non-brace nucleus, the opposite/extra script) returns
+/// `None` so the generic attachment handling applies unchanged.
+fn fold_brace_annotation(conv: &mut LatexConverter, node: &SyntaxNode) -> Option<String> {
+    let mut nucleus: Option<SyntaxNode> = None;
+    let mut marker: Option<SyntaxKind> = None;
+    let mut script: Option<SyntaxElement> = None;
+
+    for child in node.children_with_tokens() {
+        match child.kind() {
+            SyntaxKind::TokenWhiteSpace | SyntaxKind::TokenLineBreak => continue,
+            kind @ (SyntaxKind::TokenUnderscore | SyntaxKind::TokenCaret) => {
+                if marker.is_some() {
+                    return None; // a second script (e.g. `_a^b`): not a plain label
+                }
+                marker = Some(kind);
+            }
+            _ if marker.is_none() => {
+                if nucleus.is_some() {
+                    return None; // unexpected extra content before the script
+                }
+                nucleus = Some(child.into_node()?);
+            }
+            _ => {
+                if script.is_some() {
+                    return None; // unexpected extra content after the script
+                }
+                script = Some(child);
+            }
+        }
+    }
+
+    let marker = marker?;
+    // The nucleus command is wrapped in a `ClauseArgument`; descend to the
+    // `ItemCmd` (also accept a bare `ItemCmd` defensively).
+    let nucleus = nucleus?;
+    let cmd_node = if nucleus.kind() == SyntaxKind::ItemCmd {
+        nucleus
+    } else {
+        nucleus
+            .children()
+            .find(|n| n.kind() == SyntaxKind::ItemCmd)?
+    };
+    let cmd = CmdItem::cast(cmd_node)?;
+    let name = cmd.name_tok()?.text().trim_start_matches('\\').to_string();
+
+    // Non-canonical pairings (e.g. `\underbrace{..}^{..}`) are returned to the
+    // generic attachment handler untouched. We bail out *before* converting so
+    // that path sees an unconsumed nucleus/script.
+    let folds = matches!(
+        (name.as_str(), marker),
+        ("underbrace", SyntaxKind::TokenUnderscore) | ("overbrace", SyntaxKind::TokenCaret)
+    );
+    if !folds {
+        return None;
+    }
+
+    let script = script?;
+    let body = conv.convert_required_arg(&cmd, 0)?;
+    let previous_mode = conv.state.mode;
+    conv.state.mode = ConversionMode::Math;
+    let mut label = String::new();
+    conv.visit_element(script, &mut label);
+    conv.state.mode = previous_mode;
+
+    // A top-level comma in either operand would be read as an extra positional
+    // argument to the brace function; wrap such operands in `{}` so each stays a
+    // single argument (same protection used for `sqrt`, `root`, ...).
+    let body = protect_top_level_comma(&body);
+    let label = protect_top_level_comma(&label);
+
+    Some(format!("{}({}, {}) ", name, body, label))
 }
 
 // =============================================================================

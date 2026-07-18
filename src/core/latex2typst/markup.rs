@@ -21,7 +21,7 @@ use super::context::{
     ConversionMode, EnvironmentContext, LatexConverter, MacroDef, PendingCitation, PendingOperator,
     PendingReference,
 };
-use super::utils::{contains_top_level_separator, sanitize_label, to_roman_numeral};
+use super::utils::{protect_top_level_comma, sanitize_label, to_roman_numeral};
 use crate::features::images::ImageAttributes;
 use crate::features::refs::{
     citation_mode_from_latex_command, citation_to_typst, label_to_typst, reference_to_typst,
@@ -109,6 +109,13 @@ fn extract_wrapped_operator_name(arg: &str) -> Option<String> {
     if let Some(inner) = trimmed
         .strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'))
+    {
+        return normalize_operator_name_text(inner);
+    }
+
+    if let Some(inner) = trimmed
+        .strip_prefix("#text[")
+        .and_then(|rest| rest.strip_suffix(']'))
     {
         return normalize_operator_name_text(inner);
     }
@@ -347,24 +354,6 @@ fn lookup_symbol(name: &str) -> Option<&'static str> {
     None
 }
 
-/// Protect content that contains commas by wrapping in `{}`.
-///
-/// In Typst function calls like `sqrt(content)`, a comma inside `content`
-/// would be parsed as an argument separator. Wrapping with `{}` prevents this:
-/// - `sqrt(a, b)` → parsed as 2 arguments (error for sqrt)
-/// - `sqrt({a, b})` → parsed as 1 argument containing "a, b"
-///
-/// This function only adds `{}` when necessary (when content contains `,`).
-#[inline]
-fn protect_comma(content: &str) -> String {
-    let trimmed = content.trim();
-    if contains_top_level_separator(trimmed, ',') {
-        format!("{{{}}}", trimmed)
-    } else {
-        trimmed.to_string()
-    }
-}
-
 /// Convert a LaTeX command
 pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &mut String) {
     let node = match &elem {
@@ -584,7 +573,11 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         // Text in math - these commands output text in math mode
         "text" | "textrm" | "textup" | "textnormal" => {
             if let Some(arg) = conv.get_required_arg(&cmd, 0) {
-                let _ = write!(output, "\"{}\" ", arg);
+                if matches!(conv.state.mode, ConversionMode::Math) {
+                    let _ = write!(output, "#text[{}] ", arg);
+                } else {
+                    output.push_str(&arg);
+                }
             }
         }
 
@@ -818,7 +811,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "sqrt" => {
             let opt = conv.get_optional_arg(&cmd, 0);
             let content = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            let protected = protect_comma(&content);
+            let protected = protect_top_level_comma(&content);
             if let Some(n) = opt {
                 let _ = write!(output, "root({}, {})", n, protected);
             } else {
@@ -1419,25 +1412,27 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "ket" | "ket*" => {
             // \ket{ψ} → lr(| ψ ⟩)
             if let Some(content) = conv.convert_required_arg(&cmd, 0) {
-                let _ = write!(output, "lr(| {} angle.r)", content.trim());
+                let _ = write!(output, "lr(| {} chevron.r)", content.trim());
             }
         }
         "bra" | "bra*" => {
             // \bra{ψ} → lr(⟨ ψ |)
             if let Some(content) = conv.convert_required_arg(&cmd, 0) {
-                let _ = write!(output, "lr(angle.l {} |)", content.trim());
+                let _ = write!(output, "lr(chevron.l {} |)", content.trim());
             }
         }
         "braket" | "innerproduct" | "ip" | "braket*" => {
             // \braket{a}{b} → lr(⟨ a | b ⟩)
             // \braket{a} → lr(⟨ a | a ⟩)
             let a = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            let b = conv.convert_required_arg(&cmd, 1);
+            let b = conv
+                .convert_required_arg(&cmd, 1)
+                .filter(|value| !value.trim().is_empty());
             match b {
                 Some(b) => {
                     let _ = write!(
                         output,
-                        "lr(angle.l {} | {} angle.r)",
+                        "lr(chevron.l {} | {} chevron.r)",
                         a.trim(), b.trim()
                     );
                 }
@@ -1445,7 +1440,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                     let a_trimmed = a.trim();
                     let _ = write!(
                         output,
-                        "lr(angle.l {} | {} angle.r)",
+                        "lr(chevron.l {} | {} chevron.r)",
                         a_trimmed, a_trimmed
                     );
                 }
@@ -1459,7 +1454,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             let b_val = b.as_deref().unwrap_or(a.trim());
             let _ = write!(
                 output,
-                "lr(| {} angle.r) lr(angle.l {} |)",
+                "lr(| {} chevron.r) lr(chevron.l {} |)",
                 a.trim(), b_val.trim()
             );
         }
@@ -1472,14 +1467,14 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 Some(psi) => {
                     let _ = write!(
                         output,
-                        "lr(angle.l {} | {} | {} angle.r)",
+                        "lr(chevron.l {} | {} | {} chevron.r)",
                         psi.trim(), op.trim(), psi.trim()
                     );
                 }
                 None => {
                     let _ = write!(
                         output,
-                        "lr(angle.l {} angle.r)",
+                        "lr(chevron.l {} chevron.r)",
                         op.trim()
                     );
                 }
@@ -1490,7 +1485,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             if let Some(op) = conv.convert_required_arg(&cmd, 0) {
                 let _ = write!(
                     output,
-                    "lr(angle.l 0 | {} | 0 angle.r)",
+                    "lr(chevron.l 0 | {} | 0 chevron.r)",
                     op.trim()
                 );
             }
@@ -1502,7 +1497,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             let m = conv.convert_required_arg(&cmd, 2).unwrap_or_default();
             let _ = write!(
                 output,
-                "lr(angle.l {} | {} | {} angle.r)",
+                "lr(chevron.l {} | {} | {} chevron.r)",
                 n.trim(), a.trim(), m.trim()
             );
         }
@@ -2048,8 +2043,8 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "oint" => output.push_str("integral.cont "),
         "bigcup" => output.push_str("union.big "),
         "bigcap" => output.push_str("sect.big "),
-        "bigoplus" => output.push_str("plus.circle.big "),
-        "bigotimes" => output.push_str("times.circle.big "),
+        "bigoplus" => output.push_str("plus.o.big "),
+        "bigotimes" => output.push_str("times.o.big "),
         "bigsqcup" => output.push_str("union.sq.big "),
         "biguplus" => output.push_str("union.plus.big "),
         "bigvee" => output.push_str("or.big "),

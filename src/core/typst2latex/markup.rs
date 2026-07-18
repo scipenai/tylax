@@ -220,7 +220,12 @@ pub fn convert_content_nodes_to_latex(nodes: &[ContentNode], ctx: &mut ConvertCo
             ContentNode::Math { segments, block } => {
                 flush_typst_chunk(&mut buffer, ctx);
                 let math_source = render_math_segments_to_typst_source(segments);
-                let math_content = convert_math_source_to_latex(&math_source, &ctx.options);
+                let math_content = convert_math_source_to_latex(&math_source, &ctx.options, false);
+                let math_content = rerender_math_with_row_linebreaks_if_aligned(
+                    &math_source,
+                    &ctx.options,
+                    math_content,
+                );
                 emit_rendered_math(ctx, &math_content, *block);
             }
             other => buffer.push_str(&other.to_typst()),
@@ -230,14 +235,60 @@ pub fn convert_content_nodes_to_latex(nodes: &[ContentNode], ctx: &mut ConvertCo
     flush_typst_chunk(&mut buffer, ctx);
 }
 
-fn convert_math_source_to_latex(math_source: &str, options: &T2LOptions) -> String {
+fn convert_math_source_to_latex(
+    math_source: &str,
+    options: &T2LOptions,
+    linebreak_as_row: bool,
+) -> String {
     let wrapped = format!("${}$", math_source);
     let root = typst_syntax::parse(&wrapped);
     let mut math_ctx = ConvertContext::new();
     math_ctx.options = options.clone();
     math_ctx.in_math = true;
+    math_ctx.linebreak_as_row = linebreak_as_row;
     convert_first_math_child(&root, &mut math_ctx);
     math_ctx.finalize().trim().to_string()
+}
+
+fn rerender_math_with_row_linebreaks_if_aligned(
+    math_source: &str,
+    options: &T2LOptions,
+    rendered: String,
+) -> String {
+    if rendered.contains(" \\\n") && has_unescaped_alignment(&rendered) {
+        convert_math_source_to_latex(math_source, options, true)
+    } else {
+        rendered
+    }
+}
+
+fn convert_equation_math_to_latex(
+    node: &SyntaxNode,
+    options: &T2LOptions,
+    linebreak_as_row: bool,
+) -> String {
+    let mut math_ctx = ConvertContext::new();
+    math_ctx.options = options.clone();
+    math_ctx.in_math = true;
+    math_ctx.linebreak_as_row = linebreak_as_row;
+    for child in node.children() {
+        if child.kind() == SyntaxKind::Math {
+            convert_math_node(child, &mut math_ctx);
+        }
+    }
+    math_ctx.finalize().trim().to_string()
+}
+
+fn rerender_equation_with_row_linebreaks_if_aligned(
+    node: &SyntaxNode,
+    options: &T2LOptions,
+    rendered: String,
+) -> String {
+    if rendered.contains(" \\\n") && has_unescaped_alignment(&rendered) {
+        convert_equation_math_to_latex(node, options, true)
+    } else {
+        rendered
+    }
 }
 
 fn convert_first_math_child(node: &SyntaxNode, ctx: &mut ConvertContext) -> bool {
@@ -268,18 +319,27 @@ fn is_listings_supported(lang: &str) -> bool {
 fn has_unescaped_alignment(content: &str) -> bool {
     // Count nesting level of cases/matrix environments
     let mut depth = 0;
+    let mut brace_depth = 0;
     let mut chars = content.chars().peekable();
 
     while let Some(ch) = chars.next() {
         if ch == '\\' {
-            // Check for \begin or \end
+            // Check for \begin or \end before treating the next character as an
+            // escaped literal (for example `\&`, which is not an alignment
+            // marker).
             let rest: String = chars.clone().take(5).collect();
             if rest.starts_with("begin") {
                 depth += 1;
             } else if rest.starts_with("end") && depth > 0 {
                 depth -= 1;
+            } else {
+                let _ = chars.next();
             }
-        } else if ch == '&' && depth == 0 {
+        } else if ch == '{' {
+            brace_depth += 1;
+        } else if ch == '}' && brace_depth > 0 {
+            brace_depth -= 1;
+        } else if ch == '&' && depth == 0 && brace_depth == 0 {
             // Found an alignment marker outside of any environment
             return true;
         }
@@ -582,15 +642,12 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
             let in_table = ctx.is_in_env(&EnvironmentContext::Table);
             let is_block = !in_table && is_display_math(node);
 
-            // Convert math content to a temporary buffer first
-            let mut math_ctx = ConvertContext::new();
-            math_ctx.in_math = true;
-            for child in node.children() {
-                if child.kind() == SyntaxKind::Math {
-                    convert_math_node(child, &mut math_ctx);
-                }
-            }
-            let math_content = math_ctx.finalize().trim().to_string();
+            // Convert math content to a temporary buffer first. Start with
+            // inline-fragment linebreaks, then re-render with LaTeX row
+            // separators only when the expression is actually aligned.
+            let math_content = convert_equation_math_to_latex(node, &ctx.options, false);
+            let math_content =
+                rerender_equation_with_row_linebreaks_if_aligned(node, &ctx.options, math_content);
 
             emit_rendered_math(ctx, &math_content, is_block);
         }

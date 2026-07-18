@@ -501,7 +501,15 @@ fn emit_case_row(row: &MathCaseRow, ctx: &mut ConvertContext) {
 }
 
 fn emit_linebreak(ctx: &mut ConvertContext) {
-    emit_raw_literal(" \\\n", ctx);
+    // A Typst math line break (`\`) maps to LaTeX's `\\` row separator in a row
+    // context (`align`, top-level display). Inside an inline fragment (script,
+    // matrix cell, argument) a `\\` would be invalid, so it degrades to a bare
+    // `\` there.
+    if ctx.linebreak_as_row {
+        emit_raw_literal(" \\\\\n", ctx);
+    } else {
+        emit_raw_literal(" \\\n", ctx);
+    }
 }
 
 fn emit_raw_literal(text: &str, ctx: &mut ConvertContext) {
@@ -536,9 +544,32 @@ fn delimiter_token_type(delim: &str, is_open: bool) -> TokenType {
 #[cfg(test)]
 mod tests {
     use super::{
-        can_strip_wrapping_left_right_parens, can_strip_wrapping_plain_parens,
+        can_strip_wrapping_left_right_parens, can_strip_wrapping_plain_parens, emit_math_ir,
         emit_math_ir_to_string, ConvertContext, MathIr, MathSpacing,
     };
+
+    #[test]
+    fn test_linebreak_ir_emits_double_backslash_in_row_context() {
+        // At the top level (align/display rows) a Typst line break becomes
+        // LaTeX's `\\` row separator. emit_math_ir runs on a row-context context.
+        let mut ctx = ConvertContext::new();
+        ctx.in_math = true;
+        ctx.linebreak_as_row = true;
+        emit_math_ir(
+            &MathIr::Seq(vec![
+                MathIr::Ident("a".to_string()),
+                MathIr::Linebreak,
+                MathIr::Ident("b".to_string()),
+            ]),
+            &mut ctx,
+        );
+        let result = ctx.finalize();
+        assert!(
+            result.contains("a \\\\\n") && result.contains("b"),
+            "row-context line break should emit `\\\\`, got: {}",
+            result
+        );
+    }
 
     #[test]
     fn test_linebreak_ir_preserves_plain_math_emission() {
@@ -553,7 +584,7 @@ mod tests {
 
         assert!(
             result.contains("i \\\n") && result.contains("j"),
-            "linebreak IR should still emit a raw LaTeX linebreak in plain math, got: {}",
+            "linebreak inside an inline fragment (to_string) degrades to a bare `\\`, got: {}",
             result
         );
     }

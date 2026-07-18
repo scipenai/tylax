@@ -109,6 +109,69 @@ fn to_js_value<T: Serialize>(value: &T) -> JsValue {
     })
 }
 
+#[cfg(feature = "wasm")]
+fn strip_inline_math_wrapper(output: String) -> String {
+    let trimmed = output.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('$') && trimmed.ends_with('$') {
+        trimmed[1..trimmed.len() - 1].to_string()
+    } else {
+        output
+    }
+}
+
+#[cfg(feature = "wasm")]
+fn typst_math_to_latex_for_wasm(input: &str, options: &crate::T2LOptions) -> String {
+    if input.contains('&') {
+        let wrapped = format!("${}$", input);
+        let mut markup_options = options.clone();
+        markup_options.math_only = false;
+        return strip_inline_math_wrapper(crate::typst_to_latex_with_options(
+            &wrapped,
+            &markup_options,
+        ));
+    }
+
+    crate::typst_to_latex_with_options(input, options)
+}
+
+#[cfg(all(test, feature = "wasm"))]
+mod tests {
+    use super::typst_math_to_latex_for_wasm;
+
+    fn math_options() -> crate::T2LOptions {
+        crate::T2LOptions {
+            math_only: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn wasm_math_align_linebreak_uses_align_environment() {
+        let result = typst_math_to_latex_for_wasm(r"a &= b \ &= c", &math_options());
+        assert!(
+            result.contains(r"\begin{align}") && result.contains("b \\\\"),
+            "aligned bare math should render as a compilable align environment, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn wasm_math_plain_expression_keeps_bare_math_output() {
+        let result = typst_math_to_latex_for_wasm("frac(1, 2) + alpha", &math_options());
+        assert_eq!(result.trim(), r"\frac{1}{2} + \alpha");
+    }
+
+    #[test]
+    fn wasm_math_cases_ampersands_do_not_become_top_level_align() {
+        let result = typst_math_to_latex_for_wasm("cases(x, & y, z, & w)", &math_options());
+        assert!(
+            result.contains(r"\begin{cases}") && !result.contains(r"\begin{align}"),
+            "cases-internal alignment should stay in cases, got: {}",
+            result
+        );
+    }
+}
+
 /// Conversion result with additional metadata
 #[cfg(feature = "wasm")]
 #[derive(Serialize, Deserialize)]
@@ -154,7 +217,7 @@ pub fn latex_to_typst_wasm(input: &str) -> String {
 #[wasm_bindgen(js_name = "typstToLatex")]
 pub fn typst_to_latex_wasm(input: &str) -> String {
     // Use math_only mode for bare math expressions (without $ delimiters)
-    crate::typst_to_latex_with_options(
+    typst_math_to_latex_for_wasm(
         input,
         &crate::T2LOptions {
             math_only: true,
@@ -295,6 +358,8 @@ pub fn typst_to_latex_with_options_wasm(input: &str, options: JsValue) -> JsValu
         // Math mode (full_document: false) never uses MiniEval for performance.
         if opts.full_document && opts.expand_macros {
             crate::typst_to_latex_with_eval(input, &t2l_opts)
+        } else if !opts.full_document {
+            typst_math_to_latex_for_wasm(input, &t2l_opts)
         } else {
             crate::typst_to_latex_with_options(input, &t2l_opts)
         }

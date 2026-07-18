@@ -4,12 +4,14 @@
 
 use mitex_parser::syntax::{CmdItem, SyntaxElement, SyntaxKind, SyntaxNode};
 use mitex_parser::CommandSpec;
+use mitex_spec::CommandSpecItem;
 use mitex_spec_gen::DEFAULT_SPEC;
 use rowan::ast::AstNode;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use crate::data::constants::{AcronymDef, GlossaryDef};
+use crate::data::extended_symbols::EXTENDED_SYMBOLS;
 use crate::data::maps::TEX_COMMAND_SPEC;
 use crate::features::refs::{CitationMode, ReferenceType};
 use fxhash::FxHashMap;
@@ -251,6 +253,8 @@ pub struct ConversionState {
     pub pending_citation: Option<PendingCitation>,
     /// Pending reference state
     pub pending_reference: Option<PendingReference>,
+    /// Suppress the next raw whitespace token after emitting a spacing-aware token.
+    pub suppress_next_space: bool,
     /// User-defined macros
     pub macros: HashMap<String, MacroDef>,
     /// Whether we're in preamble
@@ -415,6 +419,137 @@ fn is_required_clause(child: &SyntaxNode) -> bool {
             child.first_token().map(|t| t.kind()),
             Some(SyntaxKind::TokenLBracket)
         )
+}
+
+fn slash_is_between_mathy(elem: SyntaxElement) -> bool {
+    let Some(prev) = nearest_non_trivia_sibling(&elem, false) else {
+        return false;
+    };
+    let Some(next) = nearest_non_trivia_sibling(&elem, true) else {
+        return false;
+    };
+
+    elements_form_math_slash(&prev, &next)
+}
+
+fn nearest_non_trivia_sibling(elem: &SyntaxElement, next: bool) -> Option<SyntaxElement> {
+    let mut sibling = if next {
+        elem.next_sibling_or_token()
+    } else {
+        elem.prev_sibling_or_token()
+    };
+
+    while let Some(current) = sibling {
+        if !matches!(
+            current.kind(),
+            SyntaxKind::TokenWhiteSpace | SyntaxKind::TokenLineBreak | SyntaxKind::TokenComment
+        ) {
+            return Some(current);
+        }
+        sibling = if next {
+            current.next_sibling_or_token()
+        } else {
+            current.prev_sibling_or_token()
+        };
+    }
+
+    None
+}
+
+fn element_is_mathy(elem: &SyntaxElement) -> bool {
+    match elem.kind() {
+        SyntaxKind::ItemLR | SyntaxKind::ItemAttachComponent => true,
+        SyntaxKind::ItemCmd => {
+            let Some(node) = elem.as_node() else {
+                return false;
+            };
+            let Some(cmd) = CmdItem::cast(node.clone()) else {
+                return false;
+            };
+            let Some(name) = cmd.name_tok() else {
+                return false;
+            };
+            command_is_math_like(name.text().trim_start_matches('\\'))
+        }
+        _ => false,
+    }
+}
+
+fn command_is_math_like(name: &str) -> bool {
+    let base_name = name.strip_suffix('*').unwrap_or(name);
+
+    if let Some(CommandSpecItem::Cmd(shape)) = TEX_COMMAND_SPEC.get(name) {
+        if shape.alias.is_some() {
+            return true;
+        }
+    }
+
+    if EXTENDED_SYMBOLS.contains_key(name) || EXTENDED_SYMBOLS.contains_key(base_name) {
+        return true;
+    }
+
+    matches!(
+        base_name,
+        "abs"
+            | "absolutevalue"
+            | "bar"
+            | "binom"
+            | "bm"
+            | "boldsymbol"
+            | "bra"
+            | "braket"
+            | "cfrac"
+            | "dfrac"
+            | "dyad"
+            | "ev"
+            | "expval"
+            | "expectationvalue"
+            | "flatfrac"
+            | "frac"
+            | "hat"
+            | "innerproduct"
+            | "ip"
+            | "ket"
+            | "ketbra"
+            | "matrixel"
+            | "matrixelement"
+            | "matrixquantity"
+            | "mathbb"
+            | "mathbf"
+            | "mathcal"
+            | "mathfrak"
+            | "mathit"
+            | "mathop"
+            | "mathrm"
+            | "mathsf"
+            | "mathtt"
+            | "mel"
+            | "norm"
+            | "op"
+            | "outerproduct"
+            | "overbrace"
+            | "overline"
+            | "overset"
+            | "qty"
+            | "sqrt"
+            | "stackrel"
+            | "tilde"
+            | "tfrac"
+            | "underbrace"
+            | "underset"
+            | "vec"
+            | "widehat"
+            | "widetilde"
+    )
+}
+
+fn elements_form_math_slash(prev: &SyntaxElement, next: &SyntaxElement) -> bool {
+    let prev_mathy = element_is_mathy(prev);
+    let next_mathy = element_is_mathy(next);
+    let prev_word = prev.kind() == SyntaxKind::TokenWord;
+    let next_word = next.kind() == SyntaxKind::TokenWord;
+
+    (prev_mathy && (next_mathy || next_word)) || (prev_word && next_mathy)
 }
 
 impl LatexConverter {
@@ -720,6 +855,10 @@ impl LatexConverter {
             return;
         }
 
+        if self.state.suppress_next_space && !matches!(elem.kind(), SyntaxKind::TokenWhiteSpace) {
+            self.state.suppress_next_space = false;
+        }
+
         match elem.kind() {
             // Handle errors gracefully
             TokenError => {
@@ -804,7 +943,11 @@ impl LatexConverter {
             // Whitespace
             TokenWhiteSpace => {
                 if let SyntaxElement::Token(t) = elem {
-                    output.push_str(t.text());
+                    if self.state.suppress_next_space {
+                        self.state.suppress_next_space = false;
+                    } else {
+                        output.push_str(t.text());
+                    }
                 }
             }
 
@@ -876,7 +1019,17 @@ impl LatexConverter {
                     output.push(',');
                 }
             }
-            TokenSlash => output.push('/'),
+            TokenSlash => {
+                if matches!(self.state.mode, ConversionMode::Math) || slash_is_between_mathy(elem) {
+                    while output.ends_with(char::is_whitespace) {
+                        output.pop();
+                    }
+                    output.push_str(" slash ");
+                    self.state.suppress_next_space = true;
+                } else {
+                    output.push('/');
+                }
+            }
             TokenAsterisk => {
                 if let Some(ref mut op) = self.state.pending_op {
                     op.is_limits = true;

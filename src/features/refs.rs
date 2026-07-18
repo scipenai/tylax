@@ -600,37 +600,41 @@ pub fn citation_to_typst(group: &CiteGroup) -> String {
 
     // Citations must remain explicit in Typst.
     // Bare @key is reserved for reference-first semantics on the T2L path.
-    let mut result = String::from("#cite(");
-
-    // Add keys
-    let keys: Vec<String> = group
+    //
+    // Typst's `cite` takes a single key, so multiple LaTeX keys (e.g.
+    // `\cite{a,b}`) must be emitted as separate `#cite(<a>) #cite(<b>)` calls.
+    // Joining keys inside one `#cite(<a>, <b>)` is invalid Typst and fails to
+    // compile.
+    let last = group.citations.len() - 1;
+    let cites: Vec<String> = group
         .citations
         .iter()
-        .map(|c| format!("<{}>", c.key))
+        .enumerate()
+        .map(|(i, c)| {
+            let mut one = format!("#cite(<{}>", c.key);
+
+            // Form is per-citation; biblatex multi-key groups share one mode.
+            match c.mode {
+                CitationMode::AuthorInText => one.push_str(", form: \"prose\""),
+                CitationMode::SuppressAuthor => one.push_str(", form: \"year\""),
+                CitationMode::NoParen => one.push_str(", form: \"author\""),
+                _ => {}
+            }
+
+            // A shared postnote (e.g. page number) has no group-level equivalent
+            // once keys are split, so attach it to the final citation.
+            if i == last {
+                if let Some(ref suffix) = group.suffix {
+                    one.push_str(&format!(", supplement: [{}]", suffix));
+                }
+            }
+
+            one.push(')');
+            one
+        })
         .collect();
-    result.push_str(&keys.join(", "));
 
-    // Add form for non-normal modes
-    let mode = group.citations[0].mode;
-    match mode {
-        CitationMode::AuthorInText => {
-            result.push_str(", form: \"prose\"");
-        }
-        CitationMode::SuppressAuthor => {
-            result.push_str(", form: \"year\"");
-        }
-        CitationMode::NoParen => {
-            result.push_str(", form: \"author\"");
-        }
-        _ => {}
-    }
-
-    // Add supplement for suffix
-    if let Some(ref suffix) = group.suffix {
-        result.push_str(&format!(", supplement: [{}]", suffix));
-    }
-
-    result.push(')');
+    let result = cites.join(" ");
     if let Some(ref prefix) = group.prefix {
         format!("{} {}", prefix, result)
     } else {
@@ -885,6 +889,30 @@ mod tests {
         group.suffix = Some("ch. 2".to_string());
         let typst = citation_to_typst(&group);
         assert_eq!(typst, r#"see #cite(<test2020>, supplement: [ch. 2])"#);
+    }
+
+    #[test]
+    fn test_citation_to_typst_multi_key_splits_calls() {
+        // Typst's `cite` accepts a single key, so multiple keys must become
+        // separate `#cite(..)` calls rather than an invalid `#cite(<a>, <b>)`.
+        let mut group = CiteGroup::new();
+        group.push(Citation::new("a".to_string()));
+        group.push(Citation::new("b".to_string()));
+        assert_eq!(citation_to_typst(&group), r#"#cite(<a>) #cite(<b>)"#);
+    }
+
+    #[test]
+    fn test_citation_to_typst_multi_key_suffix_on_last() {
+        // A shared postnote has no group-level equivalent once keys are split,
+        // so it attaches to the final citation.
+        let mut group = CiteGroup::new();
+        group.push(Citation::new("a".to_string()));
+        group.push(Citation::new("b".to_string()));
+        group.suffix = Some("ch. 2".to_string());
+        assert_eq!(
+            citation_to_typst(&group),
+            r#"#cite(<a>) #cite(<b>, supplement: [ch. 2])"#
+        );
     }
 
     #[test]

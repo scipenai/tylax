@@ -180,6 +180,11 @@ pub struct ConvertContext {
     pub variables: HashMap<String, String>,
     /// Pending label to be attached to the next figure/table environment
     pub pending_label: Option<String>,
+    /// Whether a math line break (`\`) should render as LaTeX's `\\` row
+    /// separator. Defaults to false because new contexts often render inline
+    /// fragments (scripts, matrix cells, function arguments); row-level callers
+    /// opt in explicitly.
+    pub linebreak_as_row: bool,
 }
 
 /// Initial capacity for output buffer (reduces reallocations)
@@ -201,6 +206,7 @@ impl ConvertContext {
             warnings: Vec::new(),
             variables: HashMap::new(),
             pending_label: None,
+            linebreak_as_row: false,
         }
     }
 
@@ -219,6 +225,7 @@ impl ConvertContext {
             warnings: Vec::new(),
             variables: HashMap::new(),
             pending_label: None,
+            linebreak_as_row: false,
         }
     }
 

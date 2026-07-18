@@ -210,15 +210,15 @@ lazy_static! {
         }));
         m.insert("bigodot".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("dot.circle.big".to_string()),
+            alias: Some("dot.o.big".to_string()),
         }));
         m.insert("bigoplus".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("plus.circle.big".to_string()),
+            alias: Some("plus.o.big".to_string()),
         }));
         m.insert("bigotimes".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("times.circle.big".to_string()),
+            alias: Some("times.o.big".to_string()),
         }));
         m.insert("bigsqcup".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -746,7 +746,7 @@ lazy_static! {
         }));
         m.insert("odot".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("dot.circle".to_string()),
+            alias: Some("dot.o".to_string()),
         }));
         m.insert("oint".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -766,19 +766,19 @@ lazy_static! {
         }));
         m.insert("ominus".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("minus.circle".to_string()),
+            alias: Some("minus.o".to_string()),
         }));
         m.insert("oplus".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("plus.circle".to_string()),
+            alias: Some("plus.o".to_string()),
         }));
         m.insert("oslash".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("divides.circle".to_string()),
+            alias: Some("slash.o".to_string()),
         }));
         m.insert("otimes".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("times.circle".to_string()),
+            alias: Some("times.o".to_string()),
         }));
         m.insert("parallel".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -2023,6 +2023,16 @@ pub static TYPST_TO_TEX: phf::Map<&'static str, &'static str> = phf_map! {
     "times.circle" => "otimes",
     "times.circle.big" => "bigotimes",
     "dot.circle.big" => "bigodot",
+    // Current Typst circled-operator spelling (`.o`); `.circle` above is the
+    // pre-0.12 deprecated form kept for backward compatibility.
+    "plus.o" => "\\oplus",
+    "plus.o.big" => "\\bigoplus",
+    "minus.o" => "\\ominus",
+    "times.o" => "\\otimes",
+    "times.o.big" => "\\bigotimes",
+    "dot.o" => "\\odot",
+    "dot.o.big" => "\\bigodot",
+    "slash.o" => "\\oslash",
 
     // =========================================================================
     // Relations

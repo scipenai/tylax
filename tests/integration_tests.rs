@@ -4,8 +4,10 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use tylax::{
-    convert_auto, convert_auto_document, detect_format, latex_document_to_typst, latex_to_typst,
-    typst_to_latex, typst_to_latex_with_diagnostics, typst_to_latex_with_options, T2LOptions,
+    convert_auto, convert_auto_document, detect_format, latex_document_to_typst,
+    latex_document_to_typst_with_options, latex_to_typst, typst_to_latex,
+    typst_to_latex_with_diagnostics, typst_to_latex_with_options, L2TOptions, PreambleMode,
+    T2LOptions,
 };
 
 fn run_t2l_cli(input: &str) -> String {
@@ -368,18 +370,34 @@ mod l2t_math {
     }
 
     #[test]
-    fn test_math_slash_passes_through_literally() {
-        // Math-mode slash escaping (LaTeX `a/b` -> Typst `a\/b`) is intentionally
-        // deferred: it would change every existing user's math output, so it is
-        // tracked separately as an opt-in L2TOptions toggle. Until then `/` is
-        // emitted literally and must NOT be escaped.
-        let inline = latex_to_typst("$a/b$");
-        assert!(inline.contains('/'), "got: {}", inline);
-        assert!(
-            !inline.contains(r"\/"),
-            "slash must not be escaped, got: {}",
-            inline
+    fn test_math_literal_slash_becomes_slash_symbol() {
+        assert_eq!(
+            latex_to_typst(r"\mathbb{R} / \mathbb{Q}").trim(),
+            "RR slash QQ"
         );
+        assert_eq!(latex_to_typst(r"\alpha / x").trim(), "alpha slash x");
+        assert_eq!(latex_to_typst("$a/b$").trim(), "$a slash b$");
+        let no_preamble = L2TOptions {
+            preamble: PreambleMode::None,
+            ..Default::default()
+        };
+        assert_eq!(
+            latex_document_to_typst_with_options(r"\mathbb{R} / \mathbb{Q}", &no_preamble).trim(),
+            "RR slash QQ"
+        );
+        assert_eq!(
+            latex_document_to_typst_with_options("text / path", &no_preamble).trim(),
+            "text / path"
+        );
+        assert_eq!(
+            latex_document_to_typst_with_options(r"\cite{a} / \cite{b}", &no_preamble).trim(),
+            "#cite(<a>) / #cite(<b>)"
+        );
+
+        // `\frac` slash notation is produced by the fraction converter itself,
+        // not by a LaTeX literal `/`, so the existing frac_to_slash option keeps
+        // using Typst's division shorthand for simple fractions.
+        assert_eq!(latex_to_typst(r"\frac{a}b").trim(), "a/b");
     }
 
     #[test]
@@ -650,6 +668,112 @@ mod l2t_math {
     }
 
     #[test]
+    fn test_brace_annotation_folds_into_second_argument() {
+        // `\underbrace{body}_{label}` / `\overbrace{body}^{label}` express the
+        // brace label as a script in LaTeX, but Typst takes it as a second
+        // positional argument. Emitting `underbrace(body)_(label)` would render
+        // the label as a real subscript instead of the brace annotation.
+        assert_eq!(
+            latex_to_typst(r"$\underbrace{a+b}_{c}$").trim(),
+            "$underbrace(a + b, c)$"
+        );
+        assert_eq!(
+            latex_to_typst(r"$\overbrace{x+y}^{n}$").trim(),
+            "$overbrace(x + y, n)$"
+        );
+        // A bare (unbraced) script is folded the same way.
+        assert_eq!(
+            latex_to_typst(r"$\underbrace{a+b}_c$").trim(),
+            "$underbrace(a + b, c)$"
+        );
+        // No script: the single-argument form is preserved unchanged.
+        assert_eq!(
+            latex_to_typst(r"$\underbrace{q}$").trim(),
+            "$underbrace(q)$"
+        );
+        // Non-canonical pairings (underbrace with `^`, overbrace with `_`) are
+        // left as ordinary scripts rather than mis-folded.
+        assert_eq!(
+            latex_to_typst(r"$\underbrace{x}^{y}$").trim(),
+            "$underbrace(x)^(y)$"
+        );
+        assert_eq!(
+            latex_to_typst(r"$\overbrace{x}_{y}$").trim(),
+            "$overbrace(x)_(y)$"
+        );
+    }
+
+    #[test]
+    fn test_brace_annotation_top_level_comma_is_protected() {
+        // A top-level comma in the label/body would make `underbrace(body,
+        // label)` parse as extra positional arguments, so the operand is wrapped
+        // in `{}` while still folding into the brace annotation.
+        assert_eq!(
+            latex_to_typst(r"$\underbrace{x}_{a, b}$").trim(),
+            "$underbrace(x, {a, b})$"
+        );
+        assert_eq!(
+            latex_to_typst(r"$\underbrace{a, b}_{c}$").trim(),
+            "$underbrace({a, b}, c)$"
+        );
+        // Commas nested inside parens or a string literal are not top-level, so
+        // these still fold safely.
+        assert_eq!(
+            latex_to_typst(r"$\underbrace{f(x,y)}_{c}$").trim(),
+            "$underbrace(f(x,y), c)$"
+        );
+        assert_eq!(
+            latex_to_typst(r"$\underbrace{x}_{\text{a, b}}$").trim(),
+            r#"$underbrace(x, #text[a, b])$"#
+        );
+    }
+
+    #[test]
+    fn test_circled_operators_use_dot_o_spelling() {
+        // Issue #27: Typst deprecated the `.circle` circled-operator spelling in
+        // favour of `.o` (e.g. `times.o`). Emitting `times.circle` renders a
+        // deprecation warning and will eventually stop compiling.
+        assert_eq!(latex_to_typst(r"\otimes").trim(), "times.o");
+        assert_eq!(latex_to_typst(r"\oplus").trim(), "plus.o");
+        assert_eq!(latex_to_typst(r"\ominus").trim(), "minus.o");
+        assert_eq!(latex_to_typst(r"\odot").trim(), "dot.o");
+        assert_eq!(latex_to_typst(r"\oslash").trim(), "slash.o");
+        // n-ary (big) variants take the `.o.big` suffix.
+        assert_eq!(latex_to_typst(r"\bigotimes").trim(), "times.o.big");
+        assert_eq!(latex_to_typst(r"\bigoplus").trim(), "plus.o.big");
+        assert_eq!(latex_to_typst(r"\bigodot").trim(), "dot.o.big");
+    }
+
+    #[test]
+    fn test_dirac_notation_uses_chevron_delimiters() {
+        // Issue #29: bra-ket notation emitted `angle.l`/`angle.r`, which are not
+        // valid Typst delimiter symbols; the angle brackets ⟨ ⟩ are `chevron.l`
+        // / `chevron.r` (matching how `\langle`/`\rangle` already convert).
+        assert_eq!(latex_to_typst(r"\ket{x}").trim(), "lr(| x chevron.r)");
+        assert_eq!(latex_to_typst(r"\bra{x}").trim(), "lr(chevron.l x |)");
+        assert_eq!(
+            latex_to_typst(r"\braket{a}{b}").trim(),
+            "lr(chevron.l a | b chevron.r)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\braket{x}").trim(),
+            "lr(chevron.l x | x chevron.r)"
+        );
+        // The shared delimiter fix also covers the other braket-family commands.
+        assert_eq!(
+            latex_to_typst(r"\mel{n}{A}{m}").trim(),
+            "lr(chevron.l n | A | m chevron.r)"
+        );
+        // `\dyad` builds the closing bra from a *second* `lr(` inside the same
+        // format string; exact-match here guards the space before the operand
+        // (a bare `contains` check would miss `chevron.lb`).
+        assert_eq!(
+            latex_to_typst(r"\dyad{a}{b}").trim(),
+            "lr(| a chevron.r) lr(chevron.l b |)"
+        );
+    }
+
+    #[test]
     fn test_spacing_commands_consume_dimension_arguments() {
         // hspace/vspace and their starred variants must be registered as 1-arg
         // commands so mitex consumes the dimension instead of leaking it
@@ -681,7 +805,13 @@ mod l2t_math {
     #[test]
     fn test_text_in_math() {
         let result = latex_to_typst(r"\text{hello}");
-        assert!(!result.contains("Error"));
+        assert_eq!(result.trim(), "#text[hello]");
+
+        let issue_label = latex_to_typst(r"\underbrace{U_p}_{\text{$p$th Layer}}");
+        assert_eq!(
+            issue_label.trim(),
+            r#"underbrace(U_(p), #text[$p$th Layer])"#
+        );
     }
 
     #[test]
@@ -3083,9 +3213,11 @@ mod citation_edge_cases {
 
     #[test]
     fn test_l2t_citation_edge_cases() {
+        // Typst's `#cite` takes one key, so multi-key groups split into separate
+        // calls; the shared postnote attaches to the final citation.
         let citep = latex_document_to_typst(r#"See \citep[see][ch. 2]{a,b}."#);
         assert!(
-            citep.contains(r#"See see #cite(<a>, <b>, supplement: [ch. 2])."#),
+            citep.contains(r#"See see #cite(<a>) #cite(<b>, supplement: [ch. 2])."#),
             "got: {}",
             citep
         );
@@ -3288,6 +3420,23 @@ mod t2l_escaped_punctuation {
     }
 
     #[test]
+    fn test_lr_linebreak_stays_inline_fragment() {
+        let result =
+            typst_to_latex_with_options(r"$lr(chevron.l a \ b chevron.r)$", &T2LOptions::default());
+
+        assert!(
+            result.contains(r"\left\langle") && result.contains(r"\right\rangle"),
+            "lr() should still render angle delimiters, got: {}",
+            result
+        );
+        assert!(
+            result.contains("a \\\n") && !result.contains("a \\\\\n"),
+            "linebreak inside lr() content should stay an inline fragment, got: {}",
+            result
+        );
+    }
+
+    #[test]
     fn test_matrix_escaped_punctuation_is_literal() {
         let result = typst_to_latex_with_options("$mat(1\\, 2; 3\\; 4)$", &T2LOptions::default());
 
@@ -3474,6 +3623,55 @@ mod t2l_escaped_punctuation {
         assert!(
             result.contains("A_{i \\\n") && result.contains("j}"),
             "non-limits multiline subscript should still emit a plain multiline brace group, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_math_linebreak_in_align_becomes_double_backslash() {
+        // A Typst math line break (`\`) at the row level of an aligned equation
+        // must map to LaTeX's `\\` row separator; a lone `\` is not a valid row
+        // break. (`\ `, backslash-space, is a Typst line break.)
+        let result = typst_to_latex_with_options(r"$ a &= b \ &= c $", &T2LOptions::default());
+        assert!(
+            result.contains(r"\begin{align}"),
+            "aligned equation should use the align environment, got: {}",
+            result
+        );
+        assert!(
+            result.contains("b \\\\") && !result.contains("b \\\n"),
+            "row-level line break should emit `\\\\`, not a bare `\\`, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_non_aligned_math_linebreak_stays_inline_spacing() {
+        // Without an alignment marker, the output stays in inline/display math
+        // rather than an align environment. In that context, emitting `\\`
+        // would create an invalid LaTeX row separator.
+        let result = typst_to_latex_with_options(r"$ a = b \ c = d $", &T2LOptions::default());
+        assert!(
+            result.contains("b \\\n") && !result.contains("b \\\\\n"),
+            "non-aligned math linebreak should stay a bare `\\`, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_text_ampersand_does_not_trigger_align_linebreak() {
+        // Alignment detection must only consider top-level `&`; an ampersand
+        // inside text/braces is literal content and should not upgrade a math
+        // line break to a row separator.
+        let result = typst_to_latex_with_options(r#"$ text("&") \ a $"#, &T2LOptions::default());
+        assert!(
+            !result.contains(r"\begin{align}"),
+            "text ampersand should not create align environment, got: {}",
+            result
+        );
+        assert!(
+            result.contains(" \\\n") && !result.contains(" \\\\\n"),
+            "text ampersand linebreak should stay a bare `\\`, got: {}",
             result
         );
     }
@@ -4358,8 +4556,8 @@ mod physics_package {
     fn test_ket() {
         let result = latex_to_typst(r"\ket{\psi}");
         assert!(
-            result.contains("lr(|") && result.contains("angle.r"),
-            "\\ket should produce lr(| ψ angle.r), got: {}",
+            result.contains("lr(|") && result.contains("chevron.r"),
+            "\\ket should produce lr(| ψ chevron.r), got: {}",
             result
         );
     }
@@ -4368,8 +4566,8 @@ mod physics_package {
     fn test_bra() {
         let result = latex_to_typst(r"\bra{\phi}");
         assert!(
-            result.contains("angle.l") && result.contains("|)"),
-            "\\bra should produce lr(angle.l φ |), got: {}",
+            result.contains("chevron.l") && result.contains("|)"),
+            "\\bra should produce lr(chevron.l φ |), got: {}",
             result
         );
     }
@@ -4378,8 +4576,8 @@ mod physics_package {
     fn test_braket_two_args() {
         let result = latex_to_typst(r"\braket{a}{b}");
         assert!(
-            result.contains("angle.l") && result.contains("|") && result.contains("angle.r"),
-            "\\braket{{a}}{{b}} should produce lr(angle.l a | b angle.r), got: {}",
+            result.contains("chevron.l") && result.contains("|") && result.contains("chevron.r"),
+            "\\braket{{a}}{{b}} should produce lr(chevron.l a | b chevron.r), got: {}",
             result
         );
     }
@@ -4390,8 +4588,8 @@ mod physics_package {
         let output = result.trim();
         // Single-arg braket: ⟨a|a⟩
         assert!(
-            output.contains("angle.l") && output.contains("angle.r"),
-            "\\braket{{a}} should produce lr(angle.l a | a angle.r), got: {}",
+            output.contains("chevron.l") && output.contains("chevron.r"),
+            "\\braket{{a}} should produce lr(chevron.l a | a chevron.r), got: {}",
             result
         );
     }
@@ -4400,8 +4598,8 @@ mod physics_package {
     fn test_expval_implicit() {
         let result = latex_to_typst(r"\expval{A}");
         assert!(
-            result.contains("angle.l") && result.contains("angle.r"),
-            "\\expval{{A}} should produce lr(angle.l A angle.r), got: {}",
+            result.contains("chevron.l") && result.contains("chevron.r"),
+            "\\expval{{A}} should produce lr(chevron.l A chevron.r), got: {}",
             result
         );
     }
@@ -4411,8 +4609,8 @@ mod physics_package {
         let result = latex_to_typst(r"\expval{A}{\Psi}");
         eprintln!("expval result: {}", result);
         assert!(
-            result.contains("angle.l") && result.contains("|") && result.contains("angle.r"),
-            "\\expval{{A}}{{Ψ}} should produce lr(angle.l Ψ | A | Ψ angle.r), got: {}",
+            result.contains("chevron.l") && result.contains("|") && result.contains("chevron.r"),
+            "\\expval{{A}}{{Ψ}} should produce lr(chevron.l Ψ | A | Ψ chevron.r), got: {}",
             result
         );
     }
@@ -4421,8 +4619,8 @@ mod physics_package {
     fn test_mel() {
         let result = latex_to_typst(r"\mel{n}{A}{m}");
         assert!(
-            result.contains("angle.l") && result.contains("|") && result.contains("angle.r"),
-            "\\mel{{n}}{{A}}{{m}} should produce lr(angle.l n | A | m angle.r), got: {}",
+            result.contains("chevron.l") && result.contains("|") && result.contains("chevron.r"),
+            "\\mel{{n}}{{A}}{{m}} should produce lr(chevron.l n | A | m chevron.r), got: {}",
             result
         );
     }
@@ -4433,7 +4631,7 @@ mod physics_package {
         eprintln!("dyad result: {}", result);
         // |a⟩⟨b|
         assert!(
-            result.contains("angle.r") && result.contains("angle.l"),
+            result.contains("chevron.r") && result.contains("chevron.l"),
             "\\dyad{{a}}{{b}} should produce |a⟩⟨b|, got: {}",
             result
         );
@@ -4535,7 +4733,7 @@ Commutator: $\comm{x}{p} = i\hbar$
             result
         );
         assert!(
-            result.contains("angle.l") || result.contains("lr(|"),
+            result.contains("chevron.l") || result.contains("lr(|"),
             "Should contain bra-ket notation, got: {}",
             result
         );
@@ -4573,8 +4771,8 @@ Commutator: $\comm{x}{p} = i\hbar$
     fn test_vev() {
         let result = latex_to_typst(r"\vev{A}");
         assert!(
-            result.contains("angle.l") && result.contains("0") && result.contains("angle.r"),
-            "\\vev{{A}} should produce lr(angle.l 0 | A | 0 angle.r), got: {}",
+            result.contains("chevron.l") && result.contains("0") && result.contains("chevron.r"),
+            "\\vev{{A}} should produce lr(chevron.l 0 | A | 0 chevron.r), got: {}",
             result
         );
     }
@@ -4653,7 +4851,7 @@ Commutator: $\comm{x}{p} = i\hbar$
     fn test_braket_star() {
         let result = latex_to_typst(r"\braket*{a}{b}");
         assert!(
-            result.contains("angle.l") && result.contains("angle.r"),
+            result.contains("chevron.l") && result.contains("chevron.r"),
             "\\braket*{{a}}{{b}} should produce braket notation, got: {}",
             result
         );
@@ -4800,6 +4998,11 @@ mod t2l_symbol_mappings {
         assert_eq!(TYPST_TO_TEX.get("times.square"), Some(&"\\boxtimes"));
         assert_eq!(TYPST_TO_TEX.get("dot.circle"), Some(&"\\odot"));
         assert_eq!(TYPST_TO_TEX.get("minus.circle"), Some(&"\\ominus"));
+        assert_eq!(TYPST_TO_TEX.get("times.o"), Some(&"\\otimes"));
+        assert_eq!(TYPST_TO_TEX.get("plus.o"), Some(&"\\oplus"));
+        assert_eq!(TYPST_TO_TEX.get("minus.o"), Some(&"\\ominus"));
+        assert_eq!(TYPST_TO_TEX.get("dot.o"), Some(&"\\odot"));
+        assert_eq!(TYPST_TO_TEX.get("slash.o"), Some(&"\\oslash"));
     }
 
     #[test]

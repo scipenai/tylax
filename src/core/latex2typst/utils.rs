@@ -269,9 +269,22 @@ pub fn contains_top_level_separator(text: &str, separator: char) -> bool {
     let mut paren_depth = 0usize;
     let mut bracket_depth = 0usize;
     let mut brace_depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
 
     for ch in text.chars() {
+        if in_string {
+            match ch {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
         match ch {
+            '"' => in_string = true,
             '(' => paren_depth += 1,
             ')' if paren_depth > 0 => paren_depth -= 1,
             '[' => bracket_depth += 1,
@@ -287,6 +300,20 @@ pub fn contains_top_level_separator(text: &str, separator: char) -> bool {
     }
 
     false
+}
+
+/// Protect content that contains a top-level comma by wrapping it in `{}`.
+///
+/// Typst function calls treat top-level commas as argument separators, so
+/// `sqrt(a, b)` is parsed as two arguments while `sqrt({a, b})` is a single
+/// content argument.
+pub fn protect_top_level_comma(content: &str) -> String {
+    let trimmed = content.trim();
+    if contains_top_level_separator(trimmed, ',') {
+        format!("{{{}}}", trimmed)
+    } else {
+        trimmed.to_string()
+    }
 }
 
 // =============================================================================

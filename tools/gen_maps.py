@@ -41,8 +41,8 @@ SYMBOL_MAP = {
     # Binary operators
     "pm": "plus.minus", "mp": "minus.plus", "times": "times", "div": "div",
     "cdot": "dot.op", "ast": "ast", "star": "star", "circ": "circle.small",
-    "bullet": "bullet", "oplus": "plus.circle", "ominus": "minus.circle",
-    "otimes": "times.circle", "oslash": "divides.circle", "odot": "dot.circle",
+    "bullet": "bullet", "oplus": "plus.o", "ominus": "minus.o",
+    "otimes": "times.o", "oslash": "slash.o", "odot": "dot.o",
     "cap": "sect", "cup": "union", "sqcap": "sect.sq", "sqcup": "union.sq",
     "vee": "or", "wedge": "and", "setminus": "without",
     "wr": "wreath", "diamond": "diamond", "bigtriangleup": "triangle.t",
@@ -100,7 +100,7 @@ SYMBOL_MAP = {
     "dots": "dots", "dotsc": "dots.c", "dotsb": "dots.c", "dotsm": "dots.c",
     
     # Delimiters
-    "langle": "angle.l", "rangle": "angle.r",
+    "langle": "chevron.l", "rangle": "chevron.r",
     "lceil": "ceil.l", "rceil": "ceil.r",
     "lfloor": "floor.l", "rfloor": "floor.r",
     "lbrace": "brace.l", "rbrace": "brace.r",
@@ -112,8 +112,8 @@ SYMBOL_MAP = {
     "int": "integral", "iint": "integral.double", "iiint": "integral.triple",
     "oint": "integral.cont", "bigcap": "sect.big", "bigcup": "union.big",
     "bigsqcup": "union.sq.big", "bigvee": "or.big", "bigwedge": "and.big",
-    "bigoplus": "plus.circle.big", "bigotimes": "times.circle.big",
-    "bigodot": "dot.circle.big",
+    "bigoplus": "plus.o.big", "bigotimes": "times.o.big",
+    "bigodot": "dot.o.big",
     
     # Functions
     "sin": "sin", "cos": "cos", "tan": "tan", "cot": "cot",
@@ -236,6 +236,11 @@ TYPST_TO_TEX = {
     # Operators
     "plus.minus": "pm", "minus.plus": "mp", "times": "times", "div": "div",
     "dot.op": "cdot", "sect": "cap", "union": "cup",
+    "plus.o": "\\oplus", "plus.o.big": "\\bigoplus",
+    "minus.o": "\\ominus",
+    "times.o": "\\otimes", "times.o.big": "\\bigotimes",
+    "dot.o": "\\odot", "dot.o.big": "\\bigodot",
+    "slash.o": "\\oslash",
     "lt.eq": "leq", "gt.eq": "geq", "eq.not": "neq",
     "approx": "approx", "equiv": "equiv", "tilde.op": "sim",
     "subset": "subset", "supset": "supset", "subset.eq": "subseteq",
