@@ -711,22 +711,32 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             }
             match conv.state.current_env() {
                 EnvironmentContext::Enumerate => {
-                    // Check for optional label
-                    if let Some(label) = conv.get_optional_arg(&cmd, 0) {
-                        let _ = write!(output, "+ [{}] ", label);
+                    // Keep the `+` marker; render a custom `\item[..]` label in
+                    // the body.
+                    if let Some(label) = conv.convert_optional_arg(&cmd, 0) {
+                        let _ = write!(output, "+ {} ", label);
+                        conv.state.suppress_next_space = true;
                     } else {
                         output.push_str("+ ");
                     }
                 }
                 EnvironmentContext::Description => {
-                    if let Some(term) = conv.get_optional_arg(&cmd, 0) {
+                    // Typst term list: `/ term: desc`. A bare `\item` needs an
+                    // empty term (`/ :`) to still parse as a term list (#32).
+                    if let Some(term) = conv.convert_optional_arg(&cmd, 0) {
                         let _ = write!(output, "/ {}: ", term);
                     } else {
-                        output.push_str("/ ");
+                        output.push_str("/ : ");
                     }
+                    conv.state.suppress_next_space = true;
                 }
                 _ => {
-                    output.push_str("- ");
+                    if let Some(label) = conv.convert_optional_arg(&cmd, 0) {
+                        let _ = write!(output, "- {} ", label);
+                        conv.state.suppress_next_space = true;
+                    } else {
+                        output.push_str("- ");
+                    }
                 }
             }
         }
@@ -835,9 +845,21 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 let _ = write!(output, "overline({}) ", arg);
             }
         }
-        "vec" => {
+        // Typst has no `overrightarrow`/`overleftarrow` accents; map to the
+        // directional `arrow` variants (issue #35).
+        "vec" | "overrightarrow" => {
             if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
                 let _ = write!(output, "arrow({}) ", arg);
+            }
+        }
+        "overleftarrow" => {
+            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(output, "arrow.l({}) ", arg);
+            }
+        }
+        "overleftrightarrow" => {
+            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+                let _ = write!(output, "arrow.l.r({}) ", arg);
             }
         }
         "dot" => {
@@ -866,8 +888,8 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 let _ = write!(output, "upright(bold({})) ", content);
             }
         }
-        "boldsymbol" | "bm" => {
-            // \boldsymbol and \bm just use bold()
+        "boldsymbol" | "bm" | "pmb" => {
+            // \boldsymbol, \bm and \pmb (poor man's bold) all use bold()
             if let Some(content) = conv.convert_required_arg(&cmd, 0) {
                 let _ = write!(output, "bold({}) ", content);
             }
@@ -893,6 +915,28 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 let _ = write!(output, "upright({}) ", content);
             }
             // If no argument, just skip
+        }
+        // `\displaystyle`/`\textstyle` are scoped by `visit_elements`; these
+        // two script-size switches have no Typst equivalent, so just keep
+        // their contents rather than leaking an unknown identifier.
+        "scriptstyle" | "scriptscriptstyle" => {
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    output.push_str(trimmed);
+                    output.push(' ');
+                }
+            }
+        }
+        // No general Typst math equivalent for `\textcircled`; keep the inner content.
+        "textcircled" => {
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    output.push_str(trimmed);
+                    output.push(' ');
+                }
+            }
         }
         "mathbb" => {
             if let Some(content) = conv.get_required_arg(&cmd, 0) {
@@ -2042,7 +2086,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "iiint" => output.push_str("integral.triple "),
         "oint" => output.push_str("integral.cont "),
         "bigcup" => output.push_str("union.big "),
-        "bigcap" => output.push_str("sect.big "),
+        "bigcap" => output.push_str("inter.big "),
         "bigoplus" => output.push_str("plus.o.big "),
         "bigotimes" => output.push_str("times.o.big "),
         "bigsqcup" => output.push_str("union.sq.big "),
@@ -2476,7 +2520,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "supset" => output.push_str("supset "),
         "supseteq" => output.push_str("supset.eq "),
         "cup" => output.push_str("union "),
-        "cap" => output.push_str("sect "),
+        "cap" => output.push_str("inter "),
         "emptyset" | "varnothing" => output.push_str("emptyset "),
 
         // Logic

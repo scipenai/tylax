@@ -678,7 +678,7 @@ pub(crate) fn convert_array_with_delim(
 }
 
 /// Convert a cases environment
-fn convert_cases(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut String) {
+pub(crate) fn convert_cases(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut String) {
     conv.state.push_env(EnvironmentContext::Cases);
     let prev_mode = conv.state.mode;
     conv.state.mode = ConversionMode::Math;

@@ -376,6 +376,10 @@ mod l2t_math {
             "RR slash QQ"
         );
         assert_eq!(latex_to_typst(r"\alpha / x").trim(), "alpha slash x");
+        assert_eq!(
+            latex_to_typst(r"\overrightarrow{A}/\overleftarrow{B}").trim(),
+            "arrow(A) slash arrow.l(B)"
+        );
         assert_eq!(latex_to_typst("$a/b$").trim(), "$a slash b$");
         let no_preamble = L2TOptions {
             preamble: PreambleMode::None,
@@ -455,9 +459,184 @@ mod l2t_math {
     fn test_matrices() {
         let result = latex_to_typst(r"\begin{pmatrix} a & b \\ c & d \end{pmatrix}");
         assert!(!result.contains("Error"));
+        // The `\\` row break must survive as a `;` row separator: mitex parses
+        // `\\` as an `ItemNewLine`, which the Matrix env maps to `;`. Losing it
+        // would merge rows into `mat(a, b c, d)` (wrong, and loses cells).
+        assert!(
+            result.contains(';'),
+            "matrix rows must be separated by `;`, got: {}",
+            result
+        );
 
         let result = latex_to_typst(r"\begin{bmatrix} 1 & 2 \\ 3 & 4 \end{bmatrix}");
         assert!(!result.contains("Error"));
+        assert!(
+            result.contains(';'),
+            "matrix rows must be separated by `;`, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_matrix_row_spacing_optional_arg_is_dropped() {
+        // Issue #41: the optional vertical-spacing argument of `\\` (e.g.
+        // `\\[6pt]`) must be consumed, not leaked into the matrix as an extra
+        // cell like `mat(..., a, b ;[6 p t ] c, d)`.
+        let result = latex_to_typst(r"\begin{pmatrix} a & b \\[6pt] c & d \end{pmatrix}");
+        assert!(!result.contains("Error"));
+        assert!(
+            !result.contains("6pt") && !result.contains("6 p t") && !result.contains('['),
+            "row-spacing option must be dropped, got: {}",
+            result
+        );
+        assert!(
+            result.contains("a, b ; c, d"),
+            "rows must stay clean and separated, got: {}",
+            result
+        );
+
+        // Same for bmatrix, and with a decimal em length. (The `[` of the
+        // bmatrix delimiter `delim: "["` is expected; the leaked length is not.)
+        let b = latex_to_typst(r"\begin{bmatrix} 1 & 2 \\[1.5em] 3 & 4 \end{bmatrix}");
+        assert!(
+            !b.contains("1.5") && !b.contains("1 . 5") && b.contains("1, 2 ; 3, 4"),
+            "bmatrix row spacing must be dropped, got: {}",
+            b
+        );
+
+        // A non-dimension bracket right after `\\` is genuine content and must
+        // be preserved (conservative: only real lengths are consumed).
+        let kept = latex_to_typst(r"\begin{pmatrix} a \\[x] b \end{pmatrix}");
+        assert!(
+            kept.contains("[x"),
+            "non-dimension bracket must be kept, got: {}",
+            kept
+        );
+
+        // Do not accept a known unit as merely a prefix, or an invalid numeric
+        // factor: neither `6ptfoo` nor `1..2pt` is a TeX dimension, so both
+        // must remain visible instead of being silently lost.
+        for invalid in ["6ptfoo", "1..2pt"] {
+            let invalid_unit = latex_to_typst(&format!(
+                r"\begin{{pmatrix}} a \\[{invalid}] b \end{{pmatrix}}"
+            ));
+            let visible = invalid
+                .chars()
+                .map(|character| character.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                invalid_unit.contains(&visible),
+                "invalid row spacing `{invalid}` must be preserved, got: {invalid_unit}"
+            );
+        }
+
+        // Standard variants that are legitimate row spacing must still be
+        // consumed: a `true` unit, elastic glue, and a user length command.
+        for spacing in [".5truept", "1fil", r"\baselineskip"] {
+            let latex = format!(r"\begin{{pmatrix}} a \\[{spacing}] b \end{{pmatrix}}");
+            let converted = latex_to_typst(&latex);
+            assert!(
+                converted.contains("a ; b") && !converted.contains('['),
+                "valid row spacing `{spacing}` must be dropped, got: {converted}"
+            );
+        }
+
+        // TeX accepts whitespace between `\\` and its optional argument.
+        let next_line = latex_to_typst(concat!(
+            "\\begin{pmatrix} a ",
+            "\\\\",
+            "\n",
+            "[6pt] b \\end{pmatrix}",
+        ));
+        assert!(
+            next_line.contains("a ; b") && !next_line.contains("6 p t"),
+            "next-line row spacing must be dropped, got: {}",
+            next_line
+        );
+
+        // The CLI commonly receives Windows CRLF input, so this must take the
+        // same path as the LF-only form above.
+        let windows_next_line = latex_to_typst(concat!(
+            "\\begin{pmatrix} a ",
+            "\\\\",
+            "\r\n",
+            "[6pt] b \\end{pmatrix}",
+        ));
+        assert!(
+            windows_next_line.contains("a ; b") && !windows_next_line.contains("6 p t"),
+            "CRLF row spacing must be dropped, got: {}",
+            windows_next_line
+        );
+
+        // #41 was reported through the full-document path (`t2l -f`), which runs
+        // the document converter (markup mode), not the math-only one above.
+        // Guard that entry point too: `\\[6pt]` inside an `equation`-wrapped
+        // `pmatrix` must still drop the spacing and keep the `;` row separator.
+        let doc = latex_document_to_typst_with_options(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\begin{equation}\nA = \\begin{pmatrix} a & b \\\\[6pt] c & d \\end{pmatrix}\n\
+             \\end{equation}\n\\end{document}\n",
+            &L2TOptions::default(),
+        );
+        assert!(
+            doc.contains("a, b ; c, d") && !doc.contains("6pt") && !doc.contains("6 p t"),
+            "full-document path must also drop `\\\\[6pt]`, got: {}",
+            doc
+        );
+    }
+
+    #[test]
+    fn test_left_brace_array_becomes_cases() {
+        // `\left\{ ... \right.` with a null right delimiter is a piecewise
+        // definition, which Typst spells `cases(...)`. Root cause ①.
+        let result = latex_to_typst(
+            r"f(x)=\left\{\begin{array}{ll} x & x>0 \\ -x & x\le 0 \end{array}\right.",
+        );
+        assert!(
+            result.contains("cases("),
+            "left-brace array should become cases(), got: {}",
+            result
+        );
+        // Both rows must be present and separated (not merged).
+        assert!(
+            result.contains("x & x > 0") && result.contains("- x & x <= 0"),
+            "both piecewise rows must be preserved, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("lr(") && !result.contains("mat("),
+            "cases path should not leak lr()/mat(), got: {}",
+            result
+        );
+
+        // A *balanced* `\{ ... \}` is a set, not a piecewise def: leave it alone.
+        let set = latex_to_typst(r"A = \{ x \mid x > 0 \}");
+        assert!(
+            !set.contains("cases("),
+            "a balanced brace set must not become cases(), got: {}",
+            set
+        );
+
+        // Preserve the AST-level distinction between an explicit array column
+        // (`&`) and a literal comma within that column. The comma must be
+        // escaped in Typst's `cases(...)` syntax rather than becoming a third
+        // column or a second row.
+        let array_with_literal_comma =
+            latex_to_typst(r"\left\{\begin{array}{ll}x & y, z \\ u & v\end{array}\right.");
+        assert!(
+            array_with_literal_comma.contains(r"cases(x & y\, z, u & v)"),
+            "array cell comma must stay literal, got: {}",
+            array_with_literal_comma
+        );
+
+        let aligned_with_literal_comma =
+            latex_to_typst(r"\left\{\begin{aligned}x & y, z \\ u & v\end{aligned}\right.");
+        assert!(
+            aligned_with_literal_comma.contains(r"cases(x & y\, z, u & v)"),
+            "aligned cell comma must stay literal, got: {}",
+            aligned_with_literal_comma
+        );
     }
 
     #[test]
@@ -742,6 +921,175 @@ mod l2t_math {
         assert_eq!(latex_to_typst(r"\bigotimes").trim(), "times.o.big");
         assert_eq!(latex_to_typst(r"\bigoplus").trim(), "plus.o.big");
         assert_eq!(latex_to_typst(r"\bigodot").trim(), "dot.o.big");
+    }
+
+    #[test]
+    fn test_intersection_uses_inter_not_sect() {
+        // Issue #33: Typst renamed the intersection symbol `sect` -> `inter`
+        // (and `sect.big` -> `inter.big`); the old spelling now renders a
+        // deprecation warning. Union was *not* renamed, so it stays `union`.
+        assert_eq!(latex_to_typst(r"\cap").trim(), "inter");
+        assert_eq!(latex_to_typst(r"\bigcap").trim(), "inter.big");
+        assert_eq!(latex_to_typst(r"\cup").trim(), "union");
+        assert_eq!(latex_to_typst(r"\bigcup").trim(), "union.big");
+        // T2L round-trips the new spelling; the deprecated `sect` still maps back
+        // so older Typst documents keep converting.
+        assert_eq!(typst_to_latex("$A inter B$").trim(), r"$A \cap B$");
+        assert_eq!(typst_to_latex("$A sect B$").trim(), r"$A \cap B$");
+    }
+
+    #[test]
+    fn test_relation_before_paren_keeps_space() {
+        // Issue #34: a space before `(` is significant in Typst math. After a
+        // relation symbol it must be preserved, otherwise `\sim (b)` collapses
+        // into the accent call `tilde(b)` (i.e. `\tilde{b}`), changing meaning.
+        assert_eq!(latex_to_typst(r"$(a) \sim (b)$").trim(), "$(a) tilde (b)$");
+        assert_eq!(latex_to_typst(r"$A \cap (B)$").trim(), "$A inter (B)$");
+        // Genuine function application by a lone identifier/number still glues.
+        assert_eq!(latex_to_typst(r"$f(x)$").trim(), "$f(x)$");
+        assert_eq!(latex_to_typst(r"$f  (x)$").trim(), "$f(x)$");
+        assert_eq!(
+            latex_to_typst(r"$\underbrace{f(x,y)}_{c}$").trim(),
+            "$underbrace(f(x,y), c)$"
+        );
+        // The accent call itself is emitted glued and stays that way.
+        assert_eq!(latex_to_typst(r"$\tilde{b}$").trim(), "$tilde(b)$");
+    }
+
+    #[test]
+    fn test_overrightarrow_uses_arrow_accent() {
+        // Issue #35: Typst has no `overrightarrow`/`overleftarrow` functions, so
+        // the old fall-through emitted invalid Typst that failed to compile. The
+        // arrow accents are `arrow` / `arrow.l` / `arrow.l.r`. `\vec` shares the
+        // rightwards arrow with `\overrightarrow`.
+        assert_eq!(latex_to_typst(r"$\vec{n}$").trim(), "$arrow(n)$");
+        assert_eq!(
+            latex_to_typst(r"$\overrightarrow{PC}$").trim(),
+            "$arrow(P C)$"
+        );
+        assert_eq!(
+            latex_to_typst(r"$\overleftarrow{AB}$").trim(),
+            "$arrow.l(A B)$"
+        );
+        assert_eq!(
+            latex_to_typst(r"$\overleftrightarrow{AB}$").trim(),
+            "$arrow.l.r(A B)$"
+        );
+        assert_eq!(
+            latex_to_typst(r"$\overrightarrow{AE} = \frac{2}{5}\overrightarrow{AD}$").trim(),
+            "$arrow(A E) = 2/5arrow(A D)$"
+        );
+        // Round-trips: `arrow`/`arrow.l`/`arrow.l.r` map back to the over-arrows.
+        assert_eq!(
+            typst_to_latex(r"$arrow(P C)$").trim(),
+            r"$\overrightarrow{P C}$"
+        );
+        assert_eq!(
+            typst_to_latex(r"$arrow.l(A B)$").trim(),
+            r"$\overleftarrow{A B}$"
+        );
+        assert_eq!(
+            typst_to_latex(r"$arrow.l.r(A B)$").trim(),
+            r"$\overleftrightarrow{A B}$"
+        );
+    }
+
+    #[test]
+    fn test_tex_style_switches_and_fonts_do_not_leak_invalid_typst() {
+        // Corpus root cause ③: the unknown-command fallback emitted `name(args)`
+        // or a bare alias, producing Typst that fails to compile ("unknown
+        // variable: scriptstyle", `pmb`, `varDelta`, `textcircled`).
+
+        // The script-size switches have no Typst equivalent, so retain their
+        // contents without leaking an unknown identifier.
+        let s = latex_to_typst(r"$\scriptstyle (0,+\infty)$");
+        assert!(!s.contains("scriptstyle"), "leaked scriptstyle: {s}");
+        assert!(s.contains("infinity"), "content dropped: {s}");
+
+        let s = latex_to_typst(r"$a_{\scriptscriptstyle 1}=1$");
+        assert!(!s.contains("scriptscriptstyle"), "leaked sss: {s}");
+        assert!(s.contains("a_"), "subscript content lost: {s}");
+
+        // `\displaystyle` is a declaration over its remaining TeX group, not a
+        // command with one argument. It must become Typst's `display(...)` so
+        // the larger display style is preserved rather than silently discarded.
+        assert_eq!(
+            latex_to_typst(r"$\displaystyle x + y$").trim(),
+            "$display(x + y)$"
+        );
+        assert_eq!(
+            latex_to_typst(r"${\displaystyle x + y} + z$").trim(),
+            "$display(x + y) + z$"
+        );
+        assert_eq!(
+            latex_to_typst(r"$\displaystyle x + \textstyle y$").trim(),
+            "$display(x + inline(y))$"
+        );
+        assert_eq!(
+            latex_to_typst(r"\begin{equation}\displaystyle x + y\end{equation}").trim(),
+            "$ display(x + y) $"
+        );
+
+        // Regression for issue #42. The style declaration is immediately
+        // followed by an attached command expression, which mitex stores as a
+        // sibling rather than as a required argument of `\displaystyle`.
+        let display_sum = latex_document_to_typst(
+            r"\documentclass{article}\begin{document}\begin{equation}
+              y = \frac{1}{\displaystyle\sum_{k=1}^{N}P_k}
+              \end{equation}\end{document}",
+        );
+        assert!(
+            display_sum.contains("frac(1, display(sum_(k = 1)^(N)P_(k)))"),
+            "displaystyle must preserve display style in the reported formula, got: {display_sum}"
+        );
+
+        // \pmb (poor man's bold) joins \boldsymbol / \bm -> bold().
+        let s = latex_to_typst(r"$\pmb{d}$");
+        assert!(s.contains("bold(d)"), "pmb content lost: {s}");
+
+        // Slanted capital Greek aliases to the plain capital.
+        let s = latex_to_typst(r"$\varDelta+\varOmega$");
+        assert!(
+            s.contains("Delta") && s.contains("Omega") && !s.contains("var"),
+            "var-capital leaked: {s}"
+        );
+
+        // \textcircled keeps its inner content instead of leaking the identifier.
+        let s = latex_to_typst(r"$\textcircled{\cdot}A$");
+        assert!(!s.contains("textcircled"), "leaked textcircled: {s}");
+        assert!(s.contains("dot") && s.contains('A'), "content lost: {s}");
+    }
+
+    #[test]
+    fn test_baseless_and_nested_attachments_are_repaired() {
+        // Corpus root cause ②: attachments (`_`/`^`) with no base produced
+        // Typst that fails to compile ("unexpected underscore"/"unexpected hat").
+
+        // Nested empty-base subscript `V_{_{M-ABF}}` (an OCR double-subscript)
+        // collapses to a single subscript rather than the invalid `V_(_(...))`.
+        let s = latex_to_typst(r"$V _ { _ { M - A B F } }$");
+        assert!(!s.contains("_(_("), "double subscript not collapsed: {s}");
+        assert!(s.contains("V_(M - A B F)"), "collapsed form wrong: {s}");
+
+        // A base-less fragment gets an empty base `""` inserted.
+        let s = latex_to_typst(r"$^ { a , b }$");
+        assert!(s.starts_with(r#"$""^("#), "no empty base inserted: {s}");
+
+        let s = latex_to_typst(r"$_ { 1 - { \sqrt { 3 } } }$");
+        assert!(
+            s.contains(r#""" _("#) || s.contains(r#"""_("#),
+            "leading sub: {s}"
+        );
+
+        // A leading inner attachment inside a group also gets the empty base,
+        // while a following attachment that already has a base is left alone.
+        let s = latex_to_typst(r"$S _ { _ { \triangle U } _ { V } }$");
+        assert!(s.contains(r#"_(""_("#), "inner base-less not repaired: {s}");
+
+        // Ordinary attachments with a real base must be untouched.
+        let s = latex_to_typst(r"$a _ { 1 } + b ^ { 2 }$");
+        assert!(!s.contains("\"\""), "empty base wrongly inserted: {s}");
+        assert!(s.contains("a_(1)") && s.contains("b^(2)"), "regressed: {s}");
     }
 
     #[test]
@@ -1187,6 +1535,111 @@ The formula $E = mc^2$ is famous.
 
         let result = latex_document_to_typst(latex);
         assert!(!result.contains("Error"));
+    }
+
+    #[test]
+    fn test_document_multirow_with_non_ascii_content() {
+        // Issue #36: this formerly panicked while parsing the generated
+        // `table.cell(...)[...]` marker because a byte offset was mixed with a
+        // character index. Keep the public document path covered, not just the
+        // table parser's internal marker format.
+        let latex = r#"
+\documentclass{article}
+\usepackage{multirow}
+\begin{document}
+\begin{tabular}{ll}
+\multirow{2}{*}{Guc katı} & A \\
+                          & B \\
+\end{tabular}
+\end{document}
+"#;
+
+        let result = latex_document_to_typst(latex);
+        assert!(
+            result.contains("table.cell(rowspan: 2)[Guc katı]"),
+            "non-ASCII multirow content must remain intact, got:\n{result}"
+        );
+        assert!(
+            result.contains("[A]") && result.contains("[B]"),
+            "multirow sibling cells must remain intact, got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_description_environment_term_list_colons() {
+        // Issue #32: the `description` environment must emit Typst term-list
+        // items (`/ term: text`). A labelled `\item[term]` needs the bracket
+        // captured as an argument; a bare `\item` needs an empty term (`/ :`)
+        // so the output still parses as a term list instead of erroring.
+        let latex = r"\documentclass{article}
+\begin{document}
+\begin{description}
+   \item This is an entry \textit{without} a label.
+   \item[Something short] A short one-line description.
+\end{description}
+\end{document}";
+
+        let result = latex_document_to_typst(latex);
+        assert!(
+            result.contains("/ : This is an entry _without_ a label."),
+            "unlabelled item should become `/ : ...`, got:\n{}",
+            result
+        );
+        assert!(
+            result.contains("/ Something short: A short one-line description."),
+            "labelled item should become `/ term: ...`, got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_item_optional_labels_remain_visible_outside_description() {
+        // `\item[...]` is parsed globally so description lists can read their
+        // term. In itemize/enumerate the optional label is user-visible content,
+        // so keep the old fallback shape instead of silently dropping it.
+        let itemize = latex_document_to_typst(
+            r"\documentclass{article}\begin{document}\begin{itemize}\item[--] custom marker\end{itemize}\end{document}",
+        );
+        assert!(
+            itemize.contains("- -- custom marker"),
+            "itemize optional label should stay visible, got:\n{}",
+            itemize
+        );
+
+        let enumerate = latex_document_to_typst(
+            r"\documentclass{article}\begin{document}\begin{enumerate}\item[(a)] custom enum\end{enumerate}\end{document}",
+        );
+        assert!(
+            enumerate.contains("+ (a) custom enum"),
+            "enumerate optional label should stay visible, got:\n{}",
+            enumerate
+        );
+    }
+
+    #[test]
+    fn test_item_label_with_math_and_commands_is_converted() {
+        // Issue #32 follow-up: a list-item label may itself contain LaTeX (math
+        // or text commands). It must be converted through the full pipeline, not
+        // emitted raw (`$O(n)$`) nor mangled by brace-stripping (`\textbf{X}`
+        // must not collapse to an empty/garbled term).
+        let latex = r"\documentclass{article}
+\begin{document}
+\begin{description}
+   \item[$O(n)$] linear time.
+   \item[\textbf{Bold}] a bold term.
+\end{description}
+\end{document}";
+        let result = latex_document_to_typst(latex);
+        assert!(
+            result.contains("/ $O(n)$: linear time."),
+            "math label should convert to inline Typst math, got:\n{}",
+            result
+        );
+        assert!(
+            result.contains("/ *Bold*: a bold term."),
+            "command label should convert (not be stripped to empty), got:\n{}",
+            result
+        );
     }
 }
 

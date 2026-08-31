@@ -31,6 +31,24 @@ fn test_multirow() {
 }
 
 #[test]
+fn test_multirow_non_ascii_no_panic() {
+    // Regression for issue #36: a multi-byte character inside a \multirow cell
+    // (`ı`, U+0131) used to make the bracket scanner mix a byte start index
+    // with a char end index, slicing across a char boundary and panicking.
+    // The inner content must now be extracted intact.
+    let cell = GridCell::parse("___TYPST_CELL___:table.cell(rowspan: 2)[Guc katı]");
+    assert_eq!(cell.rowspan, 2);
+    assert_eq!(cell.content, "Guc katı");
+
+    // End-to-end through the grid parser must not panic either.
+    let content =
+        "___TYPST_CELL___:table.cell(rowspan: 2)[Guc katı]|||CELL|||A|||ROW||| |||CELL|||B";
+    let alignments = vec![CellAlign::Left; 2];
+    let output = parse_with_grid_parser(content, alignments);
+    assert!(output.contains("table.cell(rowspan: 2)[Guc katı]"));
+}
+
+#[test]
 fn test_multicolumn() {
     // Simulate: A & \multicolumn{2}{c}{Wide} \\ 1 & 2 & 3
     let content =

@@ -475,6 +475,230 @@ fn element_is_mathy(elem: &SyntaxElement) -> bool {
     }
 }
 
+/// Glue a lone identifier/number to a following `(`/`[` (`f (x)` -> `f(x)`),
+/// but keep the space after a multi-letter token: `tilde (b)` (relation `~` on
+/// a group, from `\sim (b)`) must not collapse to the accent call `tilde(b)`
+/// (issue #34).
+fn glue_lone_identifier_calls(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        // <ident-char> <whitespace-run> `(`/`[`
+        if c.is_whitespace() && i > 0 && chars[i - 1].is_ascii_alphanumeric() {
+            let mut after_space = i;
+            while chars
+                .get(after_space)
+                .is_some_and(|next| next.is_whitespace())
+            {
+                after_space += 1;
+            }
+            // Lone token: the char before it is absent or non-alphanumeric.
+            let is_lone = i < 2 || !chars[i - 2].is_ascii_alphanumeric();
+            if is_lone && matches!(chars.get(after_space), Some('(') | Some('[')) {
+                i = after_space; // drop the space
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Split `s` on top-level occurrences of `sep`, respecting nesting of `()`,
+/// `[]`, and `{}` so a separator inside e.g. `frac(a, b)` is left alone.
+fn split_top_level(s: &str, sep: char) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for c in s.chars() {
+        match c {
+            '(' | '[' | '{' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' | ']' | '}' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            _ if c == sep && depth == 0 => {
+                parts.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    parts.push(cur.trim().to_string());
+    parts
+}
+
+/// Escape commas at the top level of a `cases` row. Inside a row that already
+/// has explicit `&` columns, a comma is literal content, not another column or
+/// row separator. Nested function/group commas remain untouched.
+fn escape_top_level_case_commas(s: &str) -> String {
+    let mut depth = 0i32;
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '(' | '[' | '{' => {
+                depth += 1;
+                out.push(c);
+            }
+            ')' | ']' | '}' => {
+                depth -= 1;
+                out.push(c);
+            }
+            ',' if depth == 0 => out.push_str("\\,"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// If `s` is exactly a single call `name(...)` — the paren matching the opening
+/// one is the final character — return the inner argument text; else `None`.
+fn strip_call<'a>(s: &'a str, name: &str) -> Option<&'a str> {
+    let inner = s.strip_prefix(name)?.strip_prefix('(')?.strip_suffix(')')?;
+    // Reject `name(a)(b)`: the first '(' must stay open until the end.
+    let mut depth = 1i32;
+    for c in inner.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            return None;
+        }
+    }
+    Some(inner)
+}
+
+/// String fallback that turns an already-converted `\left\{ ... \right.` body
+/// into `cases(...)` arguments, for shapes the AST path (see math.rs
+/// `classify_lr_cases_environment`) doesn't catch: `atop(a, b)`, a bare
+/// expression, or a leftover `mat(...)`. A row without an explicit `&` treats a
+/// top-level comma as a column hint; a row with `&` keeps commas as content.
+fn body_to_cases(body: &str) -> String {
+    let body = body.trim();
+
+    let rows: Vec<String> = if let Some(inner) = strip_call(body, "mat") {
+        let inner = inner.trim();
+        // Drop a leading `delim: #none` keyword argument, if present.
+        let inner = inner
+            .strip_prefix("delim: #none,")
+            .or_else(|| inner.strip_prefix("delim: #none ,"))
+            .map(str::trim)
+            .unwrap_or(inner);
+        split_top_level(inner, ';')
+    } else if let Some(inner) = strip_call(body, "atop") {
+        split_top_level(inner, ',')
+    } else {
+        // aligned / plain body: rows are separated by Typst line breaks `\`.
+        body.split('\\').map(|r| r.trim().to_string()).collect()
+    };
+
+    let cells: Vec<String> = rows
+        .iter()
+        .map(|r| r.trim_start_matches('&').trim())
+        .filter(|r| !r.is_empty())
+        .map(|r| {
+            if r.contains('&') {
+                escape_top_level_case_commas(r)
+            } else {
+                split_top_level(r, ',')
+                    .into_iter()
+                    .filter(|c| !c.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" & ")
+            }
+        })
+        .collect();
+
+    format!("cases({})", cells.join(", "))
+}
+
+/// The verbatim source text of a syntax element (node or token).
+fn element_source_text(el: &SyntaxElement) -> String {
+    match el {
+        SyntaxElement::Node(n) => n.text().to_string(),
+        SyntaxElement::Token(t) => t.text().to_string(),
+    }
+}
+
+/// Whether `el` is a command with exactly `name` (without its leading slash).
+fn is_command_named(el: &SyntaxElement, name: &str) -> bool {
+    let Some(node) = el.as_node() else {
+        return false;
+    };
+    CmdItem::cast(node.clone())
+        .and_then(|cmd| cmd.name_tok())
+        .is_some_and(|token| token.text().trim_start_matches('\\') == name)
+}
+
+/// Whether `s` is a TeX dimension (`6pt`, `-1.5em`, `0.5 ex`) or a length
+/// command (`\baselineskip`). Used to drop the optional row-spacing arg of `\\`
+/// (`\\[6pt]`) instead of leaking it into a matrix/aligned body (issue #41).
+/// Conservative: needs a numeric factor + known unit, or a control sequence;
+/// any other bracket group is left untouched.
+fn is_tex_dimension(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    // A control sequence may be a user length (\baselineskip); can't resolve
+    // without macro expansion, so accept it.
+    if s.starts_with('\\') {
+        return true;
+    }
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    if bytes[i] == b'+' || bytes[i] == b'-' {
+        i += 1;
+    }
+    let num_start = i;
+    let mut saw_digit = false;
+    let mut saw_decimal_point = false;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            saw_digit = true;
+            i += 1;
+        } else if bytes[i] == b'.' && !saw_decimal_point {
+            saw_decimal_point = true;
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if i == num_start || !saw_digit {
+        return false; // no numeric factor -> not a dimension
+    }
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    // TeX accepts an optional `true` modifier (e.g. `1truept`).
+    let unit = s[i..]
+        .strip_prefix("true")
+        .map(str::trim_start)
+        .unwrap_or(&s[i..]);
+    // Elastic glue units are valid too; long forms precede `fil` for correct
+    // suffix matching.
+    const UNITS: [&str; 16] = [
+        "filll", "fill", "fil", "pt", "pc", "mm", "cm", "in", "ex", "em", "bp", "dd", "cc", "sp",
+        "mu", "nd",
+    ];
+    UNITS.iter().any(|u| {
+        let Some(after_unit) = unit.strip_prefix(u) else {
+            return false;
+        };
+        after_unit.is_empty()
+            || after_unit.starts_with('\\')
+            || after_unit.chars().next().is_some_and(char::is_whitespace)
+    })
+}
+
 fn command_is_math_like(name: &str) -> bool {
     let base_name = name.strip_suffix('*').unwrap_or(name);
 
@@ -528,7 +752,10 @@ fn command_is_math_like(name: &str) -> bool {
             | "op"
             | "outerproduct"
             | "overbrace"
+            | "overleftarrow"
+            | "overleftrightarrow"
             | "overline"
+            | "overrightarrow"
             | "overset"
             | "qty"
             | "sqrt"
@@ -745,10 +972,45 @@ impl LatexConverter {
         self.postprocess_math(output)
     }
 
-    /// Visit a syntax node and convert it
+    /// Visit a syntax node and convert it.
     pub fn visit_node(&mut self, node: &SyntaxNode, output: &mut String) {
-        for child in node.children_with_tokens() {
-            self.visit_element(child, output);
+        let children: Vec<SyntaxElement> = node.children_with_tokens().collect();
+        self.visit_elements(&children, output);
+    }
+
+    /// Visit a sequence of elements, keeping TeX declaration scopes intact.
+    ///
+    /// `\displaystyle`/`\textstyle` are declarations (mitex emits the affected
+    /// expression as siblings): wrap the rendered suffix in `display(..)`/
+    /// `inline(..)`. A nested group re-enters here, so it can't leak out (#42).
+    pub fn visit_elements(&mut self, children: &[SyntaxElement], output: &mut String) {
+        let mut index = 0;
+        while index < children.len() {
+            let child = &children[index];
+            let style = if matches!(self.state.mode, ConversionMode::Math) {
+                if is_command_named(child, "displaystyle") {
+                    Some("display")
+                } else if is_command_named(child, "textstyle") {
+                    Some("inline")
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(style) = style {
+                let mut styled_content = String::new();
+                self.visit_elements(&children[index + 1..], &mut styled_content);
+                let styled_content = styled_content.trim();
+                if !styled_content.is_empty() {
+                    let _ = write!(output, "{}({})", style, styled_content);
+                }
+                return;
+            }
+
+            self.visit_element(child.clone(), output);
+            index += 1;
         }
     }
 
@@ -1127,6 +1389,41 @@ impl LatexConverter {
         None
     }
 
+    /// Recursively convert an optional `[...]` argument (bracket-clause analogue
+    /// of [`Self::convert_required_arg`]). Unlike [`Self::get_optional_arg`],
+    /// which returns raw brace-stripped text and mangles `\textbf{X}` into
+    /// `\textbfX`, this handles embedded math/commands — e.g. `\item[$O(n)$]`.
+    pub fn convert_optional_arg(&mut self, cmd: &CmdItem, index: usize) -> Option<String> {
+        let mut optional_count = 0;
+        for child in cmd.syntax().children() {
+            if child.kind() != SyntaxKind::ClauseArgument {
+                continue;
+            }
+            let Some(bracket) = child
+                .children()
+                .find(|c| c.kind() == SyntaxKind::ItemBracket)
+            else {
+                continue;
+            };
+            if optional_count == index {
+                let mut output = String::new();
+                let content: Vec<_> = bracket
+                    .children_with_tokens()
+                    .filter(|element| {
+                        !matches!(
+                            element.kind(),
+                            SyntaxKind::TokenLBracket | SyntaxKind::TokenRBracket
+                        )
+                    })
+                    .collect();
+                self.visit_elements(&content, &mut output);
+                return Some(output.trim().to_string());
+            }
+            optional_count += 1;
+        }
+        None
+    }
+
     /// Convert a required argument - recursively processes the content.
     ///
     /// Handles both braced (`{...}`) and unbraced single-token arguments. Empty
@@ -1139,15 +1436,19 @@ impl LatexConverter {
             if is_required_clause(&child) {
                 if required_count == index {
                     let mut output = String::new();
-                    for content in child.children_with_tokens() {
-                        match content.kind() {
-                            SyntaxKind::TokenLBrace
-                            | SyntaxKind::TokenRBrace
-                            | SyntaxKind::TokenLBracket
-                            | SyntaxKind::TokenRBracket => continue,
-                            _ => self.visit_element(content, &mut output),
-                        }
-                    }
+                    let content: Vec<_> = child
+                        .children_with_tokens()
+                        .filter(|element| {
+                            !matches!(
+                                element.kind(),
+                                SyntaxKind::TokenLBrace
+                                    | SyntaxKind::TokenRBrace
+                                    | SyntaxKind::TokenLBracket
+                                    | SyntaxKind::TokenRBracket
+                            )
+                        })
+                        .collect();
+                    self.visit_elements(&content, &mut output);
                     return Some(output.trim().to_string());
                 }
                 required_count += 1;
@@ -1244,6 +1545,13 @@ impl LatexConverter {
         result = result.replace(" ^", "^");
         result = result.replace(" _", "_");
 
+        // Rewrite `\left\{ ... \right.` (`lr({ ... )`) into Typst `cases(...)`.
+        result = self.fix_left_brace_cases(&result);
+
+        // Repair base-less `_`/`^` attachments now that spacing is canonical
+        // (`(_(` and leading `^(` are literal). Typst rejects these otherwise.
+        result = self.fix_baseless_attachment(&result);
+
         result.trim().to_string()
     }
 
@@ -1258,10 +1566,19 @@ impl LatexConverter {
         result = result.replace(" ,", ",");
         result = result.replace("( ", "(");
         result = result.replace(" )", ")");
-        result = result.replace(" (", "(");
-        result = result.replace(" [", "[");
+        // Only glue a lone identifier/number to a following `(`/`[` (function
+        // application like `f (x)` -> `f(x)`). We must NOT strip the space after
+        // a multi-letter symbol name: in Typst math `tilde (b)` (relation `~`
+        // on a group) and `tilde(b)` (the `tilde` accent call) mean different
+        // things, so the space in front of `(` is significant there (issue #34).
+        result = glue_lone_identifier_calls(&result);
         result = result.replace(" ^", "^");
         result = result.replace(" _", "_");
+
+        // Rewrite `\left\{ ... \right.` and repair base-less `_`/`^` attachments
+        // (see `postprocess_math`); the inline `$...$` path flows through here.
+        result = self.fix_left_brace_cases(&result);
+        result = self.fix_baseless_attachment(&result);
 
         result.trim().to_string()
     }
@@ -1420,8 +1737,14 @@ impl LatexConverter {
     /// Fix bb() (blackboard bold)
     pub fn fix_blackboard_bold(&self, input: &str) -> String {
         let mut result = input.to_string();
+        // Byte cursor into `result`. We must advance past every match we
+        // process, otherwise a `bb(...)` that rewrites to itself (any letter
+        // other than the special number sets, or an empty `bb()`) would be
+        // re-found at the same position on the next `find`, looping forever.
+        let mut search_from = 0;
 
-        while let Some(start) = result.find("bb(") {
+        while let Some(rel) = result[search_from..].find("bb(") {
+            let start = search_from + rel;
             let after = &result[start + 3..];
             if let Some(end) = self.find_matching_paren(after) {
                 let content = &after[..end];
@@ -1446,11 +1769,123 @@ impl LatexConverter {
                     replacement,
                     &result[total_end..]
                 );
+                // Resume scanning after the text we just wrote. Guarantees the
+                // cursor strictly advances even when the replacement still
+                // begins with `bb(`.
+                search_from = start + replacement.len();
             } else {
                 break;
             }
         }
 
+        result
+    }
+
+    /// Repair base-less `_`/`^` attachments that Typst rejects (from OCR-style
+    /// input like `V_{_{M-ABF}}` or a `^{a,b}` fragment), in two passes:
+    /// collapse a pure double attachment `_(_(X))` -> `_(X)`, then insert an
+    /// empty base `""` before any attachment still lacking one.
+    pub fn fix_baseless_attachment(&self, input: &str) -> String {
+        let collapsed = self.collapse_double_attachment(input);
+        self.insert_empty_attachment_base(&collapsed)
+    }
+
+    /// Collapse `_(_(X))` -> `_(X)` and `^(^(X))` -> `^(X)` when the inner
+    /// attachment is the outer group's only content (a pure wrapper).
+    fn collapse_double_attachment(&self, input: &str) -> String {
+        let mut result = input.to_string();
+        for op in ['_', '^'] {
+            // e.g. "_(_(" — an attachment whose content starts with the same
+            // base-less attachment.
+            let pat = format!("{op}({op}(");
+            let mut from = 0;
+            while let Some(rel) = result[from..].find(&pat) {
+                let start = from + rel; // outer op
+                let outer_open = start + 1; // outer '('
+                let inner_open = start + 3; // inner '('
+                let outer_end = self.find_matching_paren(&result[outer_open + 1..]);
+                let inner_end = self.find_matching_paren(&result[inner_open + 1..]);
+                if let (Some(o), Some(i)) = (outer_end, inner_end) {
+                    let outer_close = outer_open + 1 + o;
+                    let inner_close = inner_open + 1 + i;
+                    // Pure wrapper: the inner group's ')' is immediately
+                    // followed by the outer ')'.
+                    if inner_close + 1 == outer_close {
+                        let inner_content = result[inner_open + 1..inner_close].to_string();
+                        let replacement = format!("{op}({inner_content})");
+                        result = format!(
+                            "{}{}{}",
+                            &result[..start],
+                            replacement,
+                            &result[outer_close + 1..]
+                        );
+                        from = start + replacement.len();
+                        continue;
+                    }
+                }
+                from = start + 2;
+            }
+        }
+        result
+    }
+
+    /// Insert an empty base `""` before a `_(`/`^(` attachment that has no base
+    /// (at the start of the string or right after an opening `(`). Both are
+    /// positions where Typst would otherwise report an unexpected `_`/`^`.
+    fn insert_empty_attachment_base(&self, input: &str) -> String {
+        let mut out = String::with_capacity(input.len() + 4);
+        let mut last_nonspace: Option<char> = None;
+        let mut chars = input.chars().peekable();
+        while let Some(c) = chars.next() {
+            if (c == '_' || c == '^')
+                && chars.peek() == Some(&'(')
+                && matches!(last_nonspace, None | Some('('))
+            {
+                out.push_str("\"\"");
+                last_nonspace = Some('"');
+            }
+            out.push(c);
+            if !c.is_whitespace() {
+                last_nonspace = Some(c);
+            }
+        }
+        out
+    }
+
+    /// Rewrite a `\left\{ ... \right.` piecewise idiom into `cases(...)`. The
+    /// converter emits it as `lr({ ... )` with a null right delimiter, so the
+    /// `{` never closes and Typst reports "unclosed delimiter". Detect exactly
+    /// that shape (an `lr(` whose content opens with an unmatched `{`) and
+    /// rewrite it; a balanced `lr({ ... })` (a genuine set) is left alone.
+    pub fn fix_left_brace_cases(&self, input: &str) -> String {
+        let mut result = input.to_string();
+        let mut from = 0;
+        while let Some(rel) = result[from..].find("lr(") {
+            let lr_start = from + rel;
+            let open_paren = lr_start + 2; // the '(' of `lr(`
+            let Some(close_rel) = self.find_matching_paren(&result[open_paren + 1..]) else {
+                from = lr_start + 3;
+                continue;
+            };
+            let lr_close = open_paren + 1 + close_rel; // the matching ')'
+            let inner = &result[open_paren + 1..lr_close];
+            let inner_trim = inner.trim_start();
+            // Null right delimiter <=> the leading '{' has no matching '}'.
+            if let Some(body) = inner_trim.strip_prefix('{') {
+                if inner.matches('{').count() > inner.matches('}').count() {
+                    let cases = body_to_cases(body.trim());
+                    result = format!(
+                        "{}{}{}",
+                        &result[..lr_start],
+                        cases,
+                        &result[lr_close + 1..]
+                    );
+                    from = lr_start + cases.len();
+                    continue;
+                }
+            }
+            from = lr_start + 3;
+        }
         result
     }
 
@@ -1702,11 +2137,78 @@ impl LatexConverter {
 
     /// Visit environment content (excluding begin/end)
     pub fn visit_env_content(&mut self, node: &SyntaxNode, output: &mut String) {
-        for child in node.children_with_tokens() {
+        let children: Vec<SyntaxElement> = node.children_with_tokens().collect();
+        let mut content = Vec::with_capacity(children.len());
+        let mut i = 0;
+        while i < children.len() {
+            let child = &children[i];
             match child.kind() {
-                SyntaxKind::ItemBegin | SyntaxKind::ItemEnd => continue,
-                _ => self.visit_element(child, output),
+                SyntaxKind::ItemBegin | SyntaxKind::ItemEnd => {
+                    i += 1;
+                }
+                SyntaxKind::ItemNewLine => {
+                    content.push(child.clone());
+                    // Drop the optional row-spacing arg of `\\` (`\\[6pt]`),
+                    // else it leaks into the row as a stray cell (issue #41).
+                    // mitex emits it as sibling `[`/body/`]` tokens or one
+                    // `ItemBracket`; `skip_optional_row_spacing` handles both.
+                    i = self.skip_optional_row_spacing(&children, i + 1);
+                }
+                _ => {
+                    content.push(child.clone());
+                    i += 1;
+                }
             }
+        }
+        self.visit_elements(&content, output);
+    }
+
+    /// If the elements at `start` form an optional `[<dimension>]` group (after
+    /// optional whitespace), return the index just past its closing `]`;
+    /// otherwise return `start` unchanged. Only a dimension-like body (see
+    /// [`is_tex_dimension`]) is consumed, so genuine bracketed row content is
+    /// preserved.
+    fn skip_optional_row_spacing(&self, children: &[SyntaxElement], start: usize) -> usize {
+        let mut j = start;
+        while j < children.len()
+            && (matches!(
+                children[j].kind(),
+                SyntaxKind::TokenWhiteSpace | SyntaxKind::TokenLineBreak
+            ) || is_command_named(&children[j], "par"))
+        {
+            j += 1;
+        }
+        if j >= children.len() {
+            return start;
+        }
+
+        if children[j].kind() == SyntaxKind::ItemBracket {
+            let raw = element_source_text(&children[j]);
+            let is_dimension = raw
+                .strip_prefix('[')
+                .and_then(|body| body.strip_suffix(']'))
+                .is_some_and(is_tex_dimension);
+            return if is_dimension { j + 1 } else { start };
+        }
+
+        if children[j].kind() != SyntaxKind::TokenLBracket {
+            return start;
+        }
+        let mut k = j + 1;
+        let mut body = String::new();
+        let mut closed = false;
+        while k < children.len() {
+            if children[k].kind() == SyntaxKind::TokenRBracket {
+                closed = true;
+                break;
+            }
+            body.push_str(&element_source_text(&children[k]));
+            k += 1;
+        }
+        if closed && is_tex_dimension(body.trim()) {
+            k + 1 // consume through the closing ']'
+        } else {
+            start
         }
     }
 

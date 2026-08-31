@@ -287,6 +287,7 @@ lazy_static! {
         m.insert("diaer", MathHandler::Command { latex_cmd: "\\ddot" });  // diaeresis
         m.insert("arrow.r", MathHandler::Command { latex_cmd: "\\overrightarrow" });
         m.insert("arrow.l", MathHandler::Command { latex_cmd: "\\overleftarrow" });
+        m.insert("arrow.l.r", MathHandler::Command { latex_cmd: "\\overleftrightarrow" });
 
         // Spacing commands
         m.insert("thin", MathHandler::Command { latex_cmd: "\\," });

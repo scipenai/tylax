@@ -97,20 +97,21 @@ impl GridCell {
                 }
             }
 
-            // Extract inner content: table.cell(...)[INNER]
-            // We look for the first '[' and the matching closing ']'
+            // Extract inner content `table.cell(...)[INNER]`. Keep `content_end` a
+            // byte offset (via `char_indices()`) to match the byte `content_start`;
+            // mixing byte and char offsets sliced inside a multi-byte char and
+            // panicked on a non-ASCII `\multirow` cell like `katı` (issue #36).
             if let Some(content_start) = marker_content.find('[') {
                 let mut depth = 1;
                 let mut content_end = content_start;
-                let chars: Vec<char> = marker_content.chars().collect();
 
-                for (i, &ch) in chars.iter().enumerate().skip(content_start + 1) {
+                for (offset, ch) in marker_content[content_start + 1..].char_indices() {
                     if ch == '[' {
                         depth += 1;
                     } else if ch == ']' {
                         depth -= 1;
                         if depth == 0 {
-                            content_end = i;
+                            content_end = content_start + 1 + offset;
                             break;
                         }
                     }
