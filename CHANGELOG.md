@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **L2T equation labels**: a label nested in `aligned`/`split` names the enclosing equation and is emitted once, outside the math body (#43).
 - **L2T citations**: with a manual `thebibliography`, `\cite{k}` resolves to `@k` against the rendered entry anchors, which compiles. Typst's `#cite(..)` needs a real `#bibliography(..)` that the manual path never emits, so the output previously failed with "the document does not contain a bibliography". Documents using external BibTeX keep `#cite(..)` unchanged (#37).
 - **L2T references**: `\eqref{k}` targets the label the document actually defines -- an injected `eq-` prefix pointed at a label that was never created -- and renders as `(2)` without Typst re-inserting a supplement the author already wrote (#43).
+- **TikZ**: `\node[draw, ...]` emits a CeTZ `rect` only for a genuine rectangle with concrete dimensions at an absolute position. A circle, an ellipse, rounded corners or any option the converter does not understand falls back to a label-only `content`, instead of drawing a box the source never asked for (#39). Repeated options take their last value, as TikZ applies them, and `draw=none` is treated as the mode switch it is rather than as a stroke colour.
 
 ## [0.3.7] - 2026-07-18
 

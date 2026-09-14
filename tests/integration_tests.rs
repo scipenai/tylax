@@ -3244,7 +3244,9 @@ mod options {
 // ============================================================================
 
 mod tikz_cetz {
-    use super::latex_document_to_typst;
+    use super::{
+        latex_document_to_typst, latex_document_to_typst_with_options, L2TOptions, PreambleMode,
+    };
     use tylax::tikz::{convert_cetz_to_tikz, convert_tikz_to_cetz, is_cetz_code};
 
     #[test]
@@ -3354,6 +3356,132 @@ canvas({
             !cetz.contains("font") && !cetz.contains("sffamily"),
             "picture-level font option should not appear in output, got: {}",
             cetz
+        );
+    }
+
+    #[test]
+    fn test_tikz_coordinate_is_referenceable() {
+        // Issue #39: `\coordinate (g1) at ..` used to become a bare comment, so a
+        // later `line("g1", ..)` referenced an element that did not exist and the
+        // CeTZ output failed to compile. It must now emit a named anchor.
+        let tikz = r"\begin{tikzpicture}
+  \coordinate (g1) at (0,0);
+  \coordinate (g2) at (0,-2.5);
+  \draw (g1) -- (g2);
+\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(
+            cetz.contains(r#"content((0, 0), [], name: "g1")"#),
+            "coordinate should become a named anchor, got: {}",
+            cetz
+        );
+        assert!(
+            !cetz.contains("// Coordinate"),
+            "coordinate must not be dropped to a comment, got: {}",
+            cetz
+        );
+    }
+
+    #[test]
+    fn test_tikz_drawn_rectangle_node_emits_rect() {
+        // Issue #39: `\node[draw, rectangle, minimum width=.., minimum height=..]`
+        // must emit an actual `rect(..)` (named for references) plus its label,
+        // not just a `content` that drops the box.
+        let tikz = r"\begin{tikzpicture}
+  \node[draw, rectangle, minimum width=1cm, minimum height=0.6cm] (sw) at (2,0) {$S$};
+\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(
+            cetz.contains(r#"rect((1.5, -0.3), (2.5, 0.3), name: "sw")"#),
+            "drawn rectangle node should emit a sized, named rect(), got: {}",
+            cetz
+        );
+        assert!(
+            cetz.contains("content((2, 0), [$S$])"),
+            "the node label should still be placed, got: {}",
+            cetz
+        );
+    }
+
+    #[test]
+    fn test_tikz_drawn_rectangle_converts_explicit_length_units() {
+        // A rectangle is only emitted when both dimensions are concrete. The
+        // conversion must preserve TeX units rather than treating `pt` as cm.
+        let tikz = r"\begin{tikzpicture}
+  \node[draw, rectangle, minimum width=28.45pt, minimum height=10mm] at (0,0) {A};
+  \node[draw, rectangle] at (1,0) {B};
+\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(
+            cetz.contains("rect((-0.5, -0.5), (0.5, 0.5))"),
+            "explicit pt/mm dimensions should convert to cm-scale coordinates, got: {}",
+            cetz
+        );
+        assert!(
+            !cetz.contains("rect((0.5, -0.3), (1.5, 0.3))"),
+            "a node without concrete dimensions must not receive an invented rectangle, got: {}",
+            cetz
+        );
+        assert!(
+            cetz.contains("content((1, 0), [B])"),
+            "the conservative fallback must retain the node content, got: {}",
+            cetz
+        );
+    }
+
+    #[test]
+    fn test_tikz_draw_colored_rectangle_keeps_border_and_style() {
+        // `draw=<color>` is still a draw action in TikZ, not merely a color
+        // declaration. The generated rectangle must retain both its geometry
+        // and its stroke style; `draw=none` deliberately remains content only.
+        let tikz = r"\begin{tikzpicture}
+  \node[draw = red, rectangle, minimum width=1cm, minimum height=0.6cm] at (0,0) {A};
+  \node[draw=none, rectangle, minimum width=1cm, minimum height=0.6cm] at (2,0) {B};
+\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(
+            cetz.contains("rect((-0.5, -0.3), (0.5, 0.3), stroke: red)"),
+            "colored draw node should emit a styled rectangle, got: {}",
+            cetz
+        );
+        assert!(
+            !cetz.contains("rect((1.5, -0.3), (2.5, 0.3))"),
+            "draw=none must not invent a rectangle, got: {}",
+            cetz
+        );
+        assert!(
+            cetz.contains("content((2, 0), [B])"),
+            "draw=none must retain node content, got: {}",
+            cetz
+        );
+
+        // The public LaTeX-to-Typst route includes macro preprocessing before
+        // it dispatches the TikZ environment. It must preserve the same node
+        // geometry and style as the direct converter above.
+        let no_expand_output = latex_document_to_typst_with_options(
+            tikz,
+            &L2TOptions {
+                expand_macros: false,
+                preamble: PreambleMode::None,
+                ..Default::default()
+            },
+        );
+        assert!(
+            no_expand_output.contains("rect((-0.5, -0.3), (0.5, 0.3), stroke: red)"),
+            "TikZ should convert when macro expansion is disabled, got: {}",
+            no_expand_output
+        );
+
+        let public_output = latex_document_to_typst(tikz);
+        assert!(
+            public_output.contains("rect((-0.5, -0.3), (0.5, 0.3), stroke: red)"),
+            "public L2T conversion must retain the colored rectangle, got: {}",
+            public_output
+        );
+        assert!(
+            public_output.contains("content((2, 0), [B])"),
+            "public L2T conversion must retain draw=none node content, got: {}",
+            public_output
         );
     }
 
