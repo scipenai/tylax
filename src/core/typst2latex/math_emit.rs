@@ -1,4 +1,4 @@
-use super::context::{ConvertContext, TokenType};
+use super::context::{ConvertContext, EnvironmentContext, TokenType};
 use super::math_ir::{
     normalize_math_ir, MathCaseRow, MathCommand, MathEnvironment, MathIr, MathSpacing,
     MathStyleMode,
@@ -505,7 +505,7 @@ fn emit_linebreak(ctx: &mut ConvertContext) {
     // context (`align`, top-level display). Inside an inline fragment (script,
     // matrix cell, argument) a `\\` would be invalid, so it degrades to a bare
     // `\` there.
-    if ctx.linebreak_as_row {
+    if ctx.is_in_env(&EnvironmentContext::Align) || ctx.linebreak_as_row {
         emit_raw_literal(" \\\\\n", ctx);
     } else {
         emit_raw_literal(" \\\n", ctx);
@@ -545,7 +545,7 @@ fn delimiter_token_type(delim: &str, is_open: bool) -> TokenType {
 mod tests {
     use super::{
         can_strip_wrapping_left_right_parens, can_strip_wrapping_plain_parens, emit_math_ir,
-        emit_math_ir_to_string, ConvertContext, MathIr, MathSpacing,
+        emit_math_ir_to_string, ConvertContext, EnvironmentContext, MathIr, MathSpacing,
     };
 
     #[test]
@@ -554,7 +554,7 @@ mod tests {
         // LaTeX's `\\` row separator. emit_math_ir runs on a row-context context.
         let mut ctx = ConvertContext::new();
         ctx.in_math = true;
-        ctx.linebreak_as_row = true;
+        ctx.push_env(EnvironmentContext::Align);
         emit_math_ir(
             &MathIr::Seq(vec![
                 MathIr::Ident("a".to_string()),
@@ -568,6 +568,28 @@ mod tests {
             result.contains("a \\\\\n") && result.contains("b"),
             "row-context line break should emit `\\\\`, got: {}",
             result
+        );
+    }
+
+    #[test]
+    fn test_linebreak_compatibility_flag_remains_honored() {
+        // `linebreak_as_row` is public in the 0.3.x API. Internal conversion
+        // now uses EnvironmentContext::Align, but direct callers that set the
+        // established compatibility flag must retain the old behavior.
+        let mut ctx = ConvertContext::new();
+        ctx.in_math = true;
+        ctx.linebreak_as_row = true;
+        emit_math_ir(
+            &MathIr::Seq(vec![
+                MathIr::Ident("a".to_string()),
+                MathIr::Linebreak,
+                MathIr::Ident("b".to_string()),
+            ]),
+            &mut ctx,
+        );
+        assert!(
+            ctx.finalize().contains("a \\\\\n"),
+            "the public compatibility flag must still emit a row break"
         );
     }
 

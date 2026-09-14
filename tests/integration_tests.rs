@@ -5,9 +5,9 @@ use std::process::{Command, Stdio};
 
 use tylax::{
     convert_auto, convert_auto_document, detect_format, latex_document_to_typst,
-    latex_document_to_typst_with_options, latex_to_typst, typst_to_latex,
-    typst_to_latex_with_diagnostics, typst_to_latex_with_options, L2TOptions, PreambleMode,
-    T2LOptions,
+    latex_document_to_typst_with_options, latex_to_typst, typst_file_to_latex_with_diagnostics,
+    typst_file_to_latex_with_options, typst_to_latex, typst_to_latex_with_diagnostics,
+    typst_to_latex_with_options, L2TOptions, PreambleMode, T2LOptions,
 };
 
 fn run_t2l_cli(input: &str) -> String {
@@ -35,6 +35,30 @@ fn run_t2l_cli(input: &str) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
 
+    String::from_utf8(output.stdout).expect("CLI output was not valid UTF-8")
+}
+
+fn run_t2l_cli_file(input_path: &std::path::Path) -> String {
+    run_t2l_cli_file_with_args(input_path, &[])
+}
+
+fn run_t2l_cli_file_no_eval(input_path: &std::path::Path) -> String {
+    run_t2l_cli_file_with_args(input_path, &["--no-eval"])
+}
+
+fn run_t2l_cli_file_with_args(input_path: &std::path::Path, extra_args: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_t2l"))
+        .arg("--direction")
+        .arg("t2l")
+        .args(extra_args)
+        .arg(input_path)
+        .output()
+        .expect("failed to run t2l CLI on a file");
+    assert!(
+        output.status.success(),
+        "t2l CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8(output.stdout).expect("CLI output was not valid UTF-8")
 }
 
@@ -152,6 +176,39 @@ mod batch_conversion_tests {
         assert_eq!(report.error_count, 0);
         assert!(output.join("Root/Intro.tex").exists());
         assert!(output.join("Root/Chapter/Section.tex").exists());
+    }
+
+    #[test]
+    fn batch_t2l_resolves_bibtex_keys_relative_to_each_source_file() {
+        // Issue #47: batch conversion must retain the input file's directory
+        // when resolving #bibliography("refs.bib"), rather than using the
+        // process directory or guessing from the bibliography declaration.
+        let project = TempProject::new("batch-bibtex-reference-resolution");
+        project.write(
+            "paper.typ",
+            "Known @smith2020; unknown @missing.\n#bibliography(\"refs.bib\")\n",
+        );
+        project.write(
+            "refs.bib",
+            "@article{smith2020, title = {A Title}, author = {Smith, J.}, year = {2020}}",
+        );
+
+        let output = project.path("out");
+        let mut opts = options(&project.path("paper.typ"), &output);
+        opts.direction = BatchDirection::TypstToLatex;
+
+        let report = convert_batch(&opts).expect("batch conversion should succeed");
+        assert_eq!(report.error_count, 0);
+
+        let latex = project.read("out/paper.tex");
+        assert!(
+            latex.contains(r"\cite{smith2020}"),
+            "known BibTeX keys must become citations:\n{latex}"
+        );
+        assert!(
+            latex.contains(r"\ref{missing}"),
+            "unknown targets must not be guessed as citations:\n{latex}"
+        );
     }
 
     #[test]
@@ -1712,6 +1769,32 @@ mod l2t_document {
         }
     }
 
+    /// A downstream literal fixes the complete field set and field types of the
+    /// 0.3.7 public `ConvertContext` API. It catches both removal and addition:
+    /// either change makes an external struct literal fail to compile. Unlike a
+    /// source-text comparison, this works from a source archive without `.git`.
+    #[test]
+    fn released_convert_context_literal_stays_valid() {
+        use std::collections::HashMap;
+        use tylax::core::typst2latex::{ConvertContext, EnvironmentContext, T2LOptions, TokenType};
+
+        let _ = ConvertContext {
+            output: String::new(),
+            in_environment: false,
+            last_token: TokenType::None,
+            indent_level: 0,
+            in_math: false,
+            options: T2LOptions::default(),
+            env_stack: Vec::<EnvironmentContext>::new(),
+            list_depth: 0,
+            labels: Vec::new(),
+            warnings: Vec::new(),
+            variables: HashMap::new(),
+            pending_label: None,
+            linebreak_as_row: false,
+        };
+    }
+
     /// `maps.rs` is generated from `tools/gen_maps.py`, so an environment
     /// signature added to only one of them is a latent regression: regenerating
     /// would silently drop it. (The generator currently refuses to overwrite a
@@ -2942,6 +3025,180 @@ Mass \si{\kilogram}, count \num{1000}, speed \unit{\metre\per\second}, angle \an
 
 mod t2l_document {
     use super::*;
+
+    /// Issue #43 (comment): Typst renders `@sec-one` as "Section 1" — the
+    /// supplement comes from the labelled element's kind and is never written
+    /// in the source. A bare `\ref` renders only the number, so "See Section 1"
+    /// silently became "See 1". The word has to be restored from what the label
+    /// points at, which is a document-level fact, not a guess from its name.
+    #[test]
+    fn reference_supplements_are_restored_from_the_target_kind() {
+        let latex = typst_to_latex(
+            "See @sec-one for details, @fig-x and @tbl-y.\n\n\
+             = One <sec-one>\n\n\
+             #figure([], caption: [F]) <fig-x>\n\n\
+             #figure(table(columns: 1, [a]), caption: [T]) <tbl-y>\n",
+        );
+        assert!(
+            latex.contains("Section~\\ref{sec-one}"),
+            "a heading reference must read 'Section', got:\n{latex}"
+        );
+        assert!(
+            latex.contains("Figure~\\ref{fig-x}"),
+            "a figure reference must read 'Figure', got:\n{latex}"
+        );
+        // A figure whose body is a table is a TABLE for supplement purposes.
+        assert!(
+            latex.contains("Table~\\ref{tbl-y}"),
+            "a table figure must read 'Table', got:\n{latex}"
+        );
+    }
+
+    #[test]
+    fn reference_to_an_unknown_label_is_left_bare() {
+        // No target means no supplement: emitting a guessed word would state
+        // something the document does not say.
+        let latex = typst_to_latex("See @nowhere for details.\n");
+        assert!(
+            latex.contains("\\ref{nowhere}"),
+            "the reference must still be emitted, got:\n{latex}"
+        );
+        assert!(
+            !latex.contains("Section~") && !latex.contains("Figure~"),
+            "no supplement may be invented, got:\n{latex}"
+        );
+    }
+
+    #[test]
+    fn reference_markers_never_leak_into_the_output() {
+        for source in [
+            "See @sec-one.\n\n= One <sec-one>\n",
+            "See @nowhere.\n",
+            "#ref(<sec-one>)\n\n= One <sec-one>\n",
+        ] {
+            let latex = typst_to_latex(source);
+            assert!(
+                !latex.contains('\u{E012}') && !latex.contains('\u{E013}'),
+                "a reference sentinel leaked for {source:?}: {latex}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_issue_12_ignore_next_line_directive() {
+        // A `//! tylax: ignore-next-line` directive drops the following line
+        // (e.g. a Typst-only import) from the LaTeX output, while the rest of
+        // the document converts normally.
+        let typst =
+            "//! tylax: ignore-next-line\n#import \"@preview/cetz:0.3.1\"\n\n= Real Heading";
+        let result = typst_to_latex_with_options(typst, &T2LOptions::default());
+        assert!(
+            !result.contains("cetz"),
+            "ignored import should not appear, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("tylax"),
+            "directive comment should not leak, got: {}",
+            result
+        );
+        assert!(
+            result.contains("\\section"),
+            "surrounding content should still convert, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_issue_17_include_becomes_subimport() {
+        // `#include "sections/child.typ"` maps to `\subimport{sections/}{child}`
+        // (extension stripped, directory split out), keeping multi-file
+        // structure intact with file-relative path semantics.
+        let typst = "= Parent\n\n#include \"sections/child.typ\"\n\nAfter.";
+        let result = typst_to_latex_with_options(typst, &T2LOptions::default());
+        assert!(
+            result.contains("\\subimport{sections/}{child}"),
+            "expected \\subimport, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("child.typ"),
+            "raw path should not leak as text, got: {}",
+            result
+        );
+        assert!(result.contains("After."));
+    }
+
+    #[test]
+    fn test_issue_17_same_dir_include_uses_dot_base() {
+        // A same-directory include has no `/`, so the base is `./`.
+        let typst = "#include \"chapter.typ\"";
+        let result = typst_to_latex_with_options(typst, &T2LOptions::default());
+        assert!(
+            result.contains("\\subimport{./}{chapter}"),
+            "expected ./ base for same-dir include, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_issue_17_full_document_injects_import_package() {
+        // Full-document mode must pull in the `import` package that provides
+        // `\subimport`.
+        let typst = "#include \"sections/intro.typ\"";
+        let opts = T2LOptions {
+            full_document: true,
+            ..Default::default()
+        };
+        let result = typst_to_latex_with_options(typst, &opts);
+        assert!(
+            result.contains("\\usepackage{import}"),
+            "import package should be declared, got:\n{}",
+            result
+        );
+        assert!(result.contains("\\subimport{sections/}{intro}"));
+    }
+
+    #[test]
+    fn test_issue_12_ignore_block_directive() {
+        let typst = "= Kept\n\n//! tylax: ignore-begin\n#import \"helper\": *\n#let scratch = 1\n//! tylax: ignore-end\n\n= Also Kept";
+        let result = typst_to_latex_with_options(typst, &T2LOptions::default());
+        assert!(
+            !result.contains("helper"),
+            "block body dropped, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("scratch"),
+            "block body dropped, got: {}",
+            result
+        );
+        assert_eq!(
+            result.matches("\\section").count(),
+            2,
+            "both headings survive, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_tylax_directive_inside_raw_block_is_literal() {
+        // A `//! tylax:` sequence is only a directive when Typst parses it as a
+        // real line comment. Inside a fenced raw block it is literal content, so
+        // the next line must survive rather than being dropped.
+        let typst = "```\n//! tylax: ignore-next-line\nlet important = 42\n```";
+        let result = typst_to_latex_with_options(typst, &T2LOptions::default());
+        assert!(
+            result.contains("let important = 42"),
+            "raw-block line after a literal directive must survive, got: {}",
+            result
+        );
+        assert!(
+            result.contains("//! tylax: ignore-next-line"),
+            "literal directive text inside a raw block must survive, got: {}",
+            result
+        );
+    }
 
     #[test]
     fn test_heading_conversion() {
@@ -5340,6 +5597,247 @@ mod citation_edge_cases {
 
         let nameref = latex_document_to_typst(r#"See \nameref{sec:intro}."#);
         assert!(nameref.contains("See @sec-intro."), "got: {}", nameref);
+    }
+}
+
+// ============================================================================
+// Issue #46 / #47 - Typst structural table cells and bare `@` targets
+// ============================================================================
+
+mod t2l_table_cells_and_bare_references {
+    use super::*;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    struct TempSourceDir {
+        path: PathBuf,
+    }
+
+    impl TempSourceDir {
+        fn new(name: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("tylax-{name}-{nonce}"));
+            fs::create_dir_all(&path).expect("temp source directory should be created");
+            Self { path }
+        }
+
+        fn write(&self, name: &str, contents: &str) -> PathBuf {
+            let path = self.path.join(name);
+            fs::write(&path, contents).expect("fixture source should be written");
+            path
+        }
+    }
+
+    impl Drop for TempSourceDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn empty_table_cells_keep_their_position_in_all_t2l_paths() {
+        let input = "#table(columns: 3, [], [A], [B], [r1], [1], [2])";
+        let output = assert_t2l_paths_match(input);
+
+        assert!(
+            output.contains("\n & A & B "),
+            "the leading empty cell must remain in the first row:\n{output}"
+        );
+        assert!(
+            output.contains("\n r1 & 1 & 2 "),
+            "the following row must retain its original columns:\n{output}"
+        );
+
+        let diagnostics = typst_to_latex_with_diagnostics(input, &T2LOptions::default());
+        assert!(
+            diagnostics
+                .warnings
+                .iter()
+                .all(|warning| !warning.message.contains("undefined variable: table")),
+            "table helpers are valid Typst constructs, not undefined variables: {:?}",
+            diagnostics.format_warnings()
+        );
+    }
+
+    #[test]
+    fn empty_header_cells_keep_their_position_in_all_t2l_paths() {
+        let input = "#table(columns: 3, table.header([], [A], [B]), [r1], [1], [2])";
+        let output = assert_t2l_paths_match(input);
+
+        assert!(
+            output.contains("\n & A & B "),
+            "the leading empty header cell must remain:\n{output}"
+        );
+        assert!(
+            output.contains("\n r1 & 1 & 2 "),
+            "data cells must not shift under the header:\n{output}"
+        );
+    }
+
+    #[test]
+    fn empty_cells_preserve_spanning_header_alignment_in_all_t2l_paths() {
+        // The complete issue #46 reproducer: the empty first cell is necessary
+        // to align the two-column group heading above A/B rather than shifting
+        // Row into its span.
+        let input = r#"
+#figure(
+  table(
+    columns: 3,
+    table.header([], table.cell(colspan: 2)[Group]),
+    table.header([Row], [A], [B]),
+    [r1], [1], [2],
+  ),
+  caption: [Two header rows.],
+)
+"#;
+        let output = assert_t2l_paths_match(input);
+
+        assert!(
+            output.contains("\n & \\multicolumn{2}{|c|}{Group} "),
+            "the empty header cell must precede the span:\n{output}"
+        );
+        assert!(
+            output.contains("\n Row & A & B "),
+            "the second header row must retain its three columns:\n{output}"
+        );
+        assert!(
+            output.contains("\n r1 & 1 & 2 "),
+            "body cells must stay under their headers:\n{output}"
+        );
+    }
+
+    #[test]
+    fn bare_at_targets_without_file_context_remain_references() {
+        // The string API has no file-system boundary, so it must not guess that
+        // an unknown target is a citation merely because a bibliography appears.
+        let input = r#"
+As shown previously @smith2020, this holds. See also @sec-one.
+
+= One <sec-one>
+
+#bibliography("refs.bib", style: "ieee")
+"#;
+        let outputs = [
+            typst_to_latex_with_options(input, &T2LOptions::default()),
+            typst_to_latex_with_diagnostics(input, &T2LOptions::default()).output,
+            run_t2l_cli(input),
+        ];
+
+        for output in outputs {
+            assert!(
+                output.contains(r"\ref{smith2020}"),
+                "without a BibTeX key set, an unknown target must stay a reference:\n{output}"
+            );
+            assert!(
+                output.contains(r"Section~\ref{sec-one}"),
+                "document label must remain a cross-reference:\n{output}"
+            );
+            assert!(
+                output.contains(r"\bibliography{refs}"),
+                "bibliography declaration must be preserved:\n{output}"
+            );
+            assert!(
+                !output.contains(r"\cite{smith2020}"),
+                "the string API must not guess a citation from #bibliography alone:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_context_resolves_only_real_bibtex_keys_as_citations() {
+        // Issue #47: resolving bare @target must consult the actual .bib file,
+        // not merely infer citations from the presence of #bibliography.
+        let source_dir = TempSourceDir::new("issue-47-bib-keys");
+        let input = r#"
+As shown previously @smith2020. See @missing-key and @sec-one.
+
+= One <sec-one>
+
+#bibliography("refs.bib", style: "ieee")
+"#;
+        let source_path = source_dir.write("in.typ", input);
+        source_dir.write(
+            "refs.bib",
+            "@article{smith2020, title = {A Title}, author = {Smith, J.}, year = {2020}}",
+        );
+
+        let outputs = [
+            typst_file_to_latex_with_options(input, &source_path, &T2LOptions::default()),
+            typst_file_to_latex_with_diagnostics(input, &source_path, &T2LOptions::default())
+                .output,
+            run_t2l_cli_file(&source_path),
+            run_t2l_cli_file_no_eval(&source_path),
+        ];
+
+        for output in outputs {
+            assert!(
+                output.contains(r"\cite{smith2020}"),
+                "a real BibTeX key must become a citation:\n{output}"
+            );
+            assert!(
+                output.contains(r"\ref{missing-key}"),
+                "a non-BibTeX target must remain a reference:\n{output}"
+            );
+            assert!(
+                output.contains(r"Section~\ref{sec-one}"),
+                "a local label must remain a cross-reference:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_at_local_labels_remain_references_when_a_bibliography_exists() {
+        let input = r#"
+Local target <local> and @local.
+
+#bibliography("refs.bib")
+"#;
+        let output = assert_t2l_paths_match(input);
+
+        assert!(
+            output.contains(r"\ref{local}"),
+            "a local label must stay a reference:\n{output}"
+        );
+        assert!(
+            !output.contains(r"\cite{local}"),
+            "a local label must not be reclassified as a citation:\n{output}"
+        );
+    }
+
+    #[test]
+    fn bare_at_targets_without_a_bibliography_remain_references() {
+        let output = assert_t2l_paths_match("See @unresolved-target.");
+        assert!(
+            output.contains(r"\ref{unresolved-target}"),
+            "without a bibliography, a bare target remains a reference:\n{output}"
+        );
+        assert!(
+            !output.contains(r"\cite{unresolved-target}"),
+            "a bibliography-free document must not gain a citation:\n{output}"
+        );
+    }
+
+    #[test]
+    fn explicit_ref_is_never_reclassified_as_a_citation() {
+        let input = r#"
+See #ref(<external-label>).
+#bibliography("refs.bib")
+"#;
+        let output = assert_t2l_paths_match(input);
+        assert!(
+            output.contains(r"\ref{external-label}"),
+            "an explicit #ref must stay a reference:\n{output}"
+        );
+        assert!(
+            !output.contains(r"\cite{external-label}"),
+            "an explicit #ref must not become a citation:\n{output}"
+        );
     }
 }
 

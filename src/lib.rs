@@ -76,6 +76,10 @@ pub use core::typst2latex::{
     typst_document_to_latex, typst_to_latex, typst_to_latex_with_diagnostics,
     typst_to_latex_with_eval, typst_to_latex_with_options, ConversionResult as T2LConversionResult,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use core::typst2latex::{
+    typst_file_to_latex_with_diagnostics, typst_file_to_latex_with_options,
+};
 pub use core::typst2latex::{DocumentWrapperMode, T2LOptions};
 
 pub use core::latex2typst::{

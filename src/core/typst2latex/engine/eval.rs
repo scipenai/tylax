@@ -22,6 +22,7 @@ use super::value::{
     SourceSpan, Value, VertAlign,
 };
 use super::vfs::{NoopVfs, VirtualFileSystem};
+use crate::core::typst2latex::supplement::mark_at_reference;
 
 /// Maximum number of loop iterations (infinite loop protection).
 const MAX_ITERATIONS: usize = 10_000;
@@ -596,10 +597,12 @@ impl MiniEval {
             ast::Expr::Label(label) => Ok(Value::Content(vec![ContentNode::Label(
                 label.get().to_string(),
             )])),
-            ast::Expr::Ref(reference) => Ok(Value::Content(vec![ContentNode::Reference {
-                target: reference.target().to_string(),
-                ref_type: ReferenceType::Basic,
-            }])),
+            // Bare `@target` needs the document's complete label and
+            // bibliography declarations to decide between `\\ref` and `\\cite`.
+            // `ContentNode::Reference` is reserved for explicit `#ref(...)`.
+            ast::Expr::Ref(reference) => Ok(Value::Content(vec![ContentNode::RawSource(
+                mark_at_reference(reference.target()),
+            )])),
             ast::Expr::Escape(esc) => Ok(Value::Content(vec![ContentNode::Text(
                 esc.get().to_string(),
             )])),
@@ -950,7 +953,13 @@ impl MiniEval {
         self.scopes.enter();
         let result = self.eval_markup(block.body())?;
         self.scopes.exit();
-        Ok(result)
+        // `[]` is an empty content value, not `none`. The distinction is
+        // structural for calls such as `table(...)`, where an empty content
+        // block still occupies one positional cell.
+        Ok(match result {
+            Value::None => Value::Content(Vec::new()),
+            value => value,
+        })
     }
 
     /// Evaluate a unary operation.
@@ -1610,6 +1619,21 @@ impl MiniEval {
                 let (pos_args, _) = self.eval_args(args)?;
                 return call_calc(&field, pos_args);
             }
+            if ident.get().as_str() == "table"
+                && matches!(field.as_str(), "header" | "cell" | "hline" | "vline")
+            {
+                let (pos_args, named_args) = self.eval_args(args)?;
+                return match call_builtin(
+                    &format!("table.{field}"),
+                    pos_args,
+                    named_args,
+                    &self.vfs,
+                ) {
+                    BuiltinResult::Ok(value) => Ok(value),
+                    BuiltinResult::Err(error) => Err(error),
+                    BuiltinResult::NotFound => unreachable!("registered table helper"),
+                };
+            }
         }
 
         // Evaluate the target
@@ -2062,6 +2086,7 @@ impl MiniEval {
                 | "place"
                 | "box"
                 | "block"
+                | "table"
                 | "grid"
                 | "stack"
         )

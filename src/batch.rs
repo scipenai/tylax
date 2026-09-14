@@ -8,8 +8,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::{
-    latex_document_to_typst_with_options, latex_to_typst_with_options, typst_to_latex_with_options,
-    L2TOptions, T2LOptions,
+    latex_document_to_typst_with_options, latex_to_typst_with_options,
+    typst_file_to_latex_with_options, L2TOptions, T2LOptions,
 };
 
 /// Batch conversion direction.
@@ -404,7 +404,7 @@ fn convert_one(plan: &PlannedFile, options: &BatchOptions) -> io::Result<()> {
         BatchDirection::TypstToLatex => {
             let mut t2l_options = options.t2l_options.clone();
             t2l_options.full_document = options.full_document;
-            typst_to_latex_with_options(&content, &t2l_options)
+            typst_file_to_latex_with_options(&content, &plan.input_path, &t2l_options)
         }
         BatchDirection::Auto => unreachable!("auto direction must be resolved before conversion"),
     };

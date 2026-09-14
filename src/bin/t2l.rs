@@ -13,8 +13,9 @@ use tylax::{
     diagnostics::{check_latex, format_diagnostics},
     latex_document_to_typst, latex_to_typst, latex_to_typst_with_diagnostics_options,
     tikz::{convert_cetz_to_tikz, convert_tikz_to_cetz, is_cetz_code},
-    typst_document_to_latex, typst_to_latex, typst_to_latex_with_diagnostics, CliDiagnostic,
-    DocumentWrapperMode, L2TOptions, PreambleMode, T2LOptions,
+    typst_document_to_latex, typst_file_to_latex_with_diagnostics,
+    typst_file_to_latex_with_options, typst_to_latex, typst_to_latex_with_diagnostics,
+    CliDiagnostic, DocumentWrapperMode, L2TOptions, PreambleMode, T2LOptions,
 };
 
 #[cfg(feature = "cli")]
@@ -293,7 +294,14 @@ fn main() -> io::Result<()> {
                 ..Default::default()
             };
             if !cli.no_eval {
-                let conv_result = typst_to_latex_with_diagnostics(&input, &options);
+                let conv_result = match filename.as_deref() {
+                    Some(path) => typst_file_to_latex_with_diagnostics(
+                        &input,
+                        std::path::Path::new(path),
+                        &options,
+                    ),
+                    None => typst_to_latex_with_diagnostics(&input, &options),
+                };
                 let diags = conv_result
                     .warnings
                     .into_iter()
@@ -302,9 +310,23 @@ fn main() -> io::Result<()> {
                 (conv_result.output, diags)
             } else {
                 let output = if is_full_document {
-                    typst_document_to_latex(&input)
+                    match filename.as_deref() {
+                        Some(path) => typst_file_to_latex_with_options(
+                            &input,
+                            std::path::Path::new(path),
+                            &T2LOptions::full_document(),
+                        ),
+                        None => typst_document_to_latex(&input),
+                    }
                 } else {
-                    typst_to_latex(&input)
+                    match filename.as_deref() {
+                        Some(path) => typst_file_to_latex_with_options(
+                            &input,
+                            std::path::Path::new(path),
+                            &T2LOptions::default(),
+                        ),
+                        None => typst_to_latex(&input),
+                    }
                 };
                 (output, Vec::new())
             }
@@ -437,13 +459,29 @@ fn handle_subcommand(cmd: Commands) -> io::Result<()> {
             let result = if full_document {
                 match direction {
                     Direction::L2t => latex_document_to_typst(&content),
-                    Direction::T2l => typst_document_to_latex(&content),
+                    Direction::T2l => match filename.as_deref() {
+                        Some(path) => typst_file_to_latex_with_options(
+                            &content,
+                            std::path::Path::new(path),
+                            &T2LOptions::full_document(),
+                        ),
+                        // Standard input has no file-relative bibliography path.
+                        None => typst_document_to_latex(&content),
+                    },
                     Direction::Auto => convert_auto_document(&content).0,
                 }
             } else {
                 match direction {
                     Direction::L2t => latex_to_typst(&content),
-                    Direction::T2l => typst_to_latex(&content),
+                    Direction::T2l => match filename.as_deref() {
+                        Some(path) => typst_file_to_latex_with_options(
+                            &content,
+                            std::path::Path::new(path),
+                            &T2LOptions::default(),
+                        ),
+                        // Standard input has no file-relative bibliography path.
+                        None => typst_to_latex(&content),
+                    },
                     Direction::Auto => convert_auto(&content).0,
                 }
             };

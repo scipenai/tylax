@@ -10,11 +10,15 @@ mod math;
 mod math_emit;
 mod math_ir;
 mod preprocess;
+mod supplement;
 mod table;
 mod utils;
 
 pub use context::{ConvertContext, DocumentWrapperMode, EnvironmentContext, T2LOptions, TokenType};
 use engine::ContentNode;
+use std::collections::HashSet;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
 use typst_syntax::{parse, parse_math};
 
 // Re-export specific items that were previously exposed by `eval` from core
@@ -250,21 +254,54 @@ pub fn typst_to_latex(input: &str) -> String {
 
 /// Convert Typst code to LaTeX with options
 pub fn typst_to_latex_with_options(input: &str, options: &T2LOptions) -> String {
+    typst_to_latex_with_options_and_bibliography_keys(input, options, None)
+}
+
+/// Convert a Typst source file to LaTeX, resolving bare `@key` citations from
+/// literal sibling BibTeX files declared by `#bibliography("...")`.
+///
+/// Separate from the string API on purpose: callers opt into the filesystem
+/// boundary by providing the path, so in-memory conversions stay sandbox-safe.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn typst_file_to_latex_with_options(
+    input: &str,
+    source_path: &Path,
+    options: &T2LOptions,
+) -> String {
+    let bibliography_keys = supplement::load_bibliography_keys(input, source_path);
+    typst_to_latex_with_options_and_bibliography_keys(input, options, Some(&bibliography_keys))
+}
+
+fn typst_to_latex_with_options_and_bibliography_keys(
+    input: &str,
+    options: &T2LOptions,
+    bibliography_keys: Option<&HashSet<String>>,
+) -> String {
     let mut ctx = ConvertContext::new();
     ctx.options = options.clone();
 
-    // Preprocess: handle imports, etc.
-    let processed_input = preprocess::preprocess_typst(input);
+    // Preprocess: strip `//! tylax:` ignore directives, then handle imports, etc.
+    let input = preprocess::strip_tylax_ignores(input);
+    let processed_input = preprocess::preprocess_typst(&input);
 
+    // The AST is kept so the reference finalizer can look up what each label
+    // points at; Typst renders that supplement automatically and LaTeX does
+    // not (issue #43).
+    let mut document_root = None;
     if options.math_only {
         let root = parse_math(&processed_input);
         math::convert_math_node(&root, &mut ctx);
     } else {
         let root = parse(&processed_input);
         markup::convert_markup_node(&root, &mut ctx);
+        document_root = Some(root);
     }
 
     let mut result = ctx.finalize();
+    result = match document_root.as_ref() {
+        Some(root) => supplement::resolve_references(root, &result, bibliography_keys),
+        None => supplement::strip_marks(&result),
+    };
 
     if options.full_document {
         result = wrap_in_document(&result, options);
@@ -305,7 +342,32 @@ pub fn typst_document_to_latex(input: &str) -> String {
 /// }
 /// ```
 pub fn typst_to_latex_with_diagnostics(input: &str, options: &T2LOptions) -> ConversionResult {
+    typst_to_latex_with_diagnostics_and_bibliography_keys(input, options, None)
+}
+
+/// File-oriented variant of [`typst_to_latex_with_diagnostics`]: resolves bare
+/// `@key` citations only for keys present in a literal BibTeX file named by
+/// `#bibliography("...")` relative to `source_path`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn typst_file_to_latex_with_diagnostics(
+    input: &str,
+    source_path: &Path,
+    options: &T2LOptions,
+) -> ConversionResult {
+    let bibliography_keys = supplement::load_bibliography_keys(input, source_path);
+    typst_to_latex_with_diagnostics_and_bibliography_keys(input, options, Some(&bibliography_keys))
+}
+
+fn typst_to_latex_with_diagnostics_and_bibliography_keys(
+    input: &str,
+    options: &T2LOptions,
+    bibliography_keys: Option<&HashSet<String>>,
+) -> ConversionResult {
     let mut warnings = Vec::new();
+
+    // Step 0: Strip `//! tylax:` ignore directives before any evaluation.
+    let input = preprocess::strip_tylax_ignores(input);
+    let input = input.as_str();
 
     // Step 1: Expand macros using MiniEval (with show rules applied)
     let (expanded_input, expanded_nodes): (String, Option<Vec<ContentNode>>) =
@@ -324,17 +386,25 @@ pub fn typst_to_latex_with_diagnostics(input: &str, options: &T2LOptions) -> Con
     let mut ctx = ConvertContext::new();
     ctx.options = options.clone();
 
+    // As above: keep the parsed document so reference supplements resolve.
+    let mut document_root = None;
     if options.math_only {
         let root = parse_math(&expanded_input);
         math::convert_math_node(&root, &mut ctx);
     } else if let Some(nodes) = expanded_nodes.as_ref() {
         markup::convert_content_nodes_to_latex(nodes, &mut ctx);
+        document_root = Some(parse(&expanded_input));
     } else {
         let root = parse(&expanded_input);
         markup::convert_markup_node(&root, &mut ctx);
+        document_root = Some(root);
     }
 
     let mut output = ctx.finalize();
+    output = match document_root.as_ref() {
+        Some(root) => supplement::resolve_references(root, &output, bibliography_keys),
+        None => supplement::strip_marks(&output),
+    };
 
     if options.full_document {
         output = wrap_in_document(&output, options);
@@ -418,6 +488,10 @@ fn default_wrapper(content: &str, options: &T2LOptions) -> String {
     doc.push_str("\\usepackage{booktabs}\n"); // For better tables
     doc.push_str("\\usepackage{geometry}\n");
     doc.push_str("\\geometry{a4paper, margin=2cm}\n");
+    // `import` provides `\subimport`, so nested relative paths resolve like `#include`.
+    if content.contains("\\subimport") {
+        doc.push_str("\\usepackage{import}\n");
+    }
 
     // Title and author
     if let Some(ref title) = options.title {
