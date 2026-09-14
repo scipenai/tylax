@@ -59,9 +59,18 @@ t2l input.tex -o output.typ
 # Convert math formula from stdin
 echo '\frac{1}{2}' | t2l -d l2t
 
+# Convert a bare formula with the math pipeline
+echo '\bar{x}' | t2l -d l2t --math
+
 # Convert TikZ to CeTZ
 t2l tikz input.tex -o output.typ
 ```
+
+Use `--math` when the input is a formula rather than a document. Document mode
+emits a letter run as written, because in prose `AB` is the text "AB"; math mode
+splits it into atoms (`A B`) and separates a symbol from what precedes it
+(`x\ln` → `x ln`), which is what Typst math requires. The two cannot be decided
+from the input alone, so this is an explicit choice rather than a guess.
 
 ### Rust Library
 

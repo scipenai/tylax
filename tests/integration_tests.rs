@@ -62,6 +62,95 @@ fn run_t2l_cli_file_with_args(input_path: &std::path::Path, extra_args: &[&str])
     String::from_utf8(output.stdout).expect("CLI output was not valid UTF-8")
 }
 
+/// Run the `t2l` binary end-to-end in LaTeX->Typst mode over stdin, returning
+/// its stdout. Exercises the real CLI path (issue #35 reported that the CLI
+/// diverged from the library/web path for bare math fragments).
+fn run_t2l_l2t_cli(input: &str) -> String {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_t2l"))
+        .arg("--direction")
+        .arg("l2t")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn t2l CLI");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("t2l CLI stdin unavailable")
+        .write_all(input.as_bytes())
+        .expect("failed to write CLI input");
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for t2l CLI output");
+    assert!(
+        output.status.success(),
+        "t2l CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    String::from_utf8(output.stdout).expect("CLI output was not valid UTF-8")
+}
+
+fn run_t2l_l2t_cli_no_preamble(input: &str) -> String {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_t2l"))
+        .arg("--direction")
+        .arg("l2t")
+        .arg("--no-preamble")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn t2l CLI");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("t2l CLI stdin unavailable")
+        .write_all(input.as_bytes())
+        .expect("failed to write CLI input");
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for t2l CLI output");
+    assert!(
+        output.status.success(),
+        "t2l CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    String::from_utf8(output.stdout).expect("CLI output was not valid UTF-8")
+}
+
+fn run_t2l_l2t_cli_math(input: &str) -> String {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_t2l"))
+        .arg("--direction")
+        .arg("l2t")
+        .arg("--math")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn t2l CLI");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("t2l CLI stdin unavailable")
+        .write_all(input.as_bytes())
+        .expect("failed to write CLI input");
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for t2l CLI output");
+    assert!(
+        output.status.success(),
+        "t2l CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    String::from_utf8(output.stdout).expect("CLI output was not valid UTF-8")
+}
+
 fn normalize_output(output: &str) -> &str {
     output.trim_end_matches('\n')
 }
@@ -176,6 +265,51 @@ mod batch_conversion_tests {
         assert_eq!(report.error_count, 0);
         assert!(output.join("Root/Intro.tex").exists());
         assert!(output.join("Root/Chapter/Section.tex").exists());
+    }
+
+    #[test]
+    fn batch_recursive_preserves_include_structure() {
+        // Issue #17: a multi-file Typst project that uses `#include` should
+        // convert into a mirrored multi-file LaTeX project, with each include
+        // rewritten as `\subimport` rather than inlining the child content.
+        let project = TempProject::new("batch-include-structure");
+        project.write(
+            "main.typ",
+            "= Paper\n\n#include \"sections/intro.typ\"\n#include \"sections/body.typ\"\n",
+        );
+        project.write("sections/intro.typ", "= Introduction\n\nHello.");
+        project.write("sections/body.typ", "= Body\n\nWorld.");
+
+        let output = project.path("out");
+        let mut opts = options(&project.root, &output);
+        opts.direction = BatchDirection::TypstToLatex;
+        opts.recursive = true;
+
+        let report = convert_batch(&opts).expect("batch conversion should succeed");
+        assert_eq!(report.error_count, 0);
+
+        // Each source file produced its own output file.
+        assert!(output.join("main.tex").exists());
+        assert!(output.join("sections/intro.tex").exists());
+        assert!(output.join("sections/body.tex").exists());
+
+        // The parent references children via \subimport, without inlining them.
+        let main = project.read("out/main.tex");
+        assert!(
+            main.contains("\\subimport{sections/}{intro}"),
+            "expected \\subimport for intro, got: {}",
+            main
+        );
+        assert!(
+            main.contains("\\subimport{sections/}{body}"),
+            "expected \\subimport for body, got: {}",
+            main
+        );
+        assert!(
+            !main.contains("Hello."),
+            "child content should not be inlined into parent, got: {}",
+            main
+        );
     }
 
     #[test]
@@ -385,6 +519,450 @@ fn assert_t2l_paths_match(input: &str) -> String {
     );
 
     options
+}
+
+// ============================================================================
+// CLI parity Tests - LaTeX to Typst (issue #35: CLI diverged from web/library)
+// ============================================================================
+
+mod l2t_cli_parity {
+    use super::*;
+
+    /// `--math` selects the math converter explicitly.
+    ///
+    /// The two pipelines disagree on purpose: math mode splits a letter run
+    /// into atoms and separates a symbol from what precedes it, because Typst
+    /// math needs `A B` and `x ln y`; document mode must not, because in prose
+    /// `AB` is the text "AB". Which one applies cannot be read off the input,
+    /// so the CLI offers the choice instead of guessing — without it, a bare
+    /// formula silently went through the document path and produced Typst that
+    /// does not compile (`unknown variable: AB`).
+    #[test]
+    fn math_mode_converts_bare_formulas_as_math() {
+        for (latex, expected) in [
+            (r"AB", "A B"),
+            (r"x\ln y", "x ln y"),
+            (r"a\parallel b", "a parallel b"),
+            // Would otherwise glue into `sin.not`, silently turning "s ∉ A"
+            // into the sine function with a `.not` field.
+            (r"s\notin A", "s in.not A"),
+            (r"\triangle ABC", "triangle.t A B C"),
+        ] {
+            let got = run_t2l_l2t_cli_math(latex);
+            assert_eq!(
+                normalize_output(&got).trim(),
+                expected,
+                "`{latex}` in --math mode"
+            );
+        }
+    }
+
+    #[test]
+    fn document_mode_still_leaves_prose_alone() {
+        // The counter-case that makes the split necessary: applying the math
+        // rules here would emit `H e l l o *w o r l d*`.
+        let got = run_t2l_l2t_cli_no_preamble(r"Hello \textbf{world} and AB text.");
+        assert!(
+            normalize_output(&got).contains("Hello *world* and AB text."),
+            "prose must be untouched in document mode, got:\n{got}"
+        );
+    }
+
+    /// The CLI (`t2l -d l2t`) always drives the document/markup pipeline; it must
+    /// NOT guess "this looks like math" and reroute through math mode, which would
+    /// mangle prose (`Hello \textbf{world}` -> `H e l l o *w o r l d*`). These
+    /// tests pin the black-box CLI behaviour against the document library API so a
+    /// future accidental heuristic-routing change is caught immediately.
+
+    #[test]
+    fn cli_prose_fragment_stays_markup() {
+        // A bare prose fragment must convert as prose, not be spaced out by the
+        // math post-processor. This is the regression Approach C guards against.
+        let body = run_t2l_l2t_cli_no_preamble(r"Hello \textbf{world}, text.")
+            .trim()
+            .to_string();
+        assert_eq!(body, "Hello *world*, text.");
+    }
+
+    #[test]
+    fn cli_sized_bars_pair_into_abs_in_document_mode() {
+        // Issue #35 blocking case: `\ln{\big|}x{\big|}` used to leak as
+        // `ln bar.v xbar.v`, which Typst rejects ("unknown variable: xbar").
+        // The document pipeline now runs the marker-pairing pass, so BOTH the
+        // compact and the spaced forms resolve to a real `abs(..)` call.
+        let compact = run_t2l_l2t_cli_no_preamble(r"\ln{\big|}x{\big|}")
+            .trim()
+            .to_string();
+        assert_eq!(
+            compact, "ln abs(x)",
+            "compact sized bars must pair into abs()"
+        );
+
+        let spaced = run_t2l_l2t_cli_no_preamble(r"\ln \big| x \big|")
+            .trim()
+            .to_string();
+        assert!(
+            spaced.contains("abs(x)"),
+            "spaced sized bars must pair into abs(): {spaced}"
+        );
+        for body in [&compact, &spaced] {
+            assert!(
+                !body.contains("bar.v"),
+                "no bare vertical-bar delimiter should leak: {body}"
+            );
+            assert!(
+                !body.contains('\u{1f}') && !body.contains('\u{1e}'),
+                "no raw sentinel control char should leak: {body:?}"
+            );
+        }
+
+        // The double-bar form must pair into `norm(..)` the same way.
+        let norm = run_t2l_l2t_cli_no_preamble(r"\big\| x \big\|")
+            .trim()
+            .to_string();
+        assert_eq!(norm, "norm(x)");
+    }
+
+    #[test]
+    fn cli_default_keeps_document_preamble() {
+        // Without `--no-preamble` the CLI emits the document preamble; this is the
+        // default document-mode behaviour and must be preserved.
+        let out = run_t2l_l2t_cli(r"Hello \textbf{world}, text.");
+        assert!(
+            out.contains("#set page"),
+            "default CLI keeps preamble: {out}"
+        );
+        assert!(out.contains("Hello *world*, text."));
+    }
+
+    #[test]
+    fn cli_no_preamble_matches_document_library_api() {
+        // `--no-preamble` must be byte-for-byte identical to the document library
+        // API with `PreambleMode::None` — CLI and library share one pipeline.
+        let no_preamble = L2TOptions {
+            preamble: PreambleMode::None,
+            ..Default::default()
+        };
+        for fragment in [
+            r"Hello \textbf{world}, text.",
+            r"\ln{\big|}x{\big|}",
+            r"\overrightarrow{AB}",
+            r"\section{Hi} some text",
+        ] {
+            let cli = run_t2l_l2t_cli_no_preamble(fragment);
+            let lib = latex_document_to_typst_with_options(fragment, &no_preamble);
+            assert_eq!(
+                cli.trim_end_matches('\n'),
+                lib.trim_end_matches('\n'),
+                "CLI --no-preamble diverged from document library API for {fragment:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_multiletter_vector_args_split_into_atoms() {
+        // Issue #35 CLI regression: a multi-letter vector argument on the
+        // document/CLI path must render as math atoms `arrow(P C)`, NOT the bare
+        // identifier `arrow(PC)` — the latter fails to compile in Typst
+        // ("unknown variable: PC"). The compact input `\overrightarrow{PC}` is the
+        // exact form reported in the issue comments.
+        let compact = [
+            (r"\overrightarrow{PC}", "arrow(P C)"),
+            (r"\vec{PC}", "arrow(P C)"),
+            (r"\overleftarrow{AB}", "arrow.l(A B)"),
+            (r"\overleftrightarrow{AB}", "arrow.l.r(A B)"),
+        ];
+        for (input, expected) in compact {
+            let cli = run_t2l_l2t_cli_no_preamble(input).trim().to_string();
+            assert_eq!(cli, expected, "CLI compact vector arg for {input:?}");
+            assert!(
+                !cli.contains("(PC)") && !cli.contains("(AB)"),
+                "no glued multi-letter identifier may leak: {cli}"
+            );
+            // The document/CLI path must agree with the math library path, which
+            // the web/demo uses for bare fragments.
+            let math_lib = latex_to_typst(input).trim().to_string();
+            assert_eq!(
+                cli, math_lib,
+                "CLI (document) diverged from math library path for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_annotated_brace_folds_split_body() {
+        // Issue #35 follow-up: the annotated fold `\underbrace{AB}_{C}` /
+        // `\overbrace{AB}^{C}` takes a separate code path (math.rs fold handler).
+        // Its body must also render as math atoms `underbrace(A B, C)`, not the
+        // glued `underbrace(AB, C)` (Typst: "unknown variable: AB").
+        let cases = [
+            (r"\underbrace{AB}_{C}", "underbrace(A B, C)"),
+            (r"\overbrace{AB}^{C}", "overbrace(A B, C)"),
+        ];
+        for (input, expected) in cases {
+            let cli = run_t2l_l2t_cli_no_preamble(input).trim().to_string();
+            assert_eq!(cli, expected, "CLI annotated fold for {input:?}");
+            assert!(
+                !cli.contains("(AB,"),
+                "no glued multi-letter body may leak: {cli}"
+            );
+            let math_lib = latex_to_typst(input).trim().to_string();
+            assert_eq!(
+                cli, math_lib,
+                "CLI (document) diverged from math library path for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_math_command_args_split_into_atoms() {
+        // Issue #35 class-closure: EVERY math command whose Typst output is a math
+        // function must render its required argument as math atoms on the CLI/
+        // document path, not as a glued identifier that fails to compile. This
+        // guards the whole family (fractions, roots, math fonts, physics macros,
+        // stacking, cancel) against the `arrow(PC)`-style regression, not just the
+        // accents that were reported. Each expectation is the atom-split form; the
+        // CLI must also agree with the math-library path used by the web demo.
+        let cases = [
+            (r"\frac{AB}{CD}", "frac(A B, C D)"),
+            (r"\sqrt{AB}", "sqrt(A B)"),
+            (r"\mathbf{AB}", "upright(bold(A B))"),
+            (r"\mathcal{AB}", "cal(A B)"),
+            (r"\mathrm{Hom}", "upright(H o m)"),
+            (r"\cancel{AB}", "cancel(A B)"),
+            (r"\abs{AB}", "abs(A B)"),
+            (r"\norm{AB}", "norm(A B)"),
+            (r"\comm{AB}{CD}", "lr([A B, C D])"),
+            (r"\overset{AB}{CD}", "limits(C D)^(A B)"),
+        ];
+        for (input, expected) in cases {
+            let cli = run_t2l_l2t_cli_no_preamble(input).trim().to_string();
+            assert_eq!(cli, expected, "CLI math-command arg for {input:?}");
+            assert!(
+                !cli.contains("(AB") && !cli.contains("(CD") && !cli.contains("AB)"),
+                "no glued multi-letter identifier may leak: {cli}"
+            );
+            let math_lib = latex_to_typst(input).trim().to_string();
+            assert_eq!(
+                cli, math_lib,
+                "CLI (document) diverged from math library path for {input:?}"
+            );
+        }
+        // `\mathrm{d}` must keep its differential shortcut, unaffected by the
+        // math-mode argument rendering.
+        assert_eq!(run_t2l_l2t_cli_no_preamble(r"\mathrm{d}").trim(), "dif");
+    }
+
+    #[test]
+    fn cli_full_document_no_regression() {
+        // A real document keeps document-mode routing (headings + preamble), and
+        // sized bars inside it still pair into abs().
+        let doc = run_t2l_l2t_cli(
+            r"\documentclass{article}\begin{document}\section{Hi}$\big|x\big|$\end{document}",
+        );
+        assert!(doc.contains("#set page"), "document mode keeps preamble");
+        assert!(doc.contains("= Hi"));
+        assert!(doc.contains("abs(x)"));
+    }
+
+    /// Whether a `typst` compiler is on PATH. The end-to-end compile test is
+    /// skipped (not failed) when it is absent, so CI without Typst still passes.
+    fn typst_available() -> bool {
+        Command::new("typst")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Compile a Typst source string with the real `typst` binary; return true
+    /// iff it compiled cleanly (exit code 0). Uses a unique temp file and cleans
+    /// up afterwards.
+    fn typst_compiles(source: &str) -> bool {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let mut src = std::env::temp_dir();
+        src.push(format!("tylax-compile-{nonce}.typ"));
+        std::fs::write(&src, source).expect("temp typst source should be written");
+
+        let status = Command::new("typst")
+            .arg("compile")
+            .arg(&src)
+            .arg("--format")
+            .arg("pdf")
+            .arg("-") // write PDF to stdout, no output file left behind
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run typst compile");
+
+        let _ = std::fs::remove_file(&src);
+        if !status.status.success() {
+            eprintln!(
+                "typst compile failed:\n{}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+        }
+        status.status.success()
+    }
+
+    #[test]
+    fn cli_output_compiles_with_real_typst() {
+        // End-to-end guard: the CLI's Typst output must actually compile. This is
+        // what catches semantic breakage like `arrow(PC)` ("unknown variable: PC")
+        // that a string assertion alone would miss (issue #35).
+        if !typst_available() {
+            eprintln!("skipping cli_output_compiles_with_real_typst: `typst` not on PATH");
+            return;
+        }
+
+        // A full LaTeX document round-trips to a complete, self-contained Typst
+        // document (preamble included), so it compiles directly.
+        let doc = run_t2l_l2t_cli(
+            r"\documentclass{article}\begin{document}\section{Vectors}$\overrightarrow{PC} = \frac{2}{5}\overrightarrow{AD}$ and $\ln{\big|}x{\big|}$\end{document}",
+        );
+        assert!(
+            typst_compiles(&doc),
+            "CLI full-document output must compile:\n{doc}"
+        );
+
+        // Bare math fragments are emitted without `$...$`; wrap each in an
+        // equation before compiling. Before the fix `\overrightarrow{PC}` emitted
+        // `arrow(PC)`, which fails here.
+        for fragment in [
+            r"\overrightarrow{PC}",
+            r"\vec{PC}",
+            r"\overleftarrow{AB}",
+            r"\overleftrightarrow{AB}",
+            r"\hat{AB}",
+            r"\ln{\big|}x{\big|}",
+            r"\big\| x \big\|",
+            r"\underbrace{AB}_{C}",
+            r"\overbrace{AB}^{C}",
+            r"\frac{AB}{CD}",
+            r"\sqrt{AB}",
+            r"\mathbf{AB}",
+            r"\mathcal{AB}",
+            r"\mathrm{Hom}",
+            r"\cancel{AB}",
+            r"\abs{AB}",
+            r"\norm{AB}",
+            r"\comm{AB}{CD}",
+            r"\overset{AB}{CD}",
+        ] {
+            let body = run_t2l_l2t_cli_no_preamble(fragment);
+            let source = format!("$ {} $\n", body.trim());
+            assert!(
+                typst_compiles(&source),
+                "CLI fragment output for {fragment:?} must compile as math:\n{source}"
+            );
+        }
+    }
+
+    /// Run the CLI over a temporary file and return exit status, stdout, stderr.
+    fn run_t2l_cli_on_file(source: &str, extension: &str, args: &[&str]) -> (bool, String, String) {
+        let path = std::env::temp_dir().join(format!(
+            "tylax_cli_{}_{}.{extension}",
+            std::process::id(),
+            args.join("_").replace(['-', '='], "")
+        ));
+        std::fs::write(&path, source).expect("failed to write CLI input file");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_t2l"))
+            .arg(&path)
+            .args(args)
+            .output()
+            .expect("failed to run t2l CLI");
+        let _ = std::fs::remove_file(&path);
+
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// `--math` picks the LaTeX math pipeline, which has no Typst-side
+    /// counterpart. Accepting it silently in the other direction would report
+    /// success while the requested mode never applied, so the CLI refuses --
+    /// both when the direction is stated and when auto-detection resolves it.
+    #[test]
+    fn math_flag_is_rejected_outside_the_l2t_direction() {
+        for args in [
+            ["--direction", "t2l", "--math"].as_slice(),
+            ["--direction", "auto", "--math"].as_slice(),
+        ] {
+            let (ok, _, stderr) = run_t2l_cli_on_file("$a + b$\n", "typ", args);
+            assert!(!ok, "`{args:?}` on Typst input must fail, not be ignored");
+            assert!(
+                stderr.contains("--math"),
+                "the error must name the flag it rejected, got: {stderr}"
+            );
+        }
+    }
+
+    /// The same flag still works when the direction really is LaTeX -> Typst,
+    /// including through auto-detection, so the guard above rejects only the
+    /// combination it means to.
+    #[test]
+    fn math_flag_is_accepted_when_the_direction_resolves_to_l2t() {
+        for args in [
+            ["--direction", "l2t", "--math"].as_slice(),
+            ["--direction", "auto", "--math"].as_slice(),
+        ] {
+            let (ok, stdout, stderr) = run_t2l_cli_on_file(r"\alpha + AB", "tex", args);
+            assert!(ok, "`{args:?}` on LaTeX input must succeed, got: {stderr}");
+            assert!(
+                normalize_output(&stdout).contains("alpha + A B"),
+                "`{args:?}` must use the math pipeline, got: {stdout}"
+            );
+        }
+    }
+
+    /// Indentation is SEMANTIC in Typst: it is what nests a sublist, and what
+    /// keeps a raw block's body intact. `--pretty` re-derives layout from brace
+    /// depth, so it must leave deliberate indentation alone -- re-flowing it
+    /// flattened nested lists and stripped raw bodies (issue #43). Only the CLI
+    /// runs this pass, so nothing in the converter tests covers it.
+    #[test]
+    fn pretty_preserves_semantic_indentation() {
+        let latex = concat!(
+            "\\begin{itemize}\n\\item Top\n",
+            "\\begin{itemize}\n\\item Nested\n\\end{itemize}\n\\end{itemize}\n\n",
+            "\\begin{verbatim}\nif x:\n    indented\n\\end{verbatim}\n"
+        );
+
+        let (ok, pretty, stderr) = run_t2l_cli_on_file(
+            latex,
+            "tex",
+            &["--direction", "l2t", "--no-preamble", "--pretty"],
+        );
+        assert!(ok, "CLI failed: {stderr}");
+
+        assert!(
+            pretty.contains("  - Nested"),
+            "a nested list must keep its indentation under --pretty, got:\n{pretty}"
+        );
+        assert!(
+            pretty.contains("    indented"),
+            "a raw block body must keep its indentation under --pretty, got:\n{pretty}"
+        );
+
+        // `--pretty` is a layout pass, not a conversion mode: it must not change
+        // what the same input produces without it.
+        let (_, plain, _) =
+            run_t2l_cli_on_file(latex, "tex", &["--direction", "l2t", "--no-preamble"]);
+        assert_eq!(
+            pretty.trim_end(),
+            plain.trim_end(),
+            "--pretty must not alter already well-formed output"
+        );
+    }
 }
 
 // ============================================================================

@@ -10,6 +10,9 @@ import 'katex/dist/katex.min.css';
 // Import CeTZ renderer for graphics preview
 import { renderGraphicsToSVG, hasRenderableGraphics } from './cetz-renderer.js';
 
+// LaTeX structural detection (verbatim/comment-aware; see latex-detect.js)
+import { isFullLatexDocument, isLatexDocument } from './latex-detect.js';
+
 // State
 const state = {
     direction: 't2l', // 'l2t' = LaTeX to Typst, 't2l' = Typst to LaTeX (默认 Typst → LaTeX)
@@ -179,17 +182,8 @@ async function initWasm() {
 }
 
 // ===== Hierarchical Content Detection =====
-
-/**
- * Layer 1: Check if input is a full LaTeX document
- * Documents contain structural elements like \documentclass, \begin{document}, sections
- */
-function isFullLatexDocument(input) {
-    return input.includes('\\documentclass') ||
-           input.includes('\\begin{document}') ||
-           (input.includes('\\section') && input.includes('\\end')) ||
-           (input.includes('\\chapter') && input.includes('\\end'));
-}
+// `isFullLatexDocument` / `isLatexDocument` are imported from `latex-detect.js`
+// (verbatim/comment-aware structural detection shared with the test suite).
 
 /**
  * Layer 1: Check if input is a full Typst document
@@ -662,19 +656,6 @@ function isTypstGraphics(input) {
            input.includes('draw.circle(') ||
            input.includes('draw.rect(') ||
            input.includes('line(') && input.includes('stroke:');
-}
-
-/**
- * Detect if input is a full LaTeX document
- */
-function isLatexDocument(input) {
-    return input.includes('\\documentclass') ||
-           input.includes('\\begin{document}') ||
-           input.includes('\\usepackage') ||
-           input.includes('\\section') ||
-           input.includes('\\chapter') ||
-           input.includes('\\title{') ||
-           input.includes('\\maketitle');
 }
 
 /**

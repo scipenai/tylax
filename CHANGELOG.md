@@ -22,10 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **L2T references**: `\eqref{k}` targets the label the document actually defines -- an injected `eq-` prefix pointed at a label that was never created -- and renders as `(2)` without Typst re-inserting a supplement the author already wrote (#43).
 - **TikZ**: `\node[draw, ...]` emits a CeTZ `rect` only for a genuine rectangle with concrete dimensions at an absolute position. A circle, an ellipse, rounded corners or any option the converter does not understand falls back to a label-only `content`, instead of drawing a box the source never asked for (#39). Repeated options take their last value, as TikZ applies them, and `draw=none` is treated as the mode switch it is rather than as a stroke colour.
 - **T2L references**: a bare `@sec-one` becomes `Section~\ref{sec-one}`. Typst renders the supplement word from the kind of element a label is attached to and the source never writes it, so converting to a plain `\ref` silently turned "See Section 1" into "See 1" (#43). The word is recovered from what the label actually points at; an unknown target is left bare rather than given an invented word.
+- **CLI**: nested lists keep their indentation through `pretty_print`, which previously re-derived it from brace depth and flattened them.
 
 ### Added
 - **T2L directives**: `//! tylax: ignore-next-line`, `ignore-begin` and `ignore-end` drop source regions from conversion. Only a genuine Typst line comment counts, so the markers stay literal inside raw blocks and strings.
 - **T2L file API**: `typst_file_to_latex_with_options` / `typst_file_to_latex_with_diagnostics` resolve bare `@key` citations from literal sibling BibTeX files named by `#bibliography("...")`. A bare `@target` is a cross-reference or a citation depending on the completed document, so this needs the filesystem; the string and WASM APIs have no implicit file access and conservatively keep such targets as references.
+- **CLI**: `--math` (alias `--math-only`) selects the math pipeline for a bare formula, and is rejected -- not silently ignored -- when the resolved direction is Typst -> LaTeX, which has no counterpart. Document mode emits a letter run as written, because in prose `AB` is the text "AB"; math mode splits it into atoms (`A B`), which is what Typst math requires. The two cannot be decided from the input alone, so this is an explicit choice rather than a guess.
+- **Web**: LaTeX document detection is verbatim- and comment-aware, so `\verb|\begin{document}|` is no longer misrouted to the full-document converter.
+
+### Known limitations
+- An external bibliography (`\bibliography{refs}`, `\addbibresource`) still emits no `#bibliography(...)`, so `#cite(...)` in that output does not compile on its own. Only the manual `thebibliography` path is fully reconciled.
 
 ## [0.3.7] - 2026-07-18
 

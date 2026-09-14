@@ -59,9 +59,17 @@ t2l input.tex -o output.typ
 # 从标准输入转换数学公式
 echo '\frac{1}{2}' | t2l -d l2t
 
+# 用数学管线转换裸公式
+echo '\bar{x}' | t2l -d l2t --math
+
 # 将 TikZ 转换为 CeTZ
 t2l tikz input.tex -o output.typ
 ```
+
+输入是公式而非文档时请加 `--math`。文档模式会原样输出连续字母，因为正文里的
+`AB` 就是文本 "AB"；数学模式则把它拆成原子（`A B`），并把符号与前面的内容分开
+(`x\ln` → `x ln`)，这才是 Typst 数学所要求的。两者无法从输入本身判断，所以这是
+一个显式选择而非猜测。
 
 ### Rust 库
 
