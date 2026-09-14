@@ -381,6 +381,8 @@ mod tests {
     use super::*;
 
     #[test]
+    // `3.14` below is JSON test data, not an approximation of PI.
+    #[allow(clippy::approx_constant)]
     fn test_parse_json_simple_primitives() {
         // Use public parse_json API which works with or without data-loading feature
         assert_eq!(parse_json("null").unwrap(), Value::None);

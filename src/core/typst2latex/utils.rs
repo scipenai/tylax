@@ -1155,7 +1155,7 @@ mod tests {
         }
 
         for child in node.children() {
-            if let Some(found) = find_first_func_call(&child) {
+            if let Some(found) = find_first_func_call(child) {
                 return Some(found);
             }
         }
