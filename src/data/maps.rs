@@ -1170,6 +1170,121 @@ lazy_static! {
             ctx_feature: mitex_spec::ContextFeature::None,
             alias: None,
         }));
+        m.insert("minipage".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}{,b}{,b}t") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("multicols".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("t{,b}") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("multicols*".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("t{,b}") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("lstlisting".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("figure".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("figure*".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("table".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("table*".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("wrapfigure".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("enumerate".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("itemize".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("description".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("list".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("adjustbox".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("tcolorbox".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("algorithm".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("algorithmic".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("tabular".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("longtable".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("longtabu".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("array".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("tabular*".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("t{,b}t") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("tabularx".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("t{,b}t") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
 
         // Commands with required arguments
         m.insert("Acf".to_string(), CommandSpecItem::Cmd(CmdShape {
@@ -1265,7 +1380,7 @@ lazy_static! {
             alias: None,
         }));
         m.insert("caption".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
+            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },
             alias: None,
         }));
         m.insert("cfrac".to_string(), CommandSpecItem::Cmd(CmdShape {
@@ -1273,7 +1388,7 @@ lazy_static! {
             alias: None,
         }));
         m.insert("chapter".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
+            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },
             alias: None,
         }));
         m.insert("check".to_string(), CommandSpecItem::Cmd(CmdShape {
@@ -1493,7 +1608,7 @@ lazy_static! {
             alias: None,
         }));
         m.insert("paragraph".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
+            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },
             alias: None,
         }));
         m.insert("parencite".to_string(), CommandSpecItem::Cmd(CmdShape {
@@ -1501,7 +1616,7 @@ lazy_static! {
             alias: None,
         }));
         m.insert("part".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
+            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },
             alias: None,
         }));
         m.insert("phantom".to_string(), CommandSpecItem::Cmd(CmdShape {
@@ -1529,7 +1644,7 @@ lazy_static! {
             alias: None,
         }));
         m.insert("section".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
+            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },
             alias: None,
         }));
         m.insert("set".to_string(), CommandSpecItem::Cmd(CmdShape {
@@ -1546,12 +1661,16 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
             alias: None,
         }));
+        m.insert("subparagraph".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },
+            alias: None,
+        }));
         m.insert("subsection".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
+            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },
             alias: None,
         }));
         m.insert("subsubsection".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
+            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },
             alias: None,
         }));
         m.insert("text".to_string(), CommandSpecItem::Cmd(CmdShape {

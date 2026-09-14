@@ -236,6 +236,29 @@ pub struct PendingReference {
     pub ref_type: ReferenceType,
 }
 
+/// Shape of a siunitx command, used to format its collected arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiunitxKind {
+    /// `\SI{value}{unit}` / `\qty{value}{unit}` → `value "unit"`.
+    NumberUnit,
+    /// `\si{unit}` / `\unit{unit}` → just the unit.
+    UnitOnly,
+    /// `\num{value}` → just the number.
+    NumberOnly,
+    /// `\ang{degrees}` → `value°`.
+    Angle,
+}
+
+/// Pending siunitx state; mitex has no argument pattern, so groups arrive as siblings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSiunitx {
+    pub kind: SiunitxKind,
+    pub needed: usize,
+    pub args: Vec<String>,
+    /// Nesting depth while skipping a leading optional siunitx configuration.
+    pub optional_bracket_depth: usize,
+}
+
 /// Conversion state maintained during AST traversal
 #[derive(Debug, Default)]
 pub struct ConversionState {
@@ -280,6 +303,62 @@ pub struct ConversionState {
     pub options: L2TOptions,
 }
 
+/// One argument of an environment's `\begin{..}` header.
+pub(crate) struct EnvHeaderArg {
+    /// `true` for a bracketed `[..]` slot, `false` for a braced `{..}` one.
+    pub(crate) optional: bool,
+    pub(crate) content: String,
+}
+
+/// Parse the argument slots of an environment header, in source order.
+///
+/// Slots come from the environment's signature in the command spec
+/// (`EnvShape`), so mixed, repeated and out-of-order optional/required slots
+/// all parse; converters read the result instead of guessing at a leading
+/// bracket. mitex attaches the bound slots to the `\begin` marker, so they are
+/// collected from there rather than from the environment's children.
+pub(crate) fn env_header_args(node: &SyntaxNode) -> Vec<EnvHeaderArg> {
+    let mut args = Vec::new();
+    for child in node.children() {
+        if child.kind() != SyntaxKind::ItemBegin {
+            continue;
+        }
+        for slot in child.children() {
+            if slot.kind() != SyntaxKind::ClauseArgument {
+                continue;
+            }
+            let optional = slot
+                .children()
+                .any(|item| item.kind() == SyntaxKind::ItemBracket);
+            let braced = slot
+                .children()
+                .any(|item| item.kind() == SyntaxKind::ItemCurly);
+            if optional || braced {
+                args.push(EnvHeaderArg {
+                    optional,
+                    content: extract_arg_content(&slot),
+                });
+            }
+        }
+    }
+    args
+}
+
+/// A starred sectioning command whose title group has not been reached yet,
+/// and which form is waiting.
+///
+/// mitex's argument patterns know only term/bracket/paren kinds, so the `*` is
+/// bound as the title, and a greedy `RangeLenTerm` is worse still. The star is
+/// treated as a modifier and the title taken from the next group (issue #45).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PendingSection {
+    /// `\section*`..`\paragraph*`, `\chapter*`: unnumbered heading at this 0-based depth.
+    Heading { level: u8 },
+    /// `\part*`: the centred part block, without its "Part N" line or a part number.
+    Part,
+    /// `\subparagraph*`: run-in italics, which carry no number either way.
+    Subparagraph,
+}
 impl ConversionState {
     /// Add a structured warning
     pub fn add_warning(&mut self, warning: ConversionWarning) {
@@ -394,6 +473,10 @@ impl ConversionState {
 pub struct LatexConverter {
     pub(crate) state: ConversionState,
     pub(crate) spec: CommandSpec,
+    /// Half-collected siunitx arguments, carried across sibling nodes.
+    pub(crate) siunitx_arg_collector: Option<PendingSiunitx>,
+    /// A starred sectioning command whose title has not been reached yet.
+    pub(crate) pending_section: Option<PendingSection>,
 }
 
 /// A `ClauseArgument` is a *required* argument iff it does not carry an
@@ -1149,6 +1232,8 @@ impl LatexConverter {
         Self {
             state: ConversionState::new(),
             spec: MERGED_SPEC.clone(),
+            siunitx_arg_collector: None,
+            pending_section: None,
         }
     }
 
@@ -1159,6 +1244,8 @@ impl LatexConverter {
         Self {
             state,
             spec: MERGED_SPEC.clone(),
+            siunitx_arg_collector: None,
+            pending_section: None,
         }
     }
 
@@ -1301,6 +1388,8 @@ impl LatexConverter {
             options: self.state.options.clone(),
             ..ConversionState::default()
         };
+        self.siunitx_arg_collector = None;
+        self.pending_section = None;
     }
 
     /// Convert a complete LaTeX document to Typst
@@ -1479,6 +1568,48 @@ impl LatexConverter {
         }
     }
 
+    /// Take the title group following a starred sectioning command and emit
+    /// the heading. TeX skips whitespace AND `%` comments before the argument
+    /// it scans for, so `\section* % note\n{Title}` is `\section*{Title}`.
+    fn handle_pending_section(&mut self, elem: SyntaxElement, output: &mut String) -> bool {
+        let Some(pending) = self.pending_section.take() else {
+            return false;
+        };
+
+        match elem.kind() {
+            SyntaxKind::TokenWhiteSpace
+            | SyntaxKind::TokenLineBreak
+            | SyntaxKind::TokenComment
+            | SyntaxKind::ItemBlockComment
+            | SyntaxKind::TokenAsterisk => {
+                self.pending_section = Some(pending);
+                true
+            }
+            SyntaxKind::ItemCurly => {
+                if let SyntaxElement::Node(node) = elem {
+                    // Convert the title so markup inside it is translated, not copied.
+                    let body: Vec<SyntaxElement> = node
+                        .children_with_tokens()
+                        .filter(|child| {
+                            !matches!(
+                                child.kind(),
+                                SyntaxKind::TokenLBrace | SyntaxKind::TokenRBrace
+                            )
+                        })
+                        .collect();
+                    let mut title = String::new();
+                    self.visit_elements(&body, &mut title);
+                    super::markup::emit_starred_section(pending, title.trim(), output);
+                    return true;
+                }
+                self.pending_section = Some(pending);
+                false
+            }
+            // No title group follows (`\section*` alone): emit nothing rather than invent it.
+            _ => false,
+        }
+    }
+
     fn handle_pending_reference(&mut self, elem: SyntaxElement, output: &mut String) -> bool {
         let Some(pending) = self.state.pending_reference.take() else {
             return false;
@@ -1506,6 +1637,74 @@ impl LatexConverter {
         }
     }
 
+    /// Consume the curly-sibling arguments of a pending siunitx command.
+    fn handle_pending_siunitx(&mut self, elem: SyntaxElement, output: &mut String) -> bool {
+        let Some(mut pending) = self.siunitx_arg_collector.take() else {
+            return false;
+        };
+
+        if pending.optional_bracket_depth > 0 {
+            match elem.kind() {
+                SyntaxKind::TokenLBracket => pending.optional_bracket_depth += 1,
+                SyntaxKind::TokenRBracket => pending.optional_bracket_depth -= 1,
+                _ => {}
+            }
+            self.siunitx_arg_collector = Some(pending);
+            return true;
+        }
+
+        match elem.kind() {
+            // Whitespace and TeX comments are transparent to argument collection.
+            SyntaxKind::TokenWhiteSpace
+            | SyntaxKind::TokenLineBreak
+            | SyntaxKind::TokenComment
+            | SyntaxKind::ItemBlockComment => {
+                self.siunitx_arg_collector = Some(pending);
+                true
+            }
+            SyntaxKind::TokenLBracket => {
+                pending.optional_bracket_depth = 1;
+                self.siunitx_arg_collector = Some(pending);
+                true
+            }
+            // siunitx allows a key-value configuration; Typst has none, so skip it.
+            SyntaxKind::ItemBracket => {
+                self.siunitx_arg_collector = Some(pending);
+                true
+            }
+            // mitex may wrap the same optional bracket in a `ClauseArgument`.
+            SyntaxKind::ClauseArgument
+                if elem.as_node().is_some_and(|node| {
+                    node.children()
+                        .any(|child| child.kind() == SyntaxKind::ItemBracket)
+                }) =>
+            {
+                self.siunitx_arg_collector = Some(pending);
+                true
+            }
+            SyntaxKind::ItemCurly => {
+                if let SyntaxElement::Node(node) = &elem {
+                    let raw = super::utils::extract_curly_inner_content(node);
+                    pending.args.push(raw);
+                    if pending.args.len() >= pending.needed {
+                        super::markup::emit_siunitx(self, &pending, output);
+                    } else {
+                        self.siunitx_arg_collector = Some(pending);
+                    }
+                    return true;
+                }
+                // Not a node: flush what we have and let the element fall through.
+                super::markup::emit_siunitx(self, &pending, output);
+                false
+            }
+            // A non-group element means arguments are missing; flush and handle it.
+            _ => {
+                super::markup::emit_siunitx(self, &pending, output);
+                false
+            }
+        }
+    }
+
     /// Visit a syntax element (node or token)
     pub fn visit_element(&mut self, elem: SyntaxElement, output: &mut String) {
         use SyntaxKind::*;
@@ -1514,6 +1713,12 @@ impl LatexConverter {
             return;
         }
         if self.handle_pending_reference(elem.clone(), output) {
+            return;
+        }
+        if self.handle_pending_section(elem.clone(), output) {
+            return;
+        }
+        if self.handle_pending_siunitx(elem.clone(), output) {
             return;
         }
 
@@ -1708,13 +1913,14 @@ impl LatexConverter {
             TokenDitto => output.push('"'),
             TokenLParen => output.push('('),
             TokenRParen => output.push(')'),
+            // Brackets here are literal text: a real optional argument is consumed by the grammar.
             TokenLBracket => {
-                if matches!(self.state.mode, ConversionMode::Math) {
+                if !self.state.in_preamble {
                     output.push('[');
                 }
             }
             TokenRBracket => {
-                if matches!(self.state.mode, ConversionMode::Math) {
+                if !self.state.in_preamble {
                     output.push(']');
                 }
             }
@@ -1876,38 +2082,31 @@ impl LatexConverter {
 
     /// Get optional argument from an environment
     pub fn get_env_optional_arg(&self, node: &SyntaxNode) -> Option<String> {
-        for child in node.children() {
-            if child.kind() == SyntaxKind::ItemBegin {
-                for begin_child in child.children() {
-                    if begin_child.kind() == SyntaxKind::ClauseArgument {
-                        let has_bracket = begin_child
-                            .children()
-                            .any(|c| c.kind() == SyntaxKind::ItemBracket);
-                        if has_bracket {
-                            return Some(extract_arg_content(&begin_child));
-                        }
-                    }
-                }
-            }
-        }
-        None
+        env_header_args(node)
+            .into_iter()
+            .find(|arg| arg.optional)
+            .map(|arg| arg.content)
+    }
+
+    /// The n-th OPTIONAL argument of the environment header, in source order.
+    ///
+    /// `\begin{minipage}[pos][height][inner-pos]{width}` has three, so a single
+    /// "the optional argument" accessor cannot describe it.
+    pub fn get_env_optional_arg_at(&self, node: &SyntaxNode, index: usize) -> Option<String> {
+        env_header_args(node)
+            .into_iter()
+            .filter(|arg| arg.optional)
+            .nth(index)
+            .map(|arg| arg.content)
     }
 
     /// Get a required argument from an environment
     pub fn get_env_required_arg(&self, node: &SyntaxNode, index: usize) -> Option<String> {
-        let mut required_count = 0;
-        for child in node.children() {
-            if child.kind() == SyntaxKind::ClauseArgument {
-                let is_curly = child.children().any(|c| c.kind() == SyntaxKind::ItemCurly);
-                if is_curly {
-                    if required_count == index {
-                        return Some(extract_arg_content(&child));
-                    }
-                    required_count += 1;
-                }
-            }
-        }
-        None
+        env_header_args(node)
+            .into_iter()
+            .filter(|arg| !arg.optional)
+            .nth(index)
+            .map(|arg| arg.content)
     }
 
     /// Extract and convert argument for metadata (title, author, date)
@@ -2497,21 +2696,51 @@ impl LatexConverter {
 
     /// Process SI unit string
     pub fn process_si_unit(&self, input: &str) -> String {
-        let mut result = input.to_string();
-
-        for (cmd, val) in crate::siunitx::SI_UNITS.iter() {
-            result = result.replace(cmd, val);
+        // Map whole `\macro` names: `\m`/`\s` are prefixes of `\micro`/`\second` (issue #40).
+        let chars: Vec<char> = input.chars().collect();
+        let mut result = String::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\\' {
+                let name_start = i + 1;
+                let mut j = name_start;
+                while j < chars.len() && chars[j].is_ascii_alphabetic() {
+                    j += 1;
+                }
+                let name: String = chars[name_start..j].iter().collect();
+                if name.is_empty() {
+                    // Lone backslash (e.g. an escaped symbol): keep it verbatim.
+                    result.push('\\');
+                    i += 1;
+                    continue;
+                }
+                let full: String = chars[i..j].iter().collect(); // includes '\'
+                match name.as_str() {
+                    "per" => result.push('/'),
+                    "squared" => result.push('²'),
+                    "cubed" => result.push('³'),
+                    _ => {
+                        if let Some(val) = crate::siunitx::SI_PREFIXES
+                            .get(full.as_str())
+                            .or_else(|| crate::siunitx::SI_UNITS.get(full.as_str()))
+                        {
+                            result.push_str(val);
+                        } else {
+                            // Unknown unit macro: keep the bare name rather than dropping it.
+                            result.push_str(&name);
+                        }
+                    }
+                }
+                i = j;
+            } else if c.is_whitespace() {
+                // Unit strings carry no significant whitespace: `\metre \per \second` is `m/s`.
+                i += 1;
+            } else {
+                result.push(c);
+                i += 1;
+            }
         }
-        for (cmd, val) in crate::siunitx::SI_PREFIXES.iter() {
-            result = result.replace(cmd, val);
-        }
-
-        result = result
-            .replace("\\per", "/")
-            .replace("\\squared", "²")
-            .replace("\\cubed", "³")
-            .replace(" ", "");
-
         result
     }
 
@@ -2540,6 +2769,7 @@ impl LatexConverter {
         let children: Vec<SyntaxElement> = node.children_with_tokens().collect();
         let mut content = Vec::with_capacity(children.len());
         let mut i = 0;
+        // Header argument slots are bound by the environment signature, so this is body.
         while i < children.len() {
             let child = &children[i];
             match child.kind() {
@@ -2563,17 +2793,16 @@ impl LatexConverter {
         self.visit_elements(&content, output);
     }
 
-    /// If the elements at `start` form an optional `[<dimension>]` group (after
-    /// optional whitespace), return the index just past its closing `]`;
-    /// otherwise return `start` unchanged. Only a dimension-like body (see
-    /// [`is_tex_dimension`]) is consumed, so genuine bracketed row content is
-    /// preserved.
+    /// Index past an optional `[<dimension>]` group at `start`, else `start`.
+    /// Only a dimension-like body ([`is_tex_dimension`]) is consumed, so real
+    /// bracketed row content survives. `%` comments are trivia like whitespace,
+    /// so `\\% note<newline>[6pt]` is `\\[6pt]` (issue #41).
     fn skip_optional_row_spacing(&self, children: &[SyntaxElement], start: usize) -> usize {
         let mut j = start;
         while j < children.len()
             && (matches!(
                 children[j].kind(),
-                SyntaxKind::TokenWhiteSpace | SyntaxKind::TokenLineBreak
+                SyntaxKind::TokenWhiteSpace | SyntaxKind::TokenLineBreak | SyntaxKind::TokenComment
             ) || is_command_named(&children[j], "par"))
         {
             j += 1;

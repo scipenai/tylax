@@ -6,7 +6,7 @@ use mitex_parser::syntax::{CmdItem, EnvItem, SyntaxElement, SyntaxKind, SyntaxNo
 use rowan::ast::AstNode;
 use std::fmt::Write;
 
-use super::context::{ConversionMode, EnvironmentContext, LatexConverter};
+use super::context::{env_header_args, ConversionMode, EnvironmentContext, LatexConverter};
 use super::table::{parse_with_grid_parser, CellAlign};
 use super::utils::sanitize_label;
 use crate::data::constants::{CodeBlockOptions, TheoremStyle, LANGUAGE_MAP, THEOREM_TYPES};
@@ -166,6 +166,23 @@ pub fn convert_environment(conv: &mut LatexConverter, elem: SyntaxElement, outpu
         }
         "flushright" | "raggedleft" => {
             output.push_str("#align(right)[\n");
+            conv.visit_env_content(&node, output);
+            output.push_str("\n]\n");
+        }
+
+        // Multi-column layout: `\begin{multicols}{2}[Header]`. The optional
+        // argument is a header spanning all columns, so it precedes them.
+        "multicols" | "multicols*" => {
+            let columns = conv
+                .get_env_required_arg(&node, 0)
+                .unwrap_or_else(|| "2".to_string());
+            if let Some(header) = conv.get_env_optional_arg(&node) {
+                let header = header.trim();
+                if !header.is_empty() {
+                    let _ = writeln!(output, "\n{}", header);
+                }
+            }
+            let _ = writeln!(output, "#columns({})[", columns.trim());
             conv.visit_env_content(&node, output);
             output.push_str("\n]\n");
         }
@@ -1018,60 +1035,12 @@ fn convert_algorithm(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut 
 /// Get the column specification from a tabular environment
 /// The col spec is in the first curly arg after the env name: \begin{tabular}{lccc}
 fn get_tabular_col_spec(node: &SyntaxNode) -> Option<String> {
-    // Look for ItemBegin, then find the column specification argument
-    for child in node.children() {
-        if child.kind() == SyntaxKind::ItemBegin {
-            // In ItemBegin, look for ClauseArgument with curly braces
-            for begin_child in child.children() {
-                if begin_child.kind() == SyntaxKind::ClauseArgument {
-                    // Check if it's a curly (required) argument
-                    let has_curly = begin_child
-                        .children()
-                        .any(|c| c.kind() == SyntaxKind::ItemCurly);
-                    if has_curly {
-                        // Extract the content
-                        let mut content = String::new();
-                        for arg_child in begin_child.children_with_tokens() {
-                            match arg_child.kind() {
-                                SyntaxKind::TokenLBrace
-                                | SyntaxKind::TokenRBrace
-                                | SyntaxKind::TokenLBracket
-                                | SyntaxKind::TokenRBracket => continue,
-                                SyntaxKind::ItemCurly => {
-                                    // Extract inner content
-                                    if let SyntaxElement::Node(n) = arg_child {
-                                        for inner in n.children_with_tokens() {
-                                            match inner.kind() {
-                                                SyntaxKind::TokenLBrace
-                                                | SyntaxKind::TokenRBrace => continue,
-                                                _ => {
-                                                    if let SyntaxElement::Token(t) = inner {
-                                                        content.push_str(t.text());
-                                                    } else if let SyntaxElement::Node(n) = inner {
-                                                        content.push_str(&n.text().to_string());
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    if let SyntaxElement::Token(t) = arg_child {
-                                        content.push_str(t.text());
-                                    }
-                                }
-                            }
-                        }
-                        let trimmed = content.trim().to_string();
-                        if !trimmed.is_empty() {
-                            return Some(trimmed);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
+    // The column spec is the LAST required slot for every shape in the family:
+    // `tabular[pos]{cols}` as well as `tabular*{width}[pos]{cols}`.
+    env_header_args(node)
+        .into_iter()
+        .rfind(|arg| !arg.optional)
+        .map(|arg| arg.content)
 }
 
 /// Skip over a braced group {...} if present.

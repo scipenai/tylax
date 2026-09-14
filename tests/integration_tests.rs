@@ -1473,6 +1473,524 @@ mod t2l_math {
 mod l2t_document {
     use super::*;
 
+    /// Issue #45: `\section*{T}` binds the `*` as the command's single term
+    /// argument, so the heading was named `*` and the real title was demoted to
+    /// body text — losing it from the outline and the table of contents.
+    #[test]
+    fn starred_sections_are_unnumbered_headings_in_an_article() {
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\section{Numbered section}\n\\section*{Unnumbered section}\n\
+             \\subsection*{Unnumbered subsection}\n\\end{document}\n",
+        );
+        assert!(
+            out.contains("#heading(level: 1, numbering: none)[Unnumbered section]"),
+            "a starred section must be an unnumbered heading, got:\n{out}"
+        );
+        assert!(
+            out.contains("#heading(level: 2, numbering: none)[Unnumbered subsection]"),
+            "a starred subsection must keep its depth, got:\n{out}"
+        );
+        // The star must not survive anywhere: as a heading name it both broke
+        // the build and hid the title.
+        assert!(
+            !out.contains("= \\*") && !out.contains("= *"),
+            "the star must not become a heading, got:\n{out}"
+        );
+        // The numbered form is untouched.
+        assert!(
+            out.contains("= Numbered section"),
+            "a plain section must still use the shorthand, got:\n{out}"
+        );
+        // The original symptom was a build failure: Typst read the lone `*` as
+        // an unclosed strong-emphasis delimiter.
+        assert_compiles_with_real_typst(&out);
+    }
+
+    /// Compile a converted document with the real `typst` binary. Skipped, with
+    /// a note, when `typst` is not installed.
+    fn assert_compiles_with_real_typst(typst_source: &str) {
+        use std::process::{Command, Stdio};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let available = Command::new("typst")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !available {
+            eprintln!("skipping typst compile check: `typst` not on PATH");
+            return;
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let source = std::env::temp_dir().join(format!("tylax-heading-{nonce}.typ"));
+        std::fs::write(&source, typst_source).expect("typst source should be written");
+
+        let output = Command::new("typst")
+            .arg("compile")
+            .arg(&source)
+            .arg("--format")
+            .arg("pdf")
+            .arg("-")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run typst compile");
+
+        let succeeded = output.status.success();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let _ = std::fs::remove_file(&source);
+
+        assert!(
+            succeeded,
+            "the converted document must compile:\n{typst_source}\n--- typst said ---\n{stderr}"
+        );
+    }
+
+    /// Brackets the author typed are literal text. They used to be dropped
+    /// wholesale in markup mode, which hid every unconsumed optional argument
+    /// but also silently deleted real content.
+    #[test]
+    fn literal_brackets_in_body_text_are_preserved() {
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\
+             Literal [brackets] and a range [1,2] stay visible.\n\\end{document}\n",
+        );
+        assert!(
+            out.contains("Literal [brackets] and a range [1,2] stay visible."),
+            "author-typed brackets must survive, got:\n{out}"
+        );
+        assert_compiles_with_real_typst(&out);
+    }
+
+    #[test]
+    fn optional_arguments_are_consumed_not_leaked_as_brackets() {
+        // The counterpart: now that brackets are literal, every optional
+        // argument must actually be consumed by its command's grammar, or it
+        // would show up as stray text.
+        let out = latex_document_to_typst(
+            "\\documentclass[12pt,a4paper]{article}\n\\usepackage[utf8]{inputenc}\n\
+             \\begin{document}\n\
+             \\begin{figure}[htbp]\n\\caption[Short cap]{Long cap}\n\\end{figure}\n\
+             \\begin{enumerate}[label=(\\alph*)]\n\\item First\n\\end{enumerate}\n\
+             \\end{document}\n",
+        );
+        for leaked in ["12pt", "a4paper", "utf8", "htbp", "Short cap", "label="] {
+            assert!(
+                !out.contains(leaked),
+                "optional argument `{leaked}` must be consumed, got:\n{out}"
+            );
+        }
+        assert!(
+            out.contains("caption: [Long cap]"),
+            "the real caption must survive, got:\n{out}"
+        );
+        assert!(
+            out.contains("First"),
+            "the list item must survive, got:\n{out}"
+        );
+        assert_compiles_with_real_typst(&out);
+    }
+
+    /// Environment headers are described by a per-environment signature in the
+    /// command spec, so mixed, repeated and out-of-order optional/required
+    /// slots all parse. A "skip one leading bracket" rule could not express any
+    /// of these.
+    #[test]
+    fn minipage_reads_its_width_past_every_optional_slot() {
+        // `\begin{minipage}[pos][height][inner-pos]{width}` — all three
+        // optional slots, plus the shorter spellings LaTeX also accepts.
+        for header in ["[t][2cm][c]{3cm}", "[t][2cm]{3cm}", "[t]{3cm}", "{3cm}"] {
+            let out = latex_document_to_typst(&format!(
+                "\\documentclass{{article}}\n\\begin{{document}}\n\
+                 \\begin{{minipage}}{header}\nMini body\n\\end{{minipage}}\n\\end{{document}}\n"
+            ));
+            assert!(
+                out.contains("#block(width: 3cm)"),
+                "the width is the required slot after the optional ones, got \
+                 for `{header}`:\n{out}"
+            );
+            for slot in ["[t]", "2cm]", "[c]"] {
+                assert!(
+                    !out.contains(slot),
+                    "header slot `{slot}` leaked for `{header}`, got:\n{out}"
+                );
+            }
+            assert!(
+                out.contains("Mini body"),
+                "body must survive for `{header}`, got:\n{out}"
+            );
+        }
+    }
+
+    /// `maps.rs` is generated from `tools/gen_maps.py`, so an environment
+    /// signature added to only one of them is a latent regression: regenerating
+    /// would silently drop it. (The generator currently refuses to overwrite a
+    /// diverged `maps.rs`, which is exactly why the two must be kept in step by
+    /// hand.)
+    #[test]
+    fn environment_signatures_match_the_generator() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let generator = std::fs::read_to_string(root.join("tools/gen_maps.py"))
+            .expect("tools/gen_maps.py should be readable");
+        let maps = std::fs::read_to_string(root.join("src/data/maps.rs"))
+            .expect("src/data/maps.rs should be readable");
+
+        // `ENVIRONMENT_SIGNATURES = { "name": "pattern", ... }`
+        let table = generator
+            .split_once("ENVIRONMENT_SIGNATURES = {")
+            .and_then(|(_, rest)| rest.split_once("\n}"))
+            .map(|(body, _)| body)
+            .expect("ENVIRONMENT_SIGNATURES table should be present");
+        // Collect the quoted strings line by line; they alternate name,
+        // pattern. Splitting on `,` would not work — the patterns contain one.
+        let mut from_generator: Vec<(String, String)> = Vec::new();
+        for line in table.lines() {
+            let line = line.split('#').next().unwrap_or(line);
+            let quoted: Vec<&str> = line.split('"').skip(1).step_by(2).collect();
+            for pair in quoted.chunks(2) {
+                if let [name, pattern] = pair {
+                    from_generator.push((name.to_string(), pattern.to_string()));
+                }
+            }
+        }
+        assert!(
+            from_generator.len() > 10,
+            "failed to parse the generator table, got: {from_generator:?}"
+        );
+
+        let mut from_maps: Vec<(String, String)> = Vec::new();
+        for chunk in maps.split("m.insert(\"").skip(1) {
+            let Some((name, rest)) = chunk.split_once("\".to_string(), ") else {
+                continue;
+            };
+            if !rest.starts_with("CommandSpecItem::Env(") {
+                continue;
+            }
+            // `aligned` is the one environment with no argument pattern.
+            if let Some((_, after)) = rest.split_once("GlobStr::from(\"") {
+                if let Some((pattern, _)) = after.split_once('"') {
+                    from_maps.push((name.to_string(), pattern.to_string()));
+                }
+            }
+        }
+
+        from_generator.sort();
+        from_maps.sort();
+        assert_eq!(
+            from_generator, from_maps,
+            "tools/gen_maps.py and src/data/maps.rs disagree about environment signatures"
+        );
+    }
+
+    #[test]
+    fn starred_and_variant_environments_share_their_signature() {
+        // A converter that handles a variant (`multicols*`, `longtabu`) is not
+        // enough: the variant needs its own header signature, or the header
+        // leaks into the body.
+        let multicols = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\begin{multicols*}{2}[Header]\nCol body\n\\end{multicols*}\n\\end{document}\n",
+        );
+        assert!(
+            multicols.contains("#columns(2)") && !multicols.contains("[Header]"),
+            "multicols* must consume its header, got:\n{multicols}"
+        );
+
+        let longtabu = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\begin{longtabu}[t]{cc}\na & b \\\\\n\\end{longtabu}\n\\end{document}\n",
+        );
+        assert!(
+            longtabu.contains("columns: (auto, auto)") && !longtabu.contains("[t]"),
+            "longtabu must consume its position argument, got:\n{longtabu}"
+        );
+    }
+
+    #[test]
+    fn multicols_reads_a_required_slot_before_its_optional_one() {
+        // `\begin{multicols}{2}[Header]` — required first, optional second.
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\begin{multicols}{2}[Header]\nCol body\n\\end{multicols}\n\\end{document}\n",
+        );
+        assert!(
+            out.contains("#columns(2)"),
+            "the column count must be read, got:\n{out}"
+        );
+        assert!(
+            out.contains("Header") && !out.contains("[Header]"),
+            "the header spans the columns, it is not a literal bracket, got:\n{out}"
+        );
+        assert!(out.contains("Col body"), "body must survive, got:\n{out}");
+    }
+
+    #[test]
+    fn lstlisting_option_is_consumed_by_the_raw_extraction_path() {
+        // `lstlisting` takes the raw-source route, which bypasses the body scan
+        // entirely — only a header signature can keep `[language=..]` out of
+        // the code, and it also supplies the language.
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\begin{lstlisting}[language=Python]\nx = 1\n\\end{lstlisting}\n\\end{document}\n",
+        );
+        assert!(
+            !out.contains("language=Python"),
+            "the option must not land in the code, got:\n{out}"
+        );
+        assert!(
+            out.contains("```python"),
+            "the consumed option should still select the language, got:\n{out}"
+        );
+        assert!(out.contains("x = 1"), "the code must survive, got:\n{out}");
+    }
+
+    #[test]
+    fn tabular_position_argument_does_not_disturb_the_column_spec() {
+        // `\begin{tabular}[t]{cc}` — the column spec is the LAST required slot,
+        // which also holds for `tabular*{width}[pos]{cols}`.
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\begin{tabular}[t]{cc}\na & b \\\\\n\\end{tabular}\n\\end{document}\n",
+        );
+        assert!(
+            out.contains("columns: (auto, auto)"),
+            "both columns must be detected, got:\n{out}"
+        );
+        assert!(
+            !out.contains("[t]") && !out.contains("cc a"),
+            "the header must not leak into the cells, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn an_environment_without_an_optional_argument_keeps_its_brackets() {
+        // `center` declares no optional argument, so LaTeX prints `[x]`. Only
+        // environments that really take one may swallow a leading bracket.
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\begin{center}\n[x] stays text\n\\end{center}\n\\end{document}\n",
+        );
+        assert!(
+            out.contains("[x] stays text"),
+            "a non-option bracket must stay text, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn sectioning_commands_accept_their_optional_short_title() {
+        // A fixed arity of one term cannot consume `\section[short]{long}`: the
+        // parser bound NO argument at all, so the heading vanished and both the
+        // short and the long title ran together as body text. The optional
+        // argument belongs in the command's grammar.
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\section[Short toc]{Long title}\nBody.\n\\end{document}\n",
+        );
+        assert!(
+            out.contains("= Long title"),
+            "the heading must survive an optional short title, got:\n{out}"
+        );
+        assert!(
+            !out.contains("Short toc"),
+            "the short title is a table-of-contents entry, not body text, got:\n{out}"
+        );
+        assert!(
+            out.contains("Body."),
+            "the following paragraph must be intact, got:\n{out}"
+        );
+        assert_compiles_with_real_typst(&out);
+    }
+
+    #[test]
+    fn optional_short_title_works_for_every_sectioning_depth() {
+        let out = latex_document_to_typst(
+            "\\documentclass{book}\n\\begin{document}\n\
+             \\chapter[C]{Chapter title}\n\\section[S]{Section title}\n\
+             \\subsection[Sub]{Subsection title}\n\\end{document}\n",
+        );
+        for title in ["Chapter title", "Section title", "Subsection title"] {
+            assert!(out.contains(title), "{title} must survive, got:\n{out}");
+        }
+        assert!(
+            out.contains("= Chapter title") && out.contains("== Section title"),
+            "depths must be unchanged, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn starred_section_survives_a_comment_before_its_title() {
+        // TeX skips whitespace AND `%` comments before the argument it scans
+        // for, so this is the same command as `\section*{After comment}`.
+        // Treating the comment as anything but trivia dropped the pending state
+        // and demoted the title to body text.
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\section* % comment\n{After comment}\nBody.\n\\end{document}\n",
+        );
+        assert!(
+            out.contains("#heading(level: 1, numbering: none)[After comment]"),
+            "a comment between `*` and the title must be trivia, got:\n{out}"
+        );
+        assert!(
+            out.contains("Body."),
+            "the following paragraph must survive, got:\n{out}"
+        );
+        assert_compiles_with_real_typst(&out);
+    }
+
+    #[test]
+    fn starred_sections_follow_the_document_class_depth() {
+        // In book/report, `\chapter` is depth 1 and `\section` depth 2; the
+        // starred forms must land on the same levels as their plain twins.
+        let out = latex_document_to_typst(
+            "\\documentclass{book}\n\\begin{document}\n\
+             \\chapter{Numbered chapter}\n\\chapter*{Unnumbered chapter}\n\
+             \\section*{Unnumbered section}\n\\subsection*{Unnumbered subsection}\n\
+             \\end{document}\n",
+        );
+        assert!(
+            out.contains("= Numbered chapter")
+                && out.contains("#heading(level: 1, numbering: none)[Unnumbered chapter]"),
+            "a starred chapter must match its plain depth, got:\n{out}"
+        );
+        assert!(
+            out.contains("#heading(level: 2, numbering: none)[Unnumbered section]"),
+            "book `\\section*` is depth 2, got:\n{out}"
+        );
+        assert!(
+            out.contains("#heading(level: 3, numbering: none)[Unnumbered subsection]"),
+            "book `\\subsection*` is depth 3, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn every_starred_sectioning_form_keeps_its_title() {
+        // The star is bound as the argument for every one of these, so each
+        // needs the same treatment — and `\part*`/`\subparagraph*` keep the
+        // layout of their unstarred twins rather than becoming plain headings.
+        let out = latex_document_to_typst(
+            "\\documentclass{book}\n\\begin{document}\n\
+             \\part*{PartTitle}\n\\subsubsection*{SubsubTitle}\n\
+             \\paragraph*{ParaTitle}\n\\subparagraph*{SubparaTitle}\n\\end{document}\n",
+        );
+        for title in ["PartTitle", "SubsubTitle", "ParaTitle", "SubparaTitle"] {
+            assert!(out.contains(title), "{title} must survive, got:\n{out}");
+        }
+        assert!(
+            !out.contains('*'),
+            "no star may leak into the output, got:\n{out}"
+        );
+        // `\part*` keeps the centred part layout but drops the "Part N" line.
+        assert!(
+            out.contains("#text(2em, weight: \"bold\")[PartTitle]") && !out.contains("Part I"),
+            "a starred part must not be numbered, got:\n{out}"
+        );
+        assert!(
+            out.contains("_SubparaTitle_"),
+            "a starred subparagraph stays run-in italics, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn numbered_headings_are_unchanged_by_the_starred_handling() {
+        // Guard the common path: nothing about plain sectioning may change.
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\section{One}\nBody text follows.\n\\subsection{Two}\n\
+             \\subsubsection{Three}\n\\end{document}\n",
+        );
+        assert!(
+            out.contains("= One") && out.contains("== Two") && out.contains("=== Three"),
+            "plain headings must keep the shorthand, got:\n{out}"
+        );
+        assert!(
+            !out.contains("#heading("),
+            "no plain heading should need the explicit element, got:\n{out}"
+        );
+        // A greedy argument pattern would have eaten the "B" of "Body".
+        assert!(
+            out.contains("Body text follows."),
+            "the following paragraph must be intact, got:\n{out}"
+        );
+    }
+
+    /// Issue #41: TeX discards a `%` comment before scanning the optional
+    /// row-spacing argument of `\\`, so `\\% note<newline>[6pt]` is the very
+    /// same row break as `\\[6pt]`. These run through the FULL-DOCUMENT path —
+    /// the existing coverage used the math-only entry point, which is a
+    /// different pipeline.
+    #[test]
+    fn matrix_row_spacing_survives_a_comment_separator() {
+        let commented = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\\[\n\\begin{pmatrix}\n\
+             a & b \\\\% row spacing comment\n[6pt] c & d\n\\end{pmatrix}\n\\]\n\
+             \\end{document}\n",
+        );
+        assert!(
+            !commented.contains("6 p t") && !commented.contains("6pt"),
+            "row spacing must not leak into the matrix, got:\n{commented}"
+        );
+        assert!(
+            commented.contains("a, b ; c, d"),
+            "rows must stay clean and separated, got:\n{commented}"
+        );
+
+        // The strongest form of the invariant: a comment separator changes
+        // nothing at all versus the plain spelling.
+        let plain = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\\[\n\\begin{pmatrix}\n\
+             a & b \\\\[6pt]\nc & d\n\\end{pmatrix}\n\\]\n\
+             \\end{document}\n",
+        );
+        assert_eq!(
+            commented, plain,
+            "the comment-separated form must convert identically"
+        );
+    }
+
+    #[test]
+    fn align_and_cases_row_spacing_survive_a_comment_separator() {
+        let align = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\\begin{align}\n\
+             a &= b \\\\% note\n[6pt] c &= d\n\\end{align}\n\\end{document}\n",
+        );
+        assert!(
+            !align.contains("6 p t") && !align.contains("6pt"),
+            "align row spacing must not leak, got:\n{align}"
+        );
+
+        let cases = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\[ f = \\begin{cases} a & x>0 \\\\% note\n\
+             [6pt] b & x\\le 0 \\end{cases} \\]\n\\end{document}\n",
+        );
+        assert!(
+            !cases.contains("6 p t") && !cases.contains("6pt"),
+            "cases row spacing must not leak, got:\n{cases}"
+        );
+    }
+
+    #[test]
+    fn non_dimension_bracket_after_a_comment_is_still_content() {
+        // The consumption stays conservative: only a real length is dropped, so
+        // genuine bracketed content survives the comment separator too.
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\\[\n\\begin{pmatrix}\n\
+             a \\\\% note\n[x] b\n\\end{pmatrix}\n\\]\n\\end{document}\n",
+        );
+        assert!(
+            out.contains("[x"),
+            "a non-dimension bracket must be kept, got:\n{out}"
+        );
+    }
+
     #[test]
     fn test_simple_document() {
         let latex = r#"
@@ -1522,6 +2040,49 @@ This is methods.
         let book =
             latex_document_to_typst(r"\documentclass{book}\begin{document}Test\end{document}");
         assert!(book.contains("heading") || !book.contains("Error"));
+    }
+
+    #[test]
+    fn test_documentclass_with_optional_arg_reads_class_not_options() {
+        // `\documentclass[12pt]{book}`: the `[12pt]` is an optional argument, not
+        // the class. The class must be read from the following `{book}` so heading
+        // levels are correct — book's `\section` is a depth-2 `==` heading, whereas
+        // a misdetected class would collapse it to a top-level `=`.
+        let book = latex_document_to_typst(
+            "\\documentclass[12pt]{book}\n\\begin{document}\n\\section{First}\n\\end{document}",
+        );
+        assert!(
+            book.contains("== First"),
+            "book's \\section must be `== First` (depth 2), got:\n{book}"
+        );
+
+        let memoir = latex_document_to_typst(
+            "\\documentclass[11pt,openany]{memoir}\n\\begin{document}\n\\section{First}\n\\end{document}",
+        );
+        assert!(
+            memoir.contains("== First"),
+            "memoir's \\section must be `== First` (depth 2), got:\n{memoir}"
+        );
+
+        // article stays a top-level `=` even with options present.
+        let article = latex_document_to_typst(
+            "\\documentclass[a4paper,12pt]{article}\n\\begin{document}\n\\section{First}\n\\end{document}",
+        );
+        assert!(
+            article.contains("= First") && !article.contains("== First"),
+            "article's \\section must be a top-level `= First`, got:\n{article}"
+        );
+
+        // A TeX comment between the optional argument and the class group is an
+        // ignorable separator: `\documentclass[12pt]% note\n{book}` must still read
+        // `book` as the class, not abort the scan at the comment.
+        let commented = latex_document_to_typst(
+            "\\documentclass[12pt]% pick a class\n{book}\n\\begin{document}\n\\section{First}\n\\end{document}",
+        );
+        assert!(
+            commented.contains("== First"),
+            "comment between options and class must not hide book's depth-2 \\section, got:\n{commented}"
+        );
     }
 
     #[test]
@@ -1662,6 +2223,103 @@ The formula $E = mc^2$ is famous.
             result.contains("/ *Bold*: a bold term."),
             "command label should convert (not be stripped to empty), got:\n{}",
             result
+        );
+    }
+
+    #[test]
+    fn test_issue_40_siunitx_units_survive() {
+        // Issue #40: siunitx units were silently dropped in full-document mode
+        // because mitex emits `\SI`'s braces as following curly siblings, not
+        // child clauses. The value AND the mapped unit must both survive.
+        let latex = r"\documentclass{article}
+\usepackage{siunitx}
+\begin{document}
+Inductance is \SI{47}{\micro\henry} and frequency \SI{500}{\kilo\hertz}.
+\end{document}";
+        let result = latex_document_to_typst(latex);
+        assert!(
+            result.contains(r#"$47 space "μH"$"#),
+            "\\SI value and prefixed unit should both survive, got:\n{}",
+            result
+        );
+        assert!(
+            result.contains(r#"$500 space "kHz"$"#),
+            "\\SI kilo-hertz should map to kHz, got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_issue_40_siunitx_single_and_derived_units() {
+        // `\si{unit}` (unit only), `\num`, `\unit`, `\ang`, and `\qty` with a
+        // `\per`/`\squared` compound unit must all convert rather than vanish.
+        let latex = r"\documentclass{article}
+\usepackage{siunitx}
+\begin{document}
+Mass \si{\kilogram}, count \num{1000}, speed \unit{\metre\per\second}, angle \ang{45}, accel \qty{9.8}{\metre\per\second\squared}.
+\end{document}";
+        let result = latex_document_to_typst(latex);
+        for expected in [
+            r#"$"kg"$"#,
+            "$1000$",
+            r#"$"m/s"$"#,
+            "$45°$",
+            r#"$9.8 space "m/s²"$"#,
+        ] {
+            assert!(
+                result.contains(expected),
+                "expected {:?} in output, got:\n{}",
+                expected,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_issue_40_siunitx_does_not_nest_math_delimiters() {
+        // siunitx is valid in both text and math mode. In an existing formula,
+        // it must emit math content directly rather than a nested `$...$`.
+        assert_eq!(
+            latex_to_typst(r"$\SI{47}{\metre}$").trim(),
+            "$47 space \"m\"$"
+        );
+        assert_eq!(
+            latex_to_typst(r"$\qty{9.8}{\metre\per\second}$").trim(),
+            "$9.8 space \"m/s\"$"
+        );
+
+        // siunitx options affect number formatting, not the value/unit
+        // semantics represented by Typst. They must not interrupt collection
+        // of the required braced arguments.
+        assert_eq!(
+            latex_to_typst(r"$\SI[round-mode=places]{47}{\metre}$").trim(),
+            "$47 space \"m\"$"
+        );
+    }
+
+    #[test]
+    fn test_siunitx_comment_between_args_still_binds_unit() {
+        // A TeX comment (`%` line comment or `\iffalse..\fi` block comment)
+        // between `\SI`'s value and unit groups is whitespace to the parser: it
+        // must not abort argument collection and drop the unit.
+        let line_comment = "\\documentclass{article}\n\\usepackage{siunitx}\n\\begin{document}\nX \\SI{47}% note\n{\\metre}.\n\\end{document}";
+        assert!(
+            latex_document_to_typst(line_comment).contains(r#"$47 space "m"$"#),
+            "line comment between \\SI args must not drop the unit, got:\n{}",
+            latex_document_to_typst(line_comment)
+        );
+
+        let block_comment = "\\documentclass{article}\n\\usepackage{siunitx}\n\\begin{document}\nX \\SI{47}\\iffalse note \\fi{\\metre}.\n\\end{document}";
+        assert!(
+            latex_document_to_typst(block_comment).contains(r#"$47 space "m"$"#),
+            "block comment between \\SI args must not drop the unit, got:\n{}",
+            latex_document_to_typst(block_comment)
+        );
+
+        // Math-mode inline form goes through the same collection path.
+        assert_eq!(
+            latex_to_typst("$\\SI{47}% note\n{\\metre}$").trim(),
+            "$47 space \"m\"$"
         );
     }
 }

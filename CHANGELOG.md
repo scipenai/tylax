@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **L2T literal text**: `verbatim`/`Verbatim`/`lstlisting` bodies and inline `\verb` are shielded from LaTeX interpretation and emitted as Typst raw, so a `tikzpicture` shown as an example stays literal instead of becoming live CeTZ. `\begin`/`\end` accept the TeX-ignorable separators (whitespace and `%` comments) that may sit before `{env}`.
 - **L2T diagnostics**: environment-balance checking handles whichever of `\begin`/`\end` appears first, so a repeated environment name no longer reports a false "unclosed environment" (#38). Comments, `\verb` spans and verbatim bodies are masked before every scan, so literal text cannot fake an imbalance.
+- **L2T argument binding**: every command and environment now consumes its own optional arguments, so a literal `[` `]` in body text is emitted as typed instead of being mistaken for a slot. `\documentclass[12pt]{book}` reads the class, `minipage`/`tabular*`/`multicols` read past their optional slots, and `%` comments count as trivia before an argument, so `\SI{47}% note` + `{\metre}` still binds the unit and `\% note` + `[6pt]` is still a row spacing.
+- **L2T sectioning**: starred forms (`\section*` through `\subparagraph*`, `\chapter*`, `\part*`) emit unnumbered headings. mitex's argument patterns have no star kind, so the `*` was being bound as the title.
 
 ## [0.3.7] - 2026-07-18
 

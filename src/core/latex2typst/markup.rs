@@ -19,7 +19,7 @@ use mitex_spec::CommandSpecItem;
 
 use super::context::{
     ConversionMode, EnvironmentContext, LatexConverter, MacroDef, PendingCitation, PendingOperator,
-    PendingReference,
+    PendingReference, PendingSection, PendingSiunitx, SiunitxKind,
 };
 use super::utils::{protect_top_level_comma, sanitize_label, to_roman_numeral};
 use crate::features::images::ImageAttributes;
@@ -381,8 +381,14 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
     if conv.state.in_preamble {
         match base_name {
             "documentclass" => {
-                if let Some(class) = conv.get_required_arg(&cmd, 0) {
-                    conv.state.document_class = Some(class);
+                // `\documentclass` is not in the spec with an arg pattern, so mitex
+                // leaves `{article}` as a following `ItemCurly` sibling rather than a
+                // required-argument clause. Read it from there.
+                let class = conv
+                    .get_required_arg(&cmd, 0)
+                    .or_else(|| next_curly_sibling_content(cmd.syntax()));
+                if let Some(class) = class {
+                    conv.state.document_class = Some(class.trim().to_string());
                 }
                 return;
             }
@@ -480,6 +486,12 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
     match base_name {
         // Section commands - Part gets special formatting with Roman numerals
         "part" => {
+            // `\part*` keeps the part layout but drops the number entirely, so
+            // it must not consume a part counter either.
+            if takes_section_star(conv, &cmd) {
+                conv.pending_section = Some(PendingSection::Part);
+                return;
+            }
             let title = conv
                 .convert_required_arg(&cmd, 0)
                 .or_else(|| conv.get_required_arg(&cmd, 0));
@@ -496,47 +508,38 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             output.push_str("#v(2em)\n\n");
         }
         "chapter" => {
+            if takes_section_star(conv, &cmd) {
+                conv.pending_section = Some(PendingSection::Heading { level: 0 });
+                return;
+            }
             let title = conv.get_required_arg(&cmd, 0).unwrap_or_default();
             output.push('\n');
             output.push_str("= ");
             output.push_str(&title);
             output.push('\n');
         }
-        // Sectioning - adjust level based on documentclass
+        // Sectioning - depth relative to the document class (see section_base_level)
         "section" => {
-            // article: section = level 1 (=), report/book: section = level 2 (==)
-            let base_level = if conv.state.document_class.as_deref() == Some("article") {
-                0
-            } else {
-                1
-            };
-            convert_section(conv, &cmd, base_level, output);
+            let base = section_base_level(conv.state.document_class.as_deref());
+            convert_section(conv, &cmd, base, output);
         }
         "subsection" => {
-            let base_level = if conv.state.document_class.as_deref() == Some("article") {
-                1
-            } else {
-                2
-            };
-            convert_section(conv, &cmd, base_level, output);
+            let base = section_base_level(conv.state.document_class.as_deref());
+            convert_section(conv, &cmd, base + 1, output);
         }
         "subsubsection" => {
-            let base_level = if conv.state.document_class.as_deref() == Some("article") {
-                2
-            } else {
-                3
-            };
-            convert_section(conv, &cmd, base_level, output);
+            let base = section_base_level(conv.state.document_class.as_deref());
+            convert_section(conv, &cmd, base + 2, output);
         }
         "paragraph" => {
-            let base_level = if conv.state.document_class.as_deref() == Some("article") {
-                3
-            } else {
-                4
-            };
-            convert_section(conv, &cmd, base_level, output);
+            let base = section_base_level(conv.state.document_class.as_deref());
+            convert_section(conv, &cmd, base + 3, output);
         }
         "subparagraph" => {
+            if takes_section_star(conv, &cmd) {
+                conv.pending_section = Some(PendingSection::Subparagraph);
+                return;
+            }
             let title = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
             let _ = write!(output, "\n_{}_\n", title);
         }
@@ -1009,40 +1012,17 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             }
         }
 
-        // siunitx commands
-        "SI" | "si" => {
-            let value = conv.get_required_arg(&cmd, 0);
-            let unit = conv.get_required_arg(&cmd, 1);
-            match (value, unit) {
-                (Some(v), Some(u)) => {
-                    let unit_str = conv.process_si_unit(&u);
-                    let _ = write!(output, "${} space {}$", v, unit_str);
-                }
-                (None, Some(u)) => {
-                    let unit_str = conv.process_si_unit(&u);
-                    let _ = write!(output, "${}$", unit_str);
-                }
-                _ => {}
-            }
-        }
-        "qty" => {
-            let value = conv.get_required_arg(&cmd, 0).unwrap_or_default();
-            let unit = conv.get_required_arg(&cmd, 1).unwrap_or_default();
-            let unit_str = conv.process_si_unit(&unit);
-            let _ = write!(output, "${} space {}$", value, unit_str);
-        }
-        "num" => {
-            let value = conv.get_required_arg(&cmd, 0).unwrap_or_default();
-            let _ = write!(output, "${}$", value);
-        }
-        "unit" => {
-            let unit = conv.get_required_arg(&cmd, 0).unwrap_or_default();
-            let unit_str = conv.process_si_unit(&unit);
-            let _ = write!(output, "${}$", unit_str);
-        }
-        "ang" => {
-            let angle = conv.get_required_arg(&cmd, 0).unwrap_or_default();
-            let _ = write!(output, "${}°$", angle);
+        // With no argument pattern in mitex, siunitx's braced groups arrive as
+        // following siblings (issue #40), so collect them for `emit_siunitx`.
+        "SI" | "si" | "qty" | "num" | "unit" | "ang" => {
+            let (kind, needed) = match base_name {
+                "SI" | "qty" => (SiunitxKind::NumberUnit, 2),
+                "num" => (SiunitxKind::NumberOnly, 1),
+                "ang" => (SiunitxKind::Angle, 1),
+                // "si" | "unit"
+                _ => (SiunitxKind::UnitOnly, 1),
+            };
+            begin_siunitx(conv, &cmd, kind, needed, output);
         }
 
         // =====================================================================
@@ -3173,15 +3153,179 @@ fn apply_cedilla(content: &str) -> String {
     }
 }
 
+/// Inner content of the next `ItemCurly` sibling, skipping whitespace.
+///
+/// `\documentclass{..}` / `\usepackage{..}` have no arg pattern in the spec, so
+/// mitex leaves their brace group as a following sibling instead of an argument
+/// clause; this reads it back.
+fn next_curly_sibling_content(node: &mitex_parser::syntax::SyntaxNode) -> Option<String> {
+    use mitex_parser::syntax::{SyntaxElement, SyntaxKind};
+    let mut sib = node.next_sibling_or_token();
+    // A leading optional argument like the `[12pt]` in `\documentclass[12pt]{book}`
+    // is emitted by MiTeX as a flat token span (`TokenLBracket … TokenRBracket`),
+    // not a single node, so skip the balanced bracket run before reading the class
+    // from the following `{book}`. TeX comments between the arguments
+    // (`\documentclass[12pt]% note\n{book}`) are ignorable separators, exactly like
+    // whitespace, so they must not terminate the scan either.
+    let mut bracket_depth = 0usize;
+    while let Some(s) = sib {
+        match s.kind() {
+            SyntaxKind::TokenWhiteSpace
+            | SyntaxKind::TokenLineBreak
+            | SyntaxKind::TokenComment
+            | SyntaxKind::ItemBlockComment => {}
+            SyntaxKind::TokenLBracket => bracket_depth += 1,
+            SyntaxKind::TokenRBracket if bracket_depth > 0 => bracket_depth -= 1,
+            _ if bracket_depth > 0 => {}
+            SyntaxKind::ItemCurly => {
+                if let SyntaxElement::Node(n) = s {
+                    let text = n.text().to_string();
+                    return Some(text.trim_matches(|c| c == '{' || c == '}').to_string());
+                }
+                return None;
+            }
+            _ => return None,
+        }
+        sib = s.next_sibling_or_token();
+    }
+    None
+}
+
+/// Start collecting a siunitx command's braced arguments. If mitex happened to
+/// attach them as child clauses we can format immediately; otherwise we arm the
+/// pending-sibling collector, which drains the following curly groups.
+fn begin_siunitx(
+    conv: &mut LatexConverter,
+    cmd: &CmdItem,
+    kind: SiunitxKind,
+    needed: usize,
+    output: &mut String,
+) {
+    let mut args = Vec::with_capacity(needed);
+    for index in 0..needed {
+        match conv.get_required_arg(cmd, index) {
+            Some(arg) => args.push(arg),
+            None => break,
+        }
+    }
+    if args.len() == needed {
+        let pending = PendingSiunitx {
+            kind,
+            needed,
+            args,
+            optional_bracket_depth: 0,
+        };
+        emit_siunitx(conv, &pending, output);
+    } else {
+        // Arguments are following siblings; collect them as we walk forward.
+        conv.siunitx_arg_collector = Some(PendingSiunitx {
+            kind,
+            needed,
+            args,
+            optional_bracket_depth: 0,
+        });
+    }
+}
+
+/// Format a fully-collected siunitx command. Units are mapped through
+/// [`LatexConverter::process_si_unit`] and wrapped in quotes so Typst renders
+/// them upright (a unit is not a math variable).
+pub(super) fn emit_siunitx(conv: &LatexConverter, pending: &PendingSiunitx, output: &mut String) {
+    let arg = |i: usize| pending.args.get(i).map(String::as_str).unwrap_or("").trim();
+    let (math_open, math_close) = if matches!(conv.state.mode, ConversionMode::Math) {
+        ("", "")
+    } else {
+        ("$", "$")
+    };
+    match pending.kind {
+        SiunitxKind::NumberUnit => {
+            let unit = conv.process_si_unit(arg(1));
+            let _ = write!(
+                output,
+                "{}{} space \"{}\"{}",
+                math_open,
+                arg(0),
+                unit,
+                math_close
+            );
+        }
+        SiunitxKind::UnitOnly => {
+            let unit = conv.process_si_unit(arg(0));
+            let _ = write!(output, "{}\"{}\"{}", math_open, unit, math_close);
+        }
+        SiunitxKind::NumberOnly => {
+            let _ = write!(output, "{}{}{}", math_open, arg(0), math_close);
+        }
+        SiunitxKind::Angle => {
+            let _ = write!(output, "{}{}°{}", math_open, arg(0), math_close);
+        }
+    }
+}
+
+/// `\section`'s Typst heading depth for a document class. report/book/memoir put
+/// `\chapter` at depth 1, so their `\section` is depth 2 (`==`); everything else
+/// (article, or an undetected class) treats `\section` as depth 1 (`=`).
+pub(super) fn section_base_level(class: Option<&str>) -> u8 {
+    u8::from(matches!(
+        class,
+        Some("report") | Some("book") | Some("memoir")
+    ))
+}
+
+/// Render the title of a starred sectioning command.
+///
+/// The starred forms suppress numbering, which Typst's `=` shorthand cannot
+/// express, so a heading goes through the explicit `#heading` element. The
+/// other forms keep the layout their unstarred counterpart uses, minus the
+/// number.
+pub(super) fn emit_starred_section(pending: PendingSection, title: &str, output: &mut String) {
+    match pending {
+        PendingSection::Heading { level } => {
+            let _ = write!(
+                output,
+                "\n#heading(level: {}, numbering: none)[{}]\n",
+                level + 1,
+                title
+            );
+        }
+        PendingSection::Part => {
+            output.push_str("\n#v(2em)\n");
+            output.push_str("#align(center)[\n");
+            let _ = writeln!(output, "  #text(2em, weight: \"bold\")[{}]", title);
+            output.push_str("]\n");
+            output.push_str("#v(2em)\n\n");
+        }
+        PendingSection::Subparagraph => {
+            let _ = write!(output, "\n_{}_\n", title);
+        }
+    }
+}
+
+/// Whether this sectioning command carries the `*` modifier.
+///
+/// `\section*{T}` binds the `*` as the command's single term argument, because
+/// mitex's argument grammar knows only term/bracket/paren kinds and so has no
+/// way to describe a star. Recognising it here and taking the real title from
+/// the group that follows is what keeps the heading from being named `*` with
+/// its title demoted to body text (issue #45).
+fn takes_section_star(conv: &LatexConverter, cmd: &CmdItem) -> bool {
+    conv.get_required_arg(cmd, 0).as_deref().map(str::trim) == Some("*")
+}
+
 /// Convert section heading with proper level
 fn convert_section(conv: &mut LatexConverter, cmd: &CmdItem, level: u8, output: &mut String) {
-    if let Some(title) = conv.get_required_arg(cmd, 0) {
+    if takes_section_star(conv, cmd) {
+        conv.pending_section = Some(PendingSection::Heading { level });
+        return;
+    }
+
+    if let Some(title) = conv.convert_required_arg(cmd, 0) {
         output.push('\n');
         for _ in 0..=level {
             output.push('=');
         }
         output.push(' ');
-        output.push_str(&title);
+        output.push_str(title.trim());
         output.push('\n');
     }
 }

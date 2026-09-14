@@ -137,7 +137,7 @@ SYMBOL_MAP = {
     "hom": "hom", "ker": "ker", "Pr": "Pr", "deg": "deg",
     
     # Spacing
-    "displaystyle": "display", "textstyle": "inline",
+    "displaystyle": "display", "textstyle": "inline", "cal": "cal",
     "hspace": "#h", ",": "thin", ":": "med", ";": "thick",
     ">": "med", " ": "med", "~": "space.nobreak",
     
@@ -167,10 +167,49 @@ SYMBOL_MAP = {
 # Format: "command_name": num_required_args
 # ============================================================================
 
+# Argument signature of each environment's `\begin{env}` header, in the same
+# glob language the commands use: `b` is an optional `[..]` slot, `t` a required
+# `{..}` one, and `{,X}` makes a slot optional.
+#
+# Without a signature the header's arguments are not bound and leak into the
+# body — and a "skip one leading bracket" heuristic cannot express a shape like
+# minipage's three optional slots, or multicols' required-before-optional order.
+# An environment absent from this table consumes nothing, which is correct:
+# after `\begin{center}` a `[x]` really is the text LaTeX prints.
+ENVIRONMENT_SIGNATURES = {
+    # Floats: `[htbp]` placement.
+    "figure": "{,b}", "figure*": "{,b}", "table": "{,b}", "table*": "{,b}",
+    "wrapfigure": "{,b}",
+    # enumitem and friends: `[label=.., itemsep=..]`.
+    "enumerate": "{,b}", "itemize": "{,b}", "description": "{,b}", "list": "{,b}",
+    # Layout / listing-style boxes.
+    "adjustbox": "{,b}", "tcolorbox": "{,b}",
+    "algorithm": "{,b}", "algorithmic": "{,b}",
+    "lstlisting": "{,b}",
+    # `\begin{minipage}[pos][height][inner-pos]{width}`
+    "minipage": "{,b}{,b}{,b}t",
+    # `\begin{multicols}{2}[Header]` — required slot BEFORE the optional one.
+    "multicols": "t{,b}", "multicols*": "t{,b}",
+    # `\begin{tabular}[pos]{cols}`; the starred/x forms take a width first.
+    "tabular": "{,b}t", "longtable": "{,b}t", "longtabu": "{,b}t", "array": "{,b}t",
+    "tabular*": "t{,b}t", "tabularx": "t{,b}t",
+}
+
+# Commands shaped `\cmd[optional]{required}`. A fixed arity cannot express the
+# optional argument: the parser then binds nothing at all and BOTH arguments
+# degrade to body text. They are emitted with a glob pattern instead.
+SECTIONING_COMMANDS = [
+    "part", "chapter", "section", "subsection", "subsubsection",
+    "paragraph", "subparagraph",
+    # `\caption[short]{long}` — the short form is a list-of-figures entry.
+    "caption",
+]
+
 COMMANDS_WITH_ARGS = {
     # Document structure (1 arg)
-    "part": 1, "chapter": 1, "section": 1, "subsection": 1, "subsubsection": 1,
-    "paragraph": 1, "title": 1, "author": 1, "date": 1, "caption": 1, "label": 1,
+    # NOTE: the sectioning commands are NOT here — they take an optional
+    # `[short title]` that a fixed arity cannot express. See SECTIONING_COMMANDS.
+    "title": 1, "author": 1, "date": 1, "label": 1,
     
     # Macro definitions (2 args)
     "newcommand": 2, "renewcommand": 2, "providecommand": 2, "DeclareMathOperator": 2,
@@ -342,6 +381,15 @@ def generate_rust_code():
     lines.append('            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}") } },')
     lines.append('            alias: None,')
     lines.append('        }));')
+
+    # These take an optional `[..]` before the required argument, so a fixed
+    # arity would leave the `[..]` unconsumed: the parser then binds no argument
+    # at all and the whole construct degrades to body text.
+    for cmd in SECTIONING_COMMANDS:
+        lines.append(f'        m.insert("{cmd}".to_string(), CommandSpecItem::Cmd(CmdShape {{')
+        lines.append('            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },')
+        lines.append('            alias: None,')
+        lines.append('        }));')
     
     # Add aligned environment
     lines.append('        m.insert("aligned".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {')
@@ -349,6 +397,15 @@ def generate_rust_code():
     lines.append('            ctx_feature: mitex_spec::ContextFeature::None,')
     lines.append('            alias: None,')
     lines.append('        }));')
+
+    # Environment header signatures (see ENVIRONMENT_SIGNATURES).
+    for env, pattern in ENVIRONMENT_SIGNATURES.items():
+        env_esc = escape_rust_string(env)
+        lines.append(f'        m.insert("{env_esc}".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {{')
+        lines.append(f'            args: ArgPattern::Glob {{ pattern: GlobStr::from("{pattern}") }},')
+        lines.append('            ctx_feature: mitex_spec::ContextFeature::None,')
+        lines.append('            alias: None,')
+        lines.append('        }));')
     
     lines.append('')
     lines.append('        // Commands with required arguments')
