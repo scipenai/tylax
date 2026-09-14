@@ -587,14 +587,17 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
 
         // Labels and references
         "label" => {
+            let label = conv.get_required_arg(&cmd, 0).unwrap_or_default();
+            let clean_label = sanitize_label(&label);
+            // Inside math, a label attaches to its line via `#<..>`; keeping it
+            // inline preserves per-row labels in align (issue #43).
             if conv.state.is_inside(&EnvironmentContext::Equation)
                 || conv.state.is_inside(&EnvironmentContext::Align)
             {
-                return;
+                let _ = write!(output, "#<{}> ", clean_label);
+            } else {
+                output.push_str(&label_to_typst(&clean_label));
             }
-            let label = conv.get_required_arg(&cmd, 0).unwrap_or_default();
-            let clean_label = sanitize_label(&label);
-            output.push_str(&label_to_typst(&clean_label));
         }
         "ref" | "autoref" | "cref" | "Cref" | "eqref" | "pageref" | "nameref" => {
             let ref_type = reference_type_from_latex_command(base_name).unwrap_or(ReferenceType::Basic);
@@ -719,10 +722,10 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                     // the body.
                     if let Some(label) = conv.convert_optional_arg(&cmd, 0) {
                         let _ = write!(output, "+ {} ", label);
-                        conv.state.suppress_next_space = true;
                     } else {
                         output.push_str("+ ");
                     }
+                    conv.state.suppress_next_space = true;
                 }
                 EnvironmentContext::Description => {
                     // Typst term list: `/ term: desc`. A bare `\item` needs an
@@ -737,10 +740,10 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 _ => {
                     if let Some(label) = conv.convert_optional_arg(&cmd, 0) {
                         let _ = write!(output, "- {} ", label);
-                        conv.state.suppress_next_space = true;
                     } else {
                         output.push_str("- ");
                     }
+                    conv.state.suppress_next_space = true;
                 }
             }
         }
@@ -2173,8 +2176,10 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "hline" | "toprule" | "midrule" | "bottomrule" => {
             output.push_str("|||HLINE|||");
         }
+        // A partial rule needs its own marker so the parser knows what follows
+        // is a column RANGE, not a cell that merely reads `3-4` (issue #43).
         "cline" | "cmidrule" => {
-            output.push_str("|||HLINE|||");
+            output.push_str("|||CHLINE|||");
         }
         "multicolumn" => {
             let ncols = conv.get_required_arg(&cmd, 0).unwrap_or("1".to_string());

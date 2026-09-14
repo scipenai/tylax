@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **L2T sectioning**: starred forms (`\section*` through `\subparagraph*`, `\chapter*`, `\part*`) emit unnumbered headings. mitex's argument patterns have no star kind, so the `*` was being bound as the title.
 - **L2T math arguments**: accent, root and fraction arguments are converted as math whatever the surrounding mode, so the document path no longer emits `arrow(PC)` or `AB/CD` -- single Typst variables that fail to compile -- instead of `arrow(P C)` and `(A B)/(C D)`.
 - **L2T sized delimiters**: matched `\big|`/`\big\|` pairs become `abs(..)`/`norm(..)`, and a delimiterless matrix between them stays a determinant rather than collapsing to a scalar. Plain `|`/`\vert` are untouched. Plain TeX's `\cal` is handled as a declaration scoped to its group, not as an argument-taking `\mathcal{..}`.
+- **L2T figures**: `figure`/`subfigure` bodies keep tikzpictures, tabulars and prose. Only `\includegraphics` was recognised, so everything else was silently dropped (#39, #44).
+- **L2T tables**: `\cmidrule`/`\cline` column ranges are preserved, a source declaring its own rules switches off Typst's default full grid, and `|` separators from the column spec become `table.vline`. `||` is reported as a downgrade rather than silently drawn as one line (#43).
+- **L2T lists**: a nested list stays nested. The blank line emitted before every list ended the parent list too, flattening the structure (#43).
+- **L2T equation labels**: a label nested in `aligned`/`split` names the enclosing equation and is emitted once, outside the math body (#43).
 
 ## [0.3.7] - 2026-07-18
 

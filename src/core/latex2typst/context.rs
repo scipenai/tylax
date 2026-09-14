@@ -383,12 +383,23 @@ impl ConversionState {
         Self::default()
     }
 
+    /// Whether a list context is already open (used to indent only nested lists).
+    fn has_list_ancestor(&self) -> bool {
+        self.env_stack.iter().any(|e| {
+            matches!(
+                e,
+                EnvironmentContext::Itemize | EnvironmentContext::Enumerate
+            )
+        })
+    }
+
     /// Push a new environment onto the stack
     pub fn push_env(&mut self, env: EnvironmentContext) {
         if matches!(
             env,
             EnvironmentContext::Itemize | EnvironmentContext::Enumerate
-        ) {
+        ) && self.has_list_ancestor()
+        {
             self.indent += 2;
         }
         self.env_stack.push(env);
@@ -401,7 +412,8 @@ impl ConversionState {
             if matches!(
                 e,
                 EnvironmentContext::Itemize | EnvironmentContext::Enumerate
-            ) {
+            ) && self.has_list_ancestor()
+            {
                 self.indent = self.indent.saturating_sub(2);
             }
         }

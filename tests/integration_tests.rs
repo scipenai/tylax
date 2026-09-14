@@ -2004,6 +2004,21 @@ mod l2t_document {
         );
     }
 
+    #[test]
+    fn nested_lists_are_indented_not_flattened() {
+        // Typst nests lists by indentation, so a sublist must be written two
+        // spaces further in; otherwise both levels render as siblings.
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\begin{itemize}\n  \\item Top\n  \\begin{itemize}\n\
+             \\item Nested\n  \\end{itemize}\n\\end{itemize}\n\\end{document}\n",
+        );
+        assert!(
+            out.contains("- Top") && out.contains("  - Nested"),
+            "the sublist must be indented under its parent, got:\n{out}"
+        );
+    }
+
     /// Issue #41: TeX discards a `%` comment before scanning the optional
     /// row-spacing argument of `\\`, so `\\% note<newline>[6pt]` is the very
     /// same row break as `\\[6pt]`. These run through the FULL-DOCUMENT path —
@@ -2071,6 +2086,331 @@ mod l2t_document {
         assert!(
             out.contains("[x"),
             "a non-dimension bracket must be kept, got:\n{out}"
+        );
+    }
+
+    /// Issue #39: a `figure` body used to be scanned for `\includegraphics`
+    /// only, so every other kind of content was replaced by an empty `[]`
+    /// placeholder and silently lost from the document.
+    #[test]
+    fn booktabs_table_disables_the_default_grid_and_keeps_partial_rules() {
+        // Issue #43: LaTeX draws only the rules the source asks for, while
+        // Typst's `#table` defaults to a full grid; and `\cmidrule(lr){3-4}`
+        // spans columns 3-4, not the whole width.
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\usepackage{booktabs}\n\\begin{document}\n\
+             \\begin{tabular}{lccc}\n\\toprule\nName & A & B & C \\\\\n\\midrule\n\
+             \\cmidrule(lr){3-4}\nx & 1 & 2 & 3 \\\\\n\\bottomrule\n\
+             \\end{tabular}\n\\end{document}\n",
+        );
+        assert!(
+            out.contains("stroke: none"),
+            "an explicitly ruled table must switch off the default grid, got:\n{out}"
+        );
+        assert!(
+            out.contains("table.hline(start: 2, end: 4)"),
+            "`\\cmidrule(lr){{3-4}}` must span only columns 3-4, got:\n{out}"
+        );
+        // The `\midrule` next to it is a separate, full-width rule.
+        assert!(
+            out.contains("table.hline(),"),
+            "the full-width rules must survive too, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn column_spec_vertical_rules_survive_the_grid_being_switched_off() {
+        // Issue #43: `|` separators are real borders. Once a ruled table turns
+        // Typst's default grid off, nothing else would draw them, so they have
+        // to be re-emitted from the column specification.
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\begin{tabular}{|c|c|}\n\\hline\na & b \\\\\n\\hline\n\
+             \\end{tabular}\n\\end{document}\n",
+        );
+        assert!(
+            out.contains("stroke: none"),
+            "an explicitly ruled table must switch off the default grid, got:\n{out}"
+        );
+        for boundary in [
+            "table.vline(x: 0)",
+            "table.vline(x: 1)",
+            "table.vline(x: 2)",
+        ] {
+            assert!(
+                out.contains(boundary),
+                "missing {boundary} — the left/middle/right rules of `{{|c|c|}}` \
+                 must all survive, got:\n{out}"
+            );
+        }
+        assert!(
+            out.contains("table.hline()"),
+            "the horizontal rules must still be there, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn double_vertical_rule_is_downgraded_with_a_diagnostic() {
+        // `||` is a legal double rule. Typst's `table.vline` has no double-line
+        // stroke, so it is drawn as a single rule — but that downgrade must be
+        // reported, not silent.
+        let source = "\\documentclass{article}\n\\begin{document}\n\
+                      \\begin{tabular}{||c||c||}\n\\hline\na & b \\\\\n\\hline\n\
+                      \\end{tabular}\n\\end{document}\n";
+        let reported = tylax::latex_to_typst_with_diagnostics(source);
+        assert!(
+            reported
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("Double vertical rule")),
+            "the downgrade must be reported, got: {:?}",
+            reported.warnings
+        );
+
+        let out = latex_document_to_typst(source);
+        assert!(
+            out.contains("table.vline(x: 0)") && out.contains("table.vline(x: 2)"),
+            "the boundaries must still be drawn, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn single_vertical_rules_report_nothing() {
+        // The converse: a plain `|` is drawn exactly and must not warn.
+        let reported = tylax::latex_to_typst_with_diagnostics(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\begin{tabular}{|c|c|}\n\\hline\na & b \\\\\n\\end{tabular}\n\\end{document}\n",
+        );
+        assert!(
+            !reported
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("Double vertical rule")),
+            "a single rule must not be reported as a downgrade, got: {:?}",
+            reported.warnings
+        );
+    }
+
+    #[test]
+    fn column_spec_without_vertical_rules_adds_none() {
+        // The converse: a spec with no `|` must not gain borders.
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\begin{tabular}{cc}\n\\hline\na & b \\\\\n\\end{tabular}\n\\end{document}\n",
+        );
+        assert!(
+            !out.contains("table.vline"),
+            "no vertical rule may be invented, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn vertical_rules_alone_still_switch_off_the_default_grid() {
+        // `{|c|c|}` with no `\hline` draws only vertical rules in LaTeX, so the
+        // default grid must go even though no horizontal rule was declared.
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\begin{tabular}{|c|c|}\na & b \\\\\n\\end{tabular}\n\\end{document}\n",
+        );
+        assert!(
+            out.contains("stroke: none") && out.contains("table.vline(x: 0)"),
+            "vertical rules alone must be honoured, got:\n{out}"
+        );
+        assert!(
+            !out.contains("table.hline"),
+            "no horizontal rule was declared, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn cline_range_is_preserved() {
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\begin{tabular}{lll}\na & b & c \\\\\n\\cline{2-3}\nd & e & f \\\\\n\
+             \\end{tabular}\n\\end{document}\n",
+        );
+        assert!(
+            out.contains("table.hline(start: 1, end: 3)"),
+            "`\\cline{{2-3}}` must span only columns 2-3, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn figure_keeps_a_tikz_picture() {
+        let latex = "\\documentclass{article}\n\\begin{document}\n\
+                     \\begin{figure}\n\\centering\n\
+                     \\begin{tikzpicture}\n\\draw (0,0) -- (1,1);\n\\end{tikzpicture}\n\
+                     \\caption{A schematic}\n\\end{figure}\n\\end{document}\n";
+        let out = latex_document_to_typst(latex);
+        assert!(
+            out.contains("canvas") && out.contains("line((0, 0), (1, 1))"),
+            "the picture must survive inside a figure, got:\n{out}"
+        );
+        assert!(
+            out.contains("caption: [A schematic]"),
+            "the caption must still be lifted out, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn figure_keeps_non_image_content() {
+        let latex = "\\documentclass{article}\n\\begin{document}\n\
+                     \\begin{figure}\nSome explanatory prose.\n\
+                     \\begin{tabular}{ll}\na & b \\\\\n\\end{tabular}\n\
+                     \\caption{A tabular inside a figure}\n\\end{figure}\n\\end{document}\n";
+        let out = latex_document_to_typst(latex);
+        assert!(
+            out.contains("Some explanatory prose."),
+            "prose must not be dropped, got:\n{out}"
+        );
+        assert!(
+            out.contains("#table("),
+            "a tabular must not be dropped, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn figure_keeps_images_nested_in_an_unknown_command() {
+        // Issue #44: `\subfloat` (subfig) is not a command the converter knows,
+        // so its images survive only because the figure body is now walked
+        // recursively rather than scanned for a top-level `\includegraphics`.
+        // That makes this case a guard on the GENERAL rule: if unknown-command
+        // handling is ever tightened, images must not silently vanish again.
+        //
+        // The subfigure layout itself is deliberately not reproduced — the
+        // contract here is "nothing is lost and the result compiles", not
+        // faithful subfloat typesetting.
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\usepackage{graphicx}\n\\usepackage{subfig}\n\
+             \\begin{document}\n\\begin{figure}\n\\centering\n\
+             \\subfloat[One]{\\includegraphics[width=0.4\\textwidth]{foto.png}}\n\
+             \\subfloat[Two]{\\includegraphics[width=0.4\\textwidth]{otra.png}}\n\
+             \\caption{With subfloat}\n\\end{figure}\n\\end{document}\n",
+        );
+
+        assert_eq!(
+            out.matches("#image(").count(),
+            2,
+            "both subfloat images must survive, got:\n{out}"
+        );
+        assert!(
+            out.contains("foto.png") && out.contains("otra.png"),
+            "both image paths must survive, got:\n{out}"
+        );
+        assert!(
+            !out.contains("[],"),
+            "the figure body must not fall back to the empty placeholder, got:\n{out}"
+        );
+        assert!(
+            out.contains("caption: [With subfloat]"),
+            "the caption must still be lifted out, got:\n{out}"
+        );
+        // The sub-captions are kept as body text rather than dropped.
+        assert!(
+            out.contains("One") && out.contains("Two"),
+            "sub-captions must not be lost, got:\n{out}"
+        );
+
+        compile_subfloat_figure_with_real_typst();
+    }
+
+    /// Compile the issue #44 figure with the real `typst` binary, against real
+    /// image files, so the guarantee is "the images are there AND the document
+    /// builds" rather than a string match. Skipped when `typst` is absent.
+    fn compile_subfloat_figure_with_real_typst() {
+        use std::process::{Command, Stdio};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let available = Command::new("typst")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !available {
+            eprintln!("skipping subfloat compile check: `typst` not on PATH");
+            return;
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tylax-subfloat-{nonce}"));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+
+        // A real image from the repository, so `#image(..)` resolves for real.
+        let logo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/logo.svg");
+        for name in ["foto.svg", "otra.svg"] {
+            std::fs::copy(&logo, dir.join(name)).expect("test image should be copied");
+        }
+
+        let typst = latex_document_to_typst(
+            "\\documentclass{article}\n\\usepackage{graphicx}\n\\usepackage{subfig}\n\
+             \\begin{document}\n\\begin{figure}\n\\centering\n\
+             \\subfloat[One]{\\includegraphics[width=0.4\\textwidth]{foto.svg}}\n\
+             \\subfloat[Two]{\\includegraphics[width=0.4\\textwidth]{otra.svg}}\n\
+             \\caption{With subfloat}\n\\end{figure}\n\\end{document}\n",
+        );
+        let source = dir.join("doc.typ");
+        std::fs::write(&source, &typst).expect("typst source should be written");
+
+        let output = Command::new("typst")
+            .arg("compile")
+            .arg(&source)
+            .arg("--format")
+            .arg("pdf")
+            .arg("-")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run typst compile");
+
+        let succeeded = output.status.success();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            succeeded,
+            "the converted subfloat figure must compile:\n{typst}\n--- typst said ---\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn figure_keeps_every_image_with_its_options() {
+        // Two images previously became two positional `#figure` arguments,
+        // which Typst rejects outright, and their sizes were discarded.
+        let latex = "\\documentclass{article}\n\\begin{document}\n\
+                     \\begin{figure}\n\
+                     \\includegraphics[width=3cm]{a.png}\n\
+                     \\includegraphics[width=4cm]{b.png}\n\
+                     \\caption{Two images}\n\\label{fig:two}\n\\end{figure}\n\\end{document}\n";
+        let out = latex_document_to_typst(latex);
+        assert!(
+            out.contains("a.png") && out.contains("b.png"),
+            "both images must be kept, got:\n{out}"
+        );
+        assert!(
+            out.contains("width: 3cm") && out.contains("width: 4cm"),
+            "image options must be preserved, got:\n{out}"
+        );
+        assert!(
+            out.contains("<fig-two>"),
+            "the label must still be lifted out, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn figure_without_content_still_emits_a_placeholder() {
+        // The conservative fallback is unchanged for a genuinely empty body.
+        let latex = "\\documentclass{article}\n\\begin{document}\n\
+                     \\begin{figure}\n\\caption{Only a caption}\n\\end{figure}\n\
+                     \\end{document}\n";
+        let out = latex_document_to_typst(latex);
+        assert!(
+            out.contains("[],"),
+            "an empty figure body should keep its placeholder, got:\n{out}"
         );
     }
 
@@ -2307,6 +2647,52 @@ The formula $E = mc^2$ is famous.
             "command label should convert (not be stripped to empty), got:\n{}",
             result
         );
+    }
+
+    #[test]
+    fn test_equation_family_labels_are_outside_math() {
+        // `gather` supports a label on each row while `multline` has one
+        // equation label. Neither may leave Typst's invalid inline `#<..>`
+        // marker inside `$...$`.
+        let gather = latex_to_typst(r"\begin{gather}a=1\label{eq:a}\\b=2\label{eq:b}\end{gather}");
+        assert!(gather.contains("$ a = 1 $ <eq-a>"), "got: {gather}");
+        assert!(gather.contains("$ b = 2 $ <eq-b>"), "got: {gather}");
+        assert!(!gather.contains("#<eq-"), "got: {gather}");
+
+        let multline = latex_to_typst(r"\begin{multline}a=1\label{eq:m}\end{multline}");
+        assert!(multline.contains("$ a = 1 $ <eq-m>"), "got: {multline}");
+        assert!(!multline.contains("#<eq-"), "got: {multline}");
+
+        let nested = latex_to_typst(
+            r"\begin{equation}\begin{aligned}a&=1\label{eq:nested}\end{aligned}\end{equation}",
+        );
+        assert!(
+            nested.contains("<eq-nested>") && !nested.contains("#<eq-nested>"),
+            "a nested label must attach to its enclosing equation, got: {nested}"
+        );
+    }
+
+    #[test]
+    fn test_single_label_align_preserves_its_row_layout() {
+        // A single label belongs to the whole align block, so Typst can retain
+        // its row structure instead of needlessly splitting it into unrelated
+        // equations. Only independently labelled rows require the fallback.
+        let aligned = latex_to_typst(r"\begin{align}a&=1\\b&=2\label{eq:last}\end{align}");
+        assert!(aligned.contains("<eq-last>"), "got: {aligned}");
+        assert!(
+            !aligned.contains("#<eq-last>"),
+            "the label must remain outside math, got: {aligned}"
+        );
+        assert_eq!(
+            aligned.matches('$').count(),
+            2,
+            "one labelled align block must remain one math block, got: {aligned}"
+        );
+        assert!(
+            aligned.contains("a & = 1") && aligned.contains("b & = 2"),
+            "both rows must remain in the preserved block, got: {aligned}"
+        );
+        assert_compiles_with_real_typst(&aligned);
     }
 
     #[test]
