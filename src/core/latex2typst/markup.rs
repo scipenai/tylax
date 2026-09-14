@@ -979,12 +979,16 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 }
             }
         }
-        // No general Typst math equivalent for `\textcircled`; keep the inner content.
+        // Typst spells the circled OPERATORS with a `.o` suffix, the same forms
+        // `\odot`/`\oplus`/... already map to, so `\textcircled{\cdot}` is
+        // `dot.o` rather than a bare `dot`. There is no general circled-anything
+        // construction, so any other content keeps the fallback: the inner
+        // content alone, which at least stays faithful to what it wraps.
         "textcircled" => {
             if let Some(content) = conv.convert_required_arg(&cmd, 0) {
                 let trimmed = content.trim();
                 if !trimmed.is_empty() {
-                    output.push_str(trimmed);
+                    output.push_str(circled_operator(trimmed).unwrap_or(trimmed));
                     output.push(' ');
                 }
             }
@@ -3215,6 +3219,22 @@ fn apply_cedilla(content: &str) -> String {
         'C' => "Ç".to_string(),
         _ => content.to_string(),
     }
+}
+
+/// The `.o` Typst symbol for an operator drawn inside a circle, given the
+/// operator's ALREADY CONVERTED form. Matched against both spellings a source
+/// may use, `\textcircled{\cdot}` and `\textcircled{.}`, so only the converted
+/// text has to be inspected. Returns `None` for anything Typst has no circled
+/// form of, leaving the caller's fallback in charge.
+fn circled_operator(converted: &str) -> Option<&'static str> {
+    Some(match converted {
+        "dot" | "dot.op" | "." | "·" => "dot.o",
+        "plus" | "+" => "plus.o",
+        "minus" | "-" | "−" => "minus.o",
+        "times" | "*" | "×" => "times.o",
+        "slash" | "/" => "slash.o",
+        _ => return None,
+    })
 }
 
 /// Inner content of the next `ItemCurly` sibling, skipping whitespace.

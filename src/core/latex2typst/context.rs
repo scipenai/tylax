@@ -777,6 +777,60 @@ fn resolve_sized_delimiter_pair(
     output
 }
 
+/// Number of `_`/`^` attachments in `output` that have nothing to attach to.
+///
+/// Counts both shapes the converter can produce: one the math repair already
+/// gave an empty base (`""^(..)`, which compiles), and one still base-less
+/// (`^(..)` opening an expression, which does not). Both mean the same thing
+/// about the SOURCE -- a script with no operand, which LaTeX rejects too -- so
+/// they are reported together.
+fn baseless_attachment_count(output: &str) -> usize {
+    let bytes = output.as_bytes();
+    let mut count = 0;
+    for (i, window) in bytes.windows(2).enumerate() {
+        if !matches!(window, [b'_', b'('] | [b'^', b'(']) {
+            continue;
+        }
+        let before = output[..i].trim_end();
+        // An EMPTY `""` is the repair's own base; a non-empty `"foo"` is real
+        // `\text{..}` content, so only the exact empty pair counts.
+        if before.is_empty() || before.ends_with('(') || before.ends_with("\"\"") {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Split a math word into Typst atoms, separated by spaces.
+///
+/// Adjacent letters in TeX math are distinct symbols multiplied together, so
+/// `AB` has to become `A B` or Typst reads one variable named `AB`. A NUMBER is
+/// not a product of its digits, though: splitting it gives `1 2 0`, which
+/// renders as three separate numerals. Digits therefore stay in one run, and a
+/// `.` between digits stays with them so `0.008` survives as one literal.
+fn push_math_atoms(text: &str, output: &mut String) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_ascii_digit() {
+            let start = i;
+            // A `.` only continues the run when a digit follows it, so a
+            // sentence-ending `1.` keeps the period as its own atom.
+            while i < chars.len()
+                && (chars[i].is_ascii_digit()
+                    || (chars[i] == '.' && chars.get(i + 1).is_some_and(char::is_ascii_digit)))
+            {
+                i += 1;
+            }
+            output.extend(&chars[start..i]);
+        } else {
+            output.push(chars[i]);
+            i += 1;
+        }
+        output.push(' ');
+    }
+}
+
 /// Whether `input` has a blank line (spaces or CRLF allowed between the breaks).
 fn contains_paragraph_break(input: &str) -> bool {
     let mut after_line_break = false;
@@ -1583,6 +1637,7 @@ impl LatexConverter {
         // Report the backend, then resolve the markers; both before `build_document`.
         self.finalize_bibliography_diagnostics();
         let output = self.resolve_citations(&output);
+        self.warn_baseless_attachments(&output);
 
         // Build final document with preamble
         let mut result = self.build_document(output);
@@ -1622,7 +1677,30 @@ impl LatexConverter {
         let output = self.resolve_citations(&output);
 
         // Post-process
-        self.postprocess_math(output)
+        let output = self.postprocess_math(output);
+        self.warn_baseless_attachments(&output);
+        output
+    }
+
+    /// Report each `_`/`^` the math repair had to give an empty base.
+    ///
+    /// A superscript or subscript with nothing to attach to is already invalid
+    /// LaTeX, so there is no correct reading to recover: guessing a base, or
+    /// demoting the marker to text, would silently invent content. The repair
+    /// only makes the output compile; this says the source needs fixing.
+    fn warn_baseless_attachments(&mut self, output: &str) {
+        let count = baseless_attachment_count(output);
+        if count == 0 {
+            return;
+        }
+        let message = format!(
+            "{count} subscript/superscript without a base; \
+             LaTeX requires an operand before `_` or `^`. \
+             Check the source: the converter cannot tell what it was meant to attach to."
+        );
+        self.state.warnings.push(message.clone());
+        self.state
+            .add_warning(ConversionWarning::new(WarningKind::ParseError, message));
     }
 
     /// Resolve the deferred `TylaxCite{N}` markers by bibliography backend:
@@ -2062,10 +2140,7 @@ impl LatexConverter {
                 if let SyntaxElement::Token(t) = elem {
                     let text = t.text();
                     if matches!(self.state.mode, ConversionMode::Math) {
-                        for c in text.chars() {
-                            output.push(c);
-                            output.push(' ');
-                        }
+                        push_math_atoms(text, output);
                     } else {
                         output.push_str(text);
                     }

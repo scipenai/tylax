@@ -267,9 +267,12 @@ mod tests {
         assert_eq!(latex_to_typst(r"\frac {1-A}A"), "frac(1 - A, A)");
         assert_eq!(latex_to_typst(r"\frac {A+2}{1-A}"), "frac(A + 2, 1 - A)");
         assert_eq!(latex_to_typst(r"\sqrt 2"), "sqrt(2)");
+        // Unbraced, `\sqrt` takes ONE token, so `2` falls outside the root.
         assert_eq!(latex_to_typst(r"\sqrt 12"), "sqrt(1)2");
-        assert_eq!(latex_to_typst(r"\sqrt {12}"), "sqrt(1 2)");
-        assert_eq!(latex_to_typst(r"\sqrt{12}"), "sqrt(1 2)");
+        // Braced, the argument is the number twelve -- not the digits 1 and 2
+        // multiplied, which is what splitting the run used to produce.
+        assert_eq!(latex_to_typst(r"\sqrt {12}"), "sqrt(12)");
+        assert_eq!(latex_to_typst(r"\sqrt{12}"), "sqrt(12)");
     }
 
     #[test]

@@ -5,7 +5,8 @@ use std::process::{Command, Stdio};
 
 use tylax::{
     convert_auto, convert_auto_document, detect_format, latex_document_to_typst,
-    latex_document_to_typst_with_options, latex_to_typst, typst_file_to_latex_with_diagnostics,
+    latex_document_to_typst_with_options, latex_math_to_typst_with_diagnostics, latex_to_typst,
+    latex_to_typst_with_diagnostics, typst_file_to_latex_with_diagnostics,
     typst_file_to_latex_with_options, typst_to_latex, typst_to_latex_with_diagnostics,
     typst_to_latex_with_options, L2TOptions, PreambleMode, T2LOptions,
 };
@@ -2077,6 +2078,130 @@ mod l2t_math {
             !differential.contains(r#"op("d")"#) && !differential.contains(r#"op("dif")"#),
             "mathop over upright d should not be promoted to op(...), got: {}",
             differential
+        );
+    }
+
+    /// A number is not a product of its digits.
+    ///
+    /// Adjacent letters in TeX math ARE separate symbols multiplied together,
+    /// so `AB` has to split into `A B`; applying the same rule to digits turned
+    /// `120` into `1 2 0`, which renders as three numerals side by side. Digits
+    /// stay in one run, and a `.` between digits stays with them.
+    #[test]
+    fn numbers_are_not_split_into_digits() {
+        for (latex, expected) in [
+            ("120", "120"),
+            ("0.008", "0.008"),
+            ("16", "16"),
+            // A letter run still splits, and a digit run beside it stays whole.
+            ("2x", "2 x"),
+            ("x2", "x 2"),
+            ("AB", "A B"),
+            // A `.` only joins digits, so a trailing one is its own atom.
+            ("3.", "3 ."),
+        ] {
+            assert_eq!(
+                normalize_output(&latex_to_typst(latex)).trim(),
+                expected,
+                "`{latex}` in math mode"
+            );
+        }
+
+        // The same holds inside a script and inside a fraction, which is where
+        // a split number is hardest to spot.
+        assert!(
+            latex_to_typst("x_{16}").contains("x_(16)"),
+            "got: {}",
+            latex_to_typst("x_{16}")
+        );
+        let frac = latex_to_typst(r"\frac{120}{16}");
+        assert!(
+            frac.contains("120") && frac.contains("16") && !frac.contains("1 2 0"),
+            "got: {frac}"
+        );
+    }
+
+    /// Typst spells a circled operator with a `.o` suffix, the same form
+    /// `\odot`/`\oplus` already map to. `\textcircled` needs an argument
+    /// pattern in the spec for the converter to see what it wraps at all --
+    /// without one mitex leaves the group as a following sibling.
+    #[test]
+    fn textcircled_maps_known_operators_and_falls_back_otherwise() {
+        for (latex, expected) in [
+            (r"\textcircled{\cdot}", "dot.o"),
+            (r"\textcircled{+}", "plus.o"),
+            (r"\textcircled{-}", "minus.o"),
+            (r"\textcircled{\times}", "times.o"),
+            (r"\textcircled{/}", "slash.o"),
+            // Typst has no general circled-anything, so the content is kept.
+            (r"\textcircled{1}", "1"),
+            (r"\textcircled{A}", "A"),
+        ] {
+            assert_eq!(
+                normalize_output(&latex_to_typst(latex)).trim(),
+                expected,
+                "`{latex}`"
+            );
+        }
+
+        // The argument must be consumed, not left to be emitted twice.
+        assert_eq!(
+            normalize_output(&latex_to_typst(r"a \textcircled{\cdot} b")).trim(),
+            "a dot.o b"
+        );
+    }
+
+    /// A `_`/`^` with nothing to attach to is invalid LaTeX, so there is no
+    /// correct reading to recover. The repair only makes the output compile;
+    /// a diagnostic says the source needs fixing, rather than guessing a base
+    /// or silently demoting the marker to text.
+    #[test]
+    fn baseless_attachment_is_repaired_and_reported() {
+        let result = latex_math_to_typst_with_diagnostics("^{2}");
+        assert!(
+            result.output.contains("\"\"^("),
+            "the empty base must be kept so the output compiles, got: {}",
+            result.output
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("without a base")),
+            "a base-less attachment must be reported, got: {:?}",
+            result.warnings
+        );
+
+        // The document pipeline does not repair, but must still report it.
+        let doc = latex_to_typst_with_diagnostics("^{2}");
+        assert!(
+            doc.warnings
+                .iter()
+                .any(|w| w.message.contains("without a base")),
+            "the document path must report it too, got: {:?}",
+            doc.warnings
+        );
+
+        // A well-formed script reports nothing, and `\text{..}^2` is not a
+        // base-less attachment merely because its base ends with a quote.
+        let clean = latex_math_to_typst_with_diagnostics("x^{2}");
+        assert!(
+            !clean
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("without a base")),
+            "a normal script must not warn, got: {:?}",
+            clean.warnings
+        );
+
+        let texty = latex_math_to_typst_with_diagnostics(r"	ext{ab}^{2}");
+        assert!(
+            !texty
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("without a base")),
+            "a quoted text base must not be read as empty, got: {:?}",
+            texty.warnings
         );
     }
 }

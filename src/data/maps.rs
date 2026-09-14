@@ -298,6 +298,13 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("cal".to_string()),
         }));
+        // Without a pattern here mitex leaves `{..}` as a following sibling
+        // instead of binding it, so the converter never sees the content it
+        // wraps and cannot map `\textcircled{\cdot}` to the circled operator.
+        m.insert("textcircled".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
+            alias: None,
+        }));
         m.insert("cdot".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("dot.op".to_string()),

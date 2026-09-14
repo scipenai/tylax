@@ -3,19 +3,35 @@
 //! Each case pins tylax's OWN current, verified-correct output — not parity with
 //! any other converter. tylax normalizes differently on purpose (`x^(2)` not
 //! `x^2`, `F_(1)` not `F_1`, `\left(..\right)` kept as `lr(..)`, a space after a
-//! unary minus, `frac(a, b)` for stacked fractions). These 19 cases were hand
+//! unary minus, `frac(a, b)` for stacked fractions). These 21 cases were hand
 //! reviewed: every expected string both compiles under the real Typst compiler
 //! and is a faithful rendering of the LaTeX input.
 //!
+//! `//` is also deliberate, not a gap: in LaTeX it IS two slashes, and
+//! `slash slash` is the faithful conversion. Reading it as `∥` is a geometry
+//! OCR convention, not a property of the source, so it is out of scope for the
+//! converter and its cases are simply not goldens here.
+//!
 //! Cases exercising still-unfixed normalizations were deliberately excluded so
-//! this file never cements a known defect: `//`→`slash slash` (should be `∥`),
-//! `\big|`→`bar.v` (should be `abs`), half-open `\left|..\right.`, digit runs
-//! split into `1 8`, and OCR-garbled inputs. Those remain tracked separately.
+//! this file never cements a known defect: half-open `\left|..\right.` and
+//! OCR-garbled inputs. Those remain tracked separately.
 
 use tylax::latex_to_typst;
 
 /// `(id, latex, expected typst)` — expected is tylax's verified output.
 const GOLDEN: &[(&str, &str, &str)] = &[
+    // Multi-digit numbers and decimals stay single literals: splitting the run
+    // rendered `120` as three separate numerals.
+    (
+        "num-degrees",
+        r"\angle APB = 120^{\circ}",
+        "angle A P B = 120^(circle.small)",
+    ),
+    (
+        "num-fraction",
+        r"\left|MN\right| = x_{1} + x_{2} + p = 3 + \frac{1}{3} + 2 = \frac{16}{3}",
+        "abs(M N) = x_(1) + x_(2) + p = 3 + 1/3 + 2 = 16/3",
+    ),
     // #35 vectors / directional arrows + nested subscripts.
     (
         "f278",
