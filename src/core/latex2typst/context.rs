@@ -576,6 +576,370 @@ fn strip_call<'a>(s: &'a str, name: &str) -> Option<&'a str> {
     Some(inner)
 }
 
+/// Protect complete TikZ environments before macro expansion and AST parsing.
+///
+/// MiTeX represents an environment semantically: its `SyntaxNode::text()`
+/// omits delimiters such as the braces in `\begin{tikzpicture}`, node option
+/// brackets, and coordinate parentheses. Passing that reconstructed text to
+/// the TikZ parser loses the first command in the picture. TikZ is its own
+/// language, so preserve each complete source block verbatim, convert it with
+/// the dedicated parser, and restore the rendered CeTZ after document output
+/// has been built.
+fn shield_tikz_blocks(
+    input: &str,
+    protected: &[(usize, usize)],
+) -> (String, Vec<(String, String)>) {
+    const BEGIN: &str = r"\begin{tikzpicture}";
+    const END: &str = r"\end{tikzpicture}";
+
+    let mut out = String::with_capacity(input.len());
+    let mut rendered_blocks = Vec::new();
+    let mut cursor = 0;
+
+    // `protected` holds lstlisting/minted bodies; verbatim and `\verb` are shielded upstream.
+    while let Some(begin) = find_uncommented_latex_command(input, BEGIN, cursor, protected) {
+        let content_start = begin + BEGIN.len();
+        let Some(end) = find_uncommented_latex_command(input, END, content_start, protected) else {
+            // Leave an unterminated environment to the normal diagnostics.
+            break;
+        };
+        let block_end = end + END.len();
+        // Private-use delimiters cannot collide with prose yet survive MiTeX as text.
+        let marker = format!("\u{E010}TylaxTikzBlock{}X\u{E011}", rendered_blocks.len());
+
+        out.push_str(&input[cursor..begin]);
+        out.push_str(&marker);
+        rendered_blocks.push((
+            marker,
+            format!(
+                "\n// TikZ converted to CeTZ\n{}\n",
+                crate::tikz::convert_tikz_to_cetz(&input[begin..block_end])
+            ),
+        ));
+        cursor = block_end;
+    }
+
+    out.push_str(&input[cursor..]);
+    (out, rendered_blocks)
+}
+
+/// Find `needle` after `from`, skipping comments and `protected` ranges.
+fn find_uncommented_latex_command(
+    input: &str,
+    needle: &str,
+    from: usize,
+    protected: &[(usize, usize)],
+) -> Option<usize> {
+    let mut search_from = from;
+    while let Some(relative) = input[search_from..].find(needle) {
+        let position = search_from + relative;
+        if !is_latex_comment_position(input, position)
+            && !is_position_protected(position, protected)
+        {
+            return Some(position);
+        }
+        search_from = position + needle.len();
+    }
+    None
+}
+
+/// Whether `position` falls within any `[start, end)` protected range.
+fn is_position_protected(position: usize, protected: &[(usize, usize)]) -> bool {
+    protected
+        .iter()
+        .any(|&(start, end)| position >= start && position < end)
+}
+
+/// Environments whose body is literal source, markered before MiTeX. `alltt` is excluded.
+const TRUE_VERBATIM_ENVS: [&str; 4] = ["verbatim", "verbatim*", "Verbatim", "Verbatim*"];
+
+/// fancyvrb environments taking a leading `[key=val]`; plain `verbatim` takes none.
+const FANCYVRB_ENVS: [&str; 2] = ["Verbatim", "Verbatim*"];
+
+/// Environments MiTeX converts semantically but whose body is literal, so the scan skips it.
+const SKIP_SCAN_ENVS: [&str; 2] = ["lstlisting", "minted"];
+
+/// Result of [`shield_verbatim_regions`].
+struct VerbatimShield {
+    /// Source with true verbatim and inline `\verb` replaced by opaque markers.
+    source: String,
+    /// Marker → Typst-raw restorations to splice back after the document builds.
+    restorations: Vec<(String, String)>,
+    /// Byte ranges of `lstlisting`/`minted` bodies: kept for MiTeX, skipped by the TikZ scan.
+    tikz_skip_ranges: Vec<(usize, usize)>,
+}
+
+/// Shield verbatim-like source regions before any LaTeX interpretation.
+///
+/// A single left-to-right lexical scan recognizes real command tokens, `%` line
+/// comments, and inline `\verb`, so a `\begin{verbatim}` shown inside a comment
+/// (or a `\verb` span) is never mistaken for a real environment, and a `%` that
+/// is itself inside verbatim stays literal.
+fn shield_verbatim_regions(input: &str) -> VerbatimShield {
+    let mut out = String::with_capacity(input.len());
+    let mut restorations: Vec<(String, String)> = Vec::new();
+    let mut skip_ranges = Vec::new();
+    let mut i = 0;
+    let n = input.len();
+
+    while i < n {
+        let rest = &input[i..];
+        let b = rest.as_bytes()[0];
+
+        // `%` line comment: copy through end of line; `\%` is consumed by the backslash branch.
+        if b == b'%' {
+            let line_end = rest.find('\n').map(|r| i + r + 1).unwrap_or(n);
+            out.push_str(&input[i..line_end]);
+            i = line_end;
+            continue;
+        }
+
+        if b == b'\\' {
+            if let Some((consumed, content)) = parse_inline_verb(rest) {
+                let marker = format!("\u{E010}TylaxVerbatim{}X\u{E011}", restorations.len());
+                out.push_str(&marker);
+                restorations.push((marker, typst_raw_inline(content)));
+                i += consumed;
+                continue;
+            }
+            if let Some((consumed, env, body)) = parse_env_block(rest) {
+                if TRUE_VERBATIM_ENVS.contains(&env) {
+                    // fancyvrb reads a `%` prefix and `[key=val]` header, neither a body.
+                    let body = if FANCYVRB_ENVS.contains(&env) {
+                        strip_fancyvrb_header(body)
+                    } else {
+                        body
+                    };
+                    let marker = format!("\u{E010}TylaxVerbatim{}X\u{E011}", restorations.len());
+                    out.push_str(&marker);
+                    restorations.push((marker, typst_raw_block(body)));
+                    i += consumed;
+                    continue;
+                }
+                if SKIP_SCAN_ENVS.contains(&env) {
+                    // Keep the environment for MiTeX, recording its span so the TikZ scan skips it.
+                    let start = out.len();
+                    out.push_str(&input[i..i + consumed]);
+                    skip_ranges.push((start, out.len()));
+                    i += consumed;
+                    continue;
+                }
+            }
+            // Copy the backslash with its next char, so a following `%` or `{` is not reread.
+            out.push('\\');
+            i += 1;
+            if i < n {
+                let l = input[i..].chars().next().unwrap().len_utf8();
+                out.push_str(&input[i..i + l]);
+                i += l;
+            }
+            continue;
+        }
+
+        let l = rest.chars().next().unwrap().len_utf8();
+        out.push_str(&input[i..i + l]);
+        i += l;
+    }
+
+    VerbatimShield {
+        source: out,
+        restorations,
+        tikz_skip_ranges: skip_ranges,
+    }
+}
+
+/// Parse a leading inline `\verb`/`\verb*`: bytes consumed and literal content.
+fn parse_inline_verb(rest: &str) -> Option<(usize, &str)> {
+    let after = rest.strip_prefix(r"\verb")?;
+    let mut chars = after.char_indices();
+    let (_, first) = chars.next()?;
+    // A real inline `\verb` is followed by `*` or a non-letter delimiter, never a letter.
+    if first.is_ascii_alphabetic() {
+        return None;
+    }
+    let (delim, delim_start) = if first == '*' {
+        let (off, d) = chars.next()?;
+        (d, off)
+    } else {
+        (first, 0usize)
+    };
+    let content_start = delim_start + delim.len_utf8();
+    let region = &after[content_start..];
+    let close = region.find(delim)?;
+    let content = &region[..close];
+    let consumed = r"\verb".len() + content_start + close + delim.len_utf8();
+    Some((consumed, content))
+}
+
+/// Byte length of the leading run of TeX-ignorable separators in `s`: ASCII
+/// whitespace and `%` line comments (through their terminating newline).
+/// Used ONLY between the `\begin`/`\end` control word and its `{env}`
+/// argument, which TeX reads the same either way, never for body content.
+fn ignorable_separator(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
+            b'%' => match s[i..].find('\n') {
+                Some(rel) => i += rel + 1,
+                None => return s.len(),
+            },
+            _ => break,
+        }
+    }
+    i
+}
+
+/// Match `\begin`/`\end` followed by TeX-ignorable separators and `{env}`,
+/// returning the byte length of the whole tag if `env` matches. TeX ignores
+/// spaces and comments after a control word, so `\begin {verbatim}` is valid.
+fn match_env_tag(s: &str, keyword: &str, env: &str) -> Option<usize> {
+    let after_kw = s.strip_prefix(keyword)?;
+    let sep = ignorable_separator(after_kw);
+    let braced = after_kw[sep..].strip_prefix('{')?;
+    let close = braced.find('}')?;
+    if &braced[..close] != env {
+        return None;
+    }
+    Some(keyword.len() + sep + 1 + close + 1)
+}
+
+/// Find the first `\end{ENV}` (separator-tolerant) in `hay`: start offset and tag length.
+fn find_env_end(hay: &str, env: &str) -> Option<(usize, usize)> {
+    let mut from = 0;
+    while let Some(rel) = hay[from..].find(r"\end") {
+        let pos = from + rel;
+        if let Some(len) = match_env_tag(&hay[pos..], r"\end", env) {
+            return Some((pos, len));
+        }
+        from = pos + r"\end".len();
+    }
+    None
+}
+
+/// Parse a leading `\begin{ENV}`..`\end{ENV}` block into the bytes consumed,
+/// the environment name and the raw body. The first matching `\end` ends it,
+/// since verbatim-like environments cannot nest.
+fn parse_env_block(rest: &str) -> Option<(usize, &str, &str)> {
+    let after_kw = rest.strip_prefix(r"\begin")?;
+    let sep = ignorable_separator(after_kw);
+    let braced = after_kw[sep..].strip_prefix('{')?;
+    let name_end = braced.find('}')?;
+    let env = &braced[..name_end];
+    if env.is_empty() {
+        return None;
+    }
+    let header_len = r"\begin".len() + sep + 1 + name_end + 1;
+    let body_region = &rest[header_len..];
+    let (end_rel, end_len) = find_env_end(body_region, env)?;
+    let body = &body_region[..end_rel];
+    let consumed = header_len + end_rel + end_len;
+    Some((consumed, env, body))
+}
+
+/// Strip a `[..]` argument only when it follows the tag IMMEDIATELY, as fancyvrb requires.
+fn strip_leading_optional_arg(body: &str) -> &str {
+    let Some(inner) = body.strip_prefix('[') else {
+        return body;
+    };
+    let mut depth = 1usize;
+    for (idx, ch) in inner.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &inner[idx + ch.len_utf8()..];
+                }
+            }
+            _ => {}
+        }
+    }
+    // Unbalanced bracket: not a well-formed optional argument, leave as-is.
+    body
+}
+
+/// Strip a fancyvrb `Verbatim` header, returning the raw content.
+///
+/// fancyvrb reads the `[key=val]` argument in non-verbatim mode, so a `%`
+/// comment ending the `\begin{Verbatim}` line is honored and the argument may
+/// follow on the next line (checked against TeX Live `pdflatex`). A bare newline
+/// ends the header instead, making the next line literal body.
+fn strip_fancyvrb_header(body: &str) -> &str {
+    let mut rest = body;
+    // Consume comment-only header lines: optional spaces, `%`, through the newline.
+    loop {
+        let after_hspace = rest.trim_start_matches([' ', '\t']);
+        let Some(after_pct) = after_hspace.strip_prefix('%') else {
+            break;
+        };
+        rest = match after_pct.find('\n') {
+            Some(nl) => &after_pct[nl + 1..],
+            None => &after_pct[after_pct.len()..],
+        };
+    }
+    // With no comment consumed `rest == body`, enforcing the exact-start rule.
+    strip_leading_optional_arg(rest)
+}
+
+/// Longest run of consecutive backticks in `s`, used to size a raw fence.
+fn max_backtick_run(s: &str) -> usize {
+    let mut max = 0usize;
+    let mut cur = 0usize;
+    for c in s.chars() {
+        if c == '`' {
+            cur += 1;
+            max = max.max(cur);
+        } else {
+            cur = 0;
+        }
+    }
+    max
+}
+
+/// Render literal text as a fenced Typst raw block; the fence grows past any backtick run.
+fn typst_raw_block(body: &str) -> String {
+    // Drop one newline adjacent to each tag so the block is tight; keep interior bytes.
+    let body = body
+        .strip_prefix("\r\n")
+        .or_else(|| body.strip_prefix('\n'))
+        .unwrap_or(body);
+    let body = body
+        .strip_suffix("\r\n")
+        .or_else(|| body.strip_suffix('\n'))
+        .unwrap_or(body);
+    let fence = "`".repeat(max_backtick_run(body).max(2) + 1);
+    format!("\n{fence}\n{body}\n{fence}\n")
+}
+
+/// Render literal text as inline Typst raw, growing the fence past any backtick run.
+fn typst_raw_inline(content: &str) -> String {
+    let ticks = max_backtick_run(content) + 1;
+    let fence = "`".repeat(ticks);
+    if ticks == 1 {
+        format!("{fence}{content}{fence}")
+    } else {
+        // A multi-backtick raw span trims one edge space, so the guards keep backticks apart.
+        format!("{fence} {content} {fence}")
+    }
+}
+
+/// Whether `position` sits after a real LaTeX comment marker on its line.
+fn is_latex_comment_position(input: &str, position: usize) -> bool {
+    let line_start = input[..position].rfind('\n').map_or(0, |index| index + 1);
+    let mut preceding_backslashes = 0usize;
+
+    for character in input[line_start..position].chars() {
+        match character {
+            '\\' => preceding_backslashes += 1,
+            '%' if preceding_backslashes & 1 == 0 => return true,
+            _ => preceding_backslashes = 0,
+        }
+    }
+    false
+}
+
 /// String fallback that turns an already-converted `\left\{ ... \right.` body
 /// into `cases(...)` arguments, for shapes the AST path (see math.rs
 /// `classify_lr_cases_environment`) doesn't catch: `atop(a, b)`, a bare
@@ -904,33 +1268,58 @@ impl LatexConverter {
 
     /// Check if input contains a real `\begin{document}` that is not commented out.
     ///
-    /// This function scans line-by-line, ignoring lines where `\begin{document}`
-    /// appears after a `%` comment marker.
+    /// Reuses the verbatim lexer's boundary rules: [`match_env_tag`] accepts the
+    /// TeX-ignorable separators (whitespace and `%` comments) that may sit between
+    /// the `\begin` control word and its `{document}` argument, so `\begin {document}`
+    /// and `\begin% c\n{document}` are recognized. A `\begin` that is itself after a
+    /// `%` comment on its line is ignored via [`is_latex_comment_position`] (which
+    /// is escaped-`\%`-aware). Verbatim examples of `\begin{document}` are already
+    /// replaced by markers before this runs, so any remaining match is real.
     fn has_real_begin_document(input: &str) -> bool {
-        for line in input.lines() {
-            // Find position of \begin{document} in this line
-            if let Some(doc_pos) = line.find("\\begin{document}") {
-                // Check if there's a % comment before it
-                let before_doc = &line[..doc_pos];
-                // If % exists before \begin{document}, this line is commented
-                if !before_doc.contains('%') {
-                    return true;
-                }
+        let mut from = 0;
+        while let Some(rel) = input[from..].find(r"\begin") {
+            let pos = from + rel;
+            if match_env_tag(&input[pos..], r"\begin", "document").is_some()
+                && !is_latex_comment_position(input, pos)
+            {
+                return true;
             }
+            from = pos + r"\begin".len();
         }
         false
     }
 
+    /// Reset all per-conversion state before a new top-level conversion.
+    ///
+    /// A converter may be reused across documents, so every input-derived field
+    /// must start clean or macros, counters, citations and warnings leak into
+    /// the next one. Replacing the whole `ConversionState` (rather than
+    /// clearing fields individually) keeps a reused converter identical to a
+    /// fresh one and resets future fields automatically.
+    fn reset_conversion_state(&mut self) {
+        self.state = ConversionState {
+            options: self.state.options.clone(),
+            ..ConversionState::default()
+        };
+    }
+
     /// Convert a complete LaTeX document to Typst
     pub fn convert_document(&mut self, input: &str) -> String {
-        // Only enter preamble mode if there's actually a \begin{document}
-        // that is NOT inside a comment. This avoids false positives from:
-        //   % \begin{document}  (commented out)
-        //   \begin{verbatim}\begin{document}\end{verbatim}  (inside verbatim - rare edge case)
-        self.state.in_preamble = Self::has_real_begin_document(input);
+        // A reused converter must start each document identical to a fresh one.
+        self.reset_conversion_state();
 
-        // Preprocess: protect zero-argument commands that MiTeX would otherwise lose
-        let protected_input = protect_zero_arg_commands(input);
+        // Shield verbatim and `\verb` first; lstlisting/minted stay for MiTeX.
+        let verbatim = shield_verbatim_regions(input);
+
+        // Enter preamble mode only for a real `\begin{document}`, read from shielded source.
+        self.state.in_preamble = Self::has_real_begin_document(&verbatim.source);
+
+        // Preserve raw TikZ before expansion: its punctuation is unrecoverable afterwards.
+        let (tikz_protected_input, rendered_tikz_blocks) =
+            shield_tikz_blocks(&verbatim.source, &verbatim.tikz_skip_ranges);
+
+        // Preprocess: protect zero-argument commands that MiTeX would otherwise lose.
+        let protected_input = protect_zero_arg_commands(&tikz_protected_input);
 
         // Optionally expand macros using the SOTA token-based engine
         // This correctly handles nested braces and complex macro arguments
@@ -947,7 +1336,17 @@ impl LatexConverter {
         self.visit_node(&tree, &mut output);
 
         // Build final document with preamble
-        let result = self.build_document(output);
+        let mut result = self.build_document(output);
+
+        // Restore TikZ only after cleanup: the markers travel as inert text.
+        for (marker, rendered) in rendered_tikz_blocks {
+            result = result.replace(&marker, &rendered);
+        }
+
+        // Restore shielded verbatim after TikZ, so literal bodies never re-enter a scan.
+        for (marker, raw) in verbatim.restorations {
+            result = result.replace(&marker, &raw);
+        }
 
         // Restore protected commands
         restore_protected_commands(&result)
@@ -955,6 +1354,7 @@ impl LatexConverter {
 
     /// Convert math-only LaTeX to Typst
     pub fn convert_math(&mut self, input: &str) -> String {
+        self.reset_conversion_state();
         self.state.mode = ConversionMode::Math;
         self.state.in_preamble = false;
 

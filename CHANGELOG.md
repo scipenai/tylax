@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **L2T literal text**: `verbatim`/`Verbatim`/`lstlisting` bodies and inline `\verb` are shielded from LaTeX interpretation and emitted as Typst raw, so a `tikzpicture` shown as an example stays literal instead of becoming live CeTZ. `\begin`/`\end` accept the TeX-ignorable separators (whitespace and `%` comments) that may sit before `{env}`.
+- **L2T diagnostics**: environment-balance checking handles whichever of `\begin`/`\end` appears first, so a repeated environment name no longer reports a false "unclosed environment" (#38). Comments, `\verb` spans and verbatim bodies are masked before every scan, so literal text cannot fake an imbalance.
+
 ## [0.3.7] - 2026-07-18
 
 ### Fixed

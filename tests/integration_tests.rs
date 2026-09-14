@@ -1525,6 +1525,29 @@ This is methods.
     }
 
     #[test]
+    fn test_begin_document_with_separator_enters_document_mode() {
+        // TeX ignores whitespace and `%` comments between the `\begin` control word
+        // and its `{document}` argument, so `\begin {document}` and
+        // `\begin% c\n{document}` are real document starts. They must enter document
+        // mode (preamble consumed) rather than leaking `\documentclass` as body.
+        let spaced = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin {document}\n\\section{First}\n\\end{document}",
+        );
+        assert!(
+            spaced.contains("= First") && !spaced.contains("documentclass"),
+            "`\\begin {{document}}` must enter document mode, got:\n{spaced}"
+        );
+
+        let commented = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin% start\n{document}\n\\section{First}\n\\end{document}",
+        );
+        assert!(
+            commented.contains("= First") && !commented.contains("documentclass"),
+            "comment-separated `\\begin{{document}}` must enter document mode, got:\n{commented}"
+        );
+    }
+
+    #[test]
     fn test_document_with_math() {
         let latex = r#"
 \documentclass{article}
@@ -1951,6 +1974,7 @@ mod options {
 // ============================================================================
 
 mod tikz_cetz {
+    use super::latex_document_to_typst;
     use tylax::tikz::{convert_cetz_to_tikz, convert_tikz_to_cetz, is_cetz_code};
 
     #[test]
@@ -2061,6 +2085,216 @@ canvas({
             "picture-level font option should not appear in output, got: {}",
             cetz
         );
+    }
+
+    #[test]
+    fn test_commented_tikzpicture_stays_comment() {
+        // The raw-block shield must only recognize real environments, never a
+        // code sample or a commented-out drawing.
+        let source =
+            "% \\begin{tikzpicture}\n% \\draw (0,0) -- (1,1);\n% \\end{tikzpicture}\nVisible text.";
+        let result = latex_document_to_typst(source);
+        assert!(result.contains("Visible text."), "got: {result}");
+        assert!(
+            !result.contains("TikZ converted to CeTZ") && !result.contains("#canvas"),
+            "commented TikZ must not become live CeTZ, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_verbatim_tikzpicture_stays_literal() {
+        // A TikZ example shown inside a `verbatim` block is documentation, not a
+        // drawing. Verbatim regions are shielded at the source level before any
+        // LaTeX interpretation, so the example must survive byte-for-byte as a
+        // Typst raw block — braces, `\begin`/`\end`, and `\draw` intact — never
+        // a live CeTZ picture.
+        let source = "\\documentclass{article}\n\\begin{document}\nExample:\n\\begin{verbatim}\n\\begin{tikzpicture}\n\\draw (0,0) -- (1,1);\n\\end{tikzpicture}\n\\end{verbatim}\nDone.\n\\end{document}";
+        let result = latex_document_to_typst(source);
+        assert!(
+            !result.contains("TikZ converted to CeTZ") && !result.contains("#canvas"),
+            "verbatim TikZ example must not become live CeTZ, got:\n{result}"
+        );
+        for literal in [
+            r"\begin{tikzpicture}",
+            r"\draw (0,0) -- (1,1);",
+            r"\end{tikzpicture}",
+        ] {
+            assert!(
+                result.contains(literal),
+                "verbatim body must stay literal ({literal:?}), got:\n{result}"
+            );
+        }
+        assert!(
+            result.contains("```"),
+            "verbatim body must be emitted as a Typst raw block, got:\n{result}"
+        );
+        assert!(
+            result.contains("Done."),
+            "surrounding prose survives, got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_inline_verb_tikzpicture_stays_literal() {
+        // A complete `tikzpicture` shown inside inline `\verb` is literal text.
+        // The source-level shield turns it into Typst inline raw rather than
+        // letting MiTeX (which has no `\verb` support) parse the body as a live
+        // environment and emit an empty `#canvas`.
+        let source = "\\documentclass{article}\n\\begin{document}\nInline: \\verb|\\begin{tikzpicture}\\draw (0,0)--(1,1);\\end{tikzpicture}| end.\n\\end{document}";
+        let result = latex_document_to_typst(source);
+        assert!(
+            !result.contains("#canvas"),
+            "inline \\verb TikZ must not become CeTZ, got:\n{result}"
+        );
+        assert!(
+            result.contains(r"`\begin{tikzpicture}\draw (0,0)--(1,1);\end{tikzpicture}`"),
+            "inline \\verb body must survive as Typst inline raw, got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_real_tikzpicture_still_renders_alongside_verbatim() {
+        // The verbatim shield must not suppress a genuine drawing elsewhere in
+        // the same document: real TikZ still converts to CeTZ.
+        let source = "\\documentclass{article}\n\\begin{document}\n\\begin{verbatim}\n\\begin{tikzpicture} example \\end{tikzpicture}\n\\end{verbatim}\n\\begin{tikzpicture}\n\\draw (0,0) -- (1,1);\n\\end{tikzpicture}\n\\end{document}";
+        let result = latex_document_to_typst(source);
+        assert!(
+            result.contains("#canvas") && result.contains("line((0, 0), (1, 1))"),
+            "real TikZ after a verbatim example must still render, got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_commented_verbatim_markers_do_not_protect_real_tikz() {
+        // `% \begin{verbatim}` / `% \end{verbatim}` are commented out, so the
+        // TikZ between them is a REAL drawing. A source-context-aware scan must
+        // not treat the commented markers as a verbatim region and skip the
+        // genuine picture.
+        let source = "\\documentclass{article}\n\\begin{document}\n% \\begin{verbatim}\n\\begin{tikzpicture}\n\\draw (0,0) -- (1,1);\n\\end{tikzpicture}\n% \\end{verbatim}\nAfter.\n\\end{document}";
+        let result = latex_document_to_typst(source);
+        assert!(
+            result.contains("#canvas") && result.contains("line((0, 0), (1, 1))"),
+            "real TikZ between commented-out verbatim markers must still render, got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_spaced_begin_verbatim_shields_interior_tikz() {
+        // TeX ignores whitespace after the `\begin`/`\end` control words, so
+        // `\begin {verbatim}` / `\end {verbatim}` (with a space) is a valid
+        // verbatim environment. The source-level shield must recognize it and
+        // keep the interior TikZ literal — not let it become a live CeTZ.
+        let source = "\\documentclass{article}\n\\begin{document}\n\\begin {verbatim}\n\\begin{tikzpicture}\n\\draw (0,0) -- (1,1);\n\\end{tikzpicture}\n\\end {verbatim}\nDone.\n\\end{document}";
+        let result = latex_document_to_typst(source);
+        assert!(
+            !result.contains("TikZ converted to CeTZ") && !result.contains("#canvas"),
+            "TikZ inside a spaced `\\begin {{verbatim}}` must stay literal, got:\n{result}"
+        );
+        for literal in [
+            r"\begin{tikzpicture}",
+            r"\draw (0,0) -- (1,1);",
+            r"\end{tikzpicture}",
+        ] {
+            assert!(
+                result.contains(literal),
+                "spaced verbatim body must stay literal ({literal:?}), got:\n{result}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fancyvrb_optional_arg_not_leaked_into_raw() {
+        // fancyvrb `\begin{Verbatim}[numbers=left]` carries a `[key=val]`
+        // optional argument that configures the environment; it is NOT body
+        // content. The shield must drop it before emitting the Typst raw block.
+        let source = "\\documentclass{article}\n\\begin{document}\n\\begin{Verbatim}[numbers=left]\nhello world\n\\end{Verbatim}\n\\end{document}";
+        let result = latex_document_to_typst(source);
+        assert!(
+            result.contains("hello world"),
+            "Verbatim body must survive, got:\n{result}"
+        );
+        assert!(
+            !result.contains("numbers=left") && !result.contains("[numbers=left]"),
+            "fancyvrb optional argument must not leak into the raw block, got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_commented_begin_verbatim_shields_interior_tikz() {
+        // TeX discards a `%` comment (and its newline) while scanning a control
+        // word's argument, so `\begin% note\n{verbatim}` / `\end% note\n{verbatim}`
+        // is a valid verbatim environment. The shield must recognize it and keep
+        // the interior TikZ literal rather than emitting live CeTZ.
+        let source = "\\documentclass{article}\n\\begin{document}\n\\begin% open\n{verbatim}\n\\begin{tikzpicture}\n\\draw (0,0) -- (1,1);\n\\end{tikzpicture}\n\\end% close\n{verbatim}\nDone.\n\\end{document}";
+        let result = latex_document_to_typst(source);
+        assert!(
+            !result.contains("TikZ converted to CeTZ") && !result.contains("#canvas"),
+            "TikZ inside a comment-separated verbatim tag must stay literal, got:\n{result}"
+        );
+        for literal in [
+            r"\begin{tikzpicture}",
+            r"\draw (0,0) -- (1,1);",
+            r"\end{tikzpicture}",
+        ] {
+            assert!(
+                result.contains(literal),
+                "comment-separated verbatim body must stay literal ({literal:?}), got:\n{result}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fancyvrb_body_starting_with_bracket_is_preserved() {
+        // fancyvrb reads the optional `[...]` only when it directly follows
+        // `\begin{Verbatim}`. Here the tag is followed by a newline, so the
+        // bracketed first line is literal body content and must NOT be deleted.
+        let source = "\\documentclass{article}\n\\begin{document}\n\\begin{Verbatim}\n[first line is literal data]\nsecond line\n\\end{Verbatim}\n\\end{document}";
+        let result = latex_document_to_typst(source);
+        assert!(
+            result.contains("[first line is literal data]"),
+            "a bracketed first body line must be preserved, got:\n{result}"
+        );
+        assert!(
+            result.contains("second line"),
+            "the rest of the Verbatim body must be preserved, got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_fancyvrb_header_comment_then_optional_arg_is_config() {
+        // Verified with TeX Live pdflatex: fancyvrb reads the `[key=val]` optional
+        // argument in non-verbatim mode, so a `%` comment ending the
+        // `\begin{Verbatim}` line is honored and the `[...]` on the next line is
+        // configuration, not body. Only `code` is typeset.
+        let source = "\\documentclass{article}\n\\begin{document}\n\\begin{Verbatim}% header comment\n[numbers=left]\ncode\n\\end{Verbatim}\n\\end{document}";
+        let result = latex_document_to_typst(source);
+        assert!(
+            result.contains("code"),
+            "Verbatim body must survive, got:\n{result}"
+        );
+        assert!(
+            !result.contains("numbers=left")
+                && !result.contains("[numbers=left]")
+                && !result.contains("header comment"),
+            "fancyvrb header comment and optional argument must not leak into the raw block, got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_plain_verbatim_comment_and_bracket_stay_literal() {
+        // Direct contrast to `test_fancyvrb_header_comment_then_optional_arg_is_config`:
+        // the SAME header-comment shape (`% comment` ending the `\begin` line, then
+        // a `[...]` line) must NOT be treated as a fancyvrb header for plain
+        // `verbatim`. It takes no optional argument, so the `%` comment and `[...]`
+        // are byte-for-byte literal body and must all survive.
+        let source = "\\documentclass{article}\n\\begin{document}\n\\begin{verbatim}% header comment\n[numbers=left]\ncode\n\\end{verbatim}\n\\end{document}";
+        let result = latex_document_to_typst(source);
+        for literal in ["% header comment", "[numbers=left]", "code"] {
+            assert!(
+                result.contains(literal),
+                "plain verbatim body must stay literal ({literal:?}), got:\n{result}"
+            );
+        }
     }
 }
 
