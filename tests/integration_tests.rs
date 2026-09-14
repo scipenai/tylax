@@ -957,6 +957,89 @@ mod l2t_math {
     }
 
     #[test]
+    fn test_sized_vertical_delimiter_pairs_preserve_semantics() {
+        // OCR corpus cases used `\big|x\big|` for absolute value. Preserve
+        // the fact that these bars came from a size command until their pair is
+        // known, rather than globally treating every `bar.v` as abs().
+        assert_eq!(latex_to_typst(r"\big|x\big|").trim(), "abs(x)");
+        assert_eq!(latex_to_typst(r"\Big\|x\Big\|").trim(), "norm(x)");
+        assert_eq!(
+            latex_to_typst(r"\big|x, y\big|").trim(),
+            "abs({x, y})",
+            "a comma stays inside the absolute-value operand"
+        );
+
+        // A matrix between paired bars is a determinant, not abs(mat(...)).
+        let determinant = latex_to_typst(r"\big|\begin{matrix}a & b \\ c & d\end{matrix}\big|");
+        assert!(
+            determinant.contains("mat(delim: \"|\"") && !determinant.contains("abs(mat("),
+            "sized matrix bars must stay matrix delimiters, got: {determinant}"
+        );
+
+        // Ordinary and one-sided bars use existing delimiter semantics; this
+        // change must not promote either into an absolute-value call.
+        assert_eq!(latex_to_typst(r"a \vert b").trim(), "a bar.v b");
+        assert_eq!(
+            latex_to_typst(r"\big|x").trim(),
+            "bar.v x",
+            "an unmatched sized bar must retain delimiter spacing"
+        );
+        assert!(
+            latex_to_typst(r"\left|x\right.").contains("lr(bar.v x)"),
+            "a legal null-right delimiter must remain one-sided"
+        );
+        assert!(
+            !latex_document_to_typst(
+                r"\documentclass{article}\begin{document}\big|x\end{document}"
+            )
+            .contains('\u{1f}'),
+            "a math-only delimiter in permissive text input must not leak an internal marker"
+        );
+        let ambiguous_adjacent = latex_to_typst(r"\big|\big|x\big|\big|");
+        assert!(
+            !ambiguous_adjacent.contains("abs(zws)"),
+            "adjacent bars must not be greedily paired into empty absolute values: {ambiguous_adjacent}"
+        );
+        assert!(
+            !ambiguous_adjacent.contains('\u{1f}'),
+            "the conservative fallback must resolve all internal markers: {ambiguous_adjacent}"
+        );
+
+        // A blank line ends a document paragraph and cannot be part of one
+        // valid math expression. Markers must therefore never pair across it.
+        // Test both public conversion paths because document mode runs only the
+        // marker-pairing pass, while math mode runs the full math cleanup.
+        let across_paragraph_math = latex_to_typst("a \\big| b\n\nc \\big| d");
+        let across_paragraph_document = latex_document_to_typst_with_options(
+            "a \\big| b\n\nc \\big| d",
+            &L2TOptions {
+                preamble: PreambleMode::None,
+                ..Default::default()
+            },
+        );
+        for output in [&across_paragraph_math, &across_paragraph_document] {
+            assert!(
+                !output.contains("abs("),
+                "sized bars must not pair across paragraphs: {output}"
+            );
+            assert!(
+                output.contains("bar.v") && !output.contains('\u{1f}'),
+                "each unmatched bar must fall back without leaking markers: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_plain_tex_cal_is_a_scoped_math_declaration() {
+        // Unlike `\mathcal{...}`, plain TeX's `\cal` styles the remaining
+        // expression in its current group. The group bounds the declaration.
+        assert_eq!(latex_to_typst(r"{\cal Z}").trim(), "cal(Z)");
+        assert_eq!(latex_to_typst(r"{\cal A B}").trim(), "cal(A B)");
+        assert_eq!(latex_to_typst(r"{\cal Z}_n").trim(), "cal(Z)_(n)");
+        assert_eq!(latex_to_typst(r"\mathcal{Z}").trim(), "cal(Z)");
+    }
+
+    #[test]
     fn test_overrightarrow_uses_arrow_accent() {
         // Issue #35: Typst has no `overrightarrow`/`overleftarrow` functions, so
         // the old fall-through emitted invalid Typst that failed to compile. The

@@ -680,7 +680,12 @@ fn fold_brace_annotation(conv: &mut LatexConverter, node: &SyntaxNode) -> Option
     }
 
     let script = script?;
-    let body = conv.convert_required_arg(&cmd, 0)?;
+    // The folded body is math content (e.g. `AB` in `\underbrace{AB}_{C}`); force
+    // math rendering so it splits into atoms `A B`, matching the standalone
+    // `\underbrace` path and the annotation below. Otherwise the document/CLI
+    // path emits `underbrace(AB, C)`, which Typst rejects as `unknown variable:
+    // AB` (issue #35).
+    let body = conv.convert_required_math_arg(&cmd, 0)?;
     let previous_mode = conv.state.mode;
     conv.state.mode = ConversionMode::Math;
     let mut label = String::new();

@@ -22,8 +22,15 @@ use super::{ConversionResult, ConversionWarning, WarningKind};
 
 use super::utils::{
     clean_whitespace, convert_caption_text, extract_arg_content, extract_arg_content_with_braces,
-    extract_curly_inner_content, protect_zero_arg_commands, restore_protected_commands,
+    extract_curly_inner_content, protect_top_level_comma, protect_zero_arg_commands,
+    restore_protected_commands,
 };
+
+/// Marker for a `\big`-style vertical delimiter, paired during math cleanup.
+pub(crate) const SIZED_BAR_SENTINEL: &str = "\u{1f}";
+
+/// Internal marker for a double vertical delimiter introduced by `\big\|`.
+pub(crate) const SIZED_DOUBLE_BAR_SENTINEL: &str = "\u{1e}";
 
 // =============================================================================
 // LaTeX → Typst Conversion Options
@@ -657,6 +664,105 @@ fn strip_call<'a>(s: &'a str, name: &str) -> Option<&'a str> {
         }
     }
     Some(inner)
+}
+
+/// Render the operand between a matched pair of sized vertical delimiters.
+///
+/// A delimiterless matrix becomes a determinant (or a norm matrix) when it is
+/// enclosed by bars. Every other operand uses Typst's scalar `abs`/`norm`
+/// function. Top-level commas need grouping because Typst parses them as
+/// function argument separators.
+fn render_sized_delimiter_operand(operand: &str, function: &str, matrix_delim: &str) -> String {
+    let operand = operand.trim();
+    if let Some(inner) = strip_call(operand, "mat") {
+        let inner = inner.trim();
+        if let Some(content) = inner
+            .strip_prefix("delim: #none,")
+            .or_else(|| inner.strip_prefix("delim: #none ,"))
+        {
+            return format!("mat(delim: \"{}\", {})", matrix_delim, content.trim());
+        }
+    }
+
+    let operand = if operand.is_empty() { "zws" } else { operand };
+    format!("{}({})", function, protect_top_level_comma(operand))
+}
+
+/// Pair the markers emitted for `\big`-style vertical delimiters, after
+/// rendering, where a delimiterless matrix is still distinguishable from a
+/// scalar operand. An unmatched marker is a legal one-sided delimiter.
+fn resolve_sized_delimiter_pair(
+    input: &str,
+    marker: &str,
+    function: &str,
+    fallback: &str,
+    matrix_delim: &str,
+) -> String {
+    // Adjacent equal bars are ambiguous without a delimiter tree; keep the tokens.
+    if markers_are_adjacent(input, marker) {
+        return input.replace(marker, fallback);
+    }
+
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+
+    while let Some(open) = remaining.find(marker) {
+        output.push_str(&remaining[..open]);
+        let after_open = &remaining[open + marker.len()..];
+
+        // A blank line cannot occur inside one math expression, so these are not a pair.
+        let close = after_open
+            .find(marker)
+            .filter(|&offset| !contains_paragraph_break(&after_open[..offset]));
+
+        let Some(close) = close else {
+            output.push_str(fallback);
+            // Keep scanning: a later pair in a following paragraph still resolves.
+            remaining = after_open;
+            continue;
+        };
+
+        output.push_str(&render_sized_delimiter_operand(
+            &after_open[..close],
+            function,
+            matrix_delim,
+        ));
+        remaining = &after_open[close + marker.len()..];
+    }
+
+    output.push_str(remaining);
+    output
+}
+
+/// Whether `input` has a blank line (spaces or CRLF allowed between the breaks).
+fn contains_paragraph_break(input: &str) -> bool {
+    let mut after_line_break = false;
+
+    for c in input.chars() {
+        if c == '\n' {
+            if after_line_break {
+                return true;
+            }
+            after_line_break = true;
+        } else if after_line_break && !c.is_whitespace() {
+            after_line_break = false;
+        }
+    }
+
+    false
+}
+
+/// Whether two occurrences of `marker` have only whitespace between them.
+fn markers_are_adjacent(input: &str, marker: &str) -> bool {
+    let mut remaining = input;
+    while let Some(start) = remaining.find(marker) {
+        let after_marker = &remaining[start + marker.len()..];
+        if after_marker.trim_start().starts_with(marker) {
+            return true;
+        }
+        remaining = after_marker;
+    }
+    false
 }
 
 /// Protect complete TikZ environments before macro expansion and AST parsing.
@@ -1424,6 +1530,9 @@ impl LatexConverter {
         // Walk the tree
         self.visit_node(&tree, &mut output);
 
+        // Pair the sized-delimiter sentinels only; full `postprocess_math` would corrupt prose.
+        let output = self.resolve_sized_delimiter_pairs(&output);
+
         // Build final document with preamble
         let mut result = self.build_document(output);
 
@@ -1469,9 +1578,9 @@ impl LatexConverter {
 
     /// Visit a sequence of elements, keeping TeX declaration scopes intact.
     ///
-    /// `\displaystyle`/`\textstyle` are declarations (mitex emits the affected
-    /// expression as siblings): wrap the rendered suffix in `display(..)`/
-    /// `inline(..)`. A nested group re-enters here, so it can't leak out (#42).
+    /// TeX declarations are emitted by mitex with their affected expression as
+    /// siblings. Wrap that suffix while visiting the current group, so the style
+    /// cannot leak into its parent scope.
     pub fn visit_elements(&mut self, children: &[SyntaxElement], output: &mut String) {
         let mut index = 0;
         while index < children.len() {
@@ -1481,6 +1590,11 @@ impl LatexConverter {
                     Some("display")
                 } else if is_command_named(child, "textstyle") {
                     Some("inline")
+                } else if is_command_named(child, "cal") {
+                    // Plain TeX's `\cal` is a declaration, not an
+                    // argument-taking `\mathcal{...}`: it applies through the
+                    // enclosing group, or the rest of an ungrouped formula.
+                    Some("cal")
                 } else {
                     None
                 }
@@ -2063,11 +2177,16 @@ impl LatexConverter {
         None
     }
 
-    /// Convert a required *term* argument such as `b` in `\frac{a}b` or `\sim`
-    /// in `\overset{p}\sim`. Thin alias of [`Self::convert_required_arg`], which
-    /// already handles unbraced single-token terms (and pads empty groups).
-    pub fn convert_required_term_arg(&mut self, cmd: &CmdItem, index: usize) -> Option<String> {
-        self.convert_required_arg(cmd, index)
+    /// Convert a required argument as MATH content whatever the surrounding
+    /// mode: accents and roots always take a math expression. On the document
+    /// path `\overrightarrow{PC}` would otherwise emit `arrow(PC)`, a single
+    /// Typst variable that fails to compile, not `arrow(P C)` (issue #35).
+    pub fn convert_required_math_arg(&mut self, cmd: &CmdItem, index: usize) -> Option<String> {
+        let previous_mode = self.state.mode;
+        self.state.mode = ConversionMode::Math;
+        let converted = self.convert_required_arg(cmd, index);
+        self.state.mode = previous_mode;
+        converted
     }
 
     /// Get a required argument from a command and convert it to Typst
@@ -2144,6 +2263,8 @@ impl LatexConverter {
         result = result.replace(" ^", "^");
         result = result.replace(" _", "_");
 
+        result = self.resolve_sized_delimiter_pairs(&result);
+
         // Rewrite `\left\{ ... \right.` (`lr({ ... )`) into Typst `cases(...)`.
         result = self.fix_left_brace_cases(&result);
 
@@ -2174,12 +2295,28 @@ impl LatexConverter {
         result = result.replace(" ^", "^");
         result = result.replace(" _", "_");
 
+        result = self.resolve_sized_delimiter_pairs(&result);
+
         // Rewrite `\left\{ ... \right.` and repair base-less `_`/`^` attachments
         // (see `postprocess_math`); the inline `$...$` path flows through here.
         result = self.fix_left_brace_cases(&result);
         result = self.fix_baseless_attachment(&result);
 
         result.trim().to_string()
+    }
+
+    /// Turn matched `\big|`/`\big\|` pairs into `abs(...)`/`norm(...)`. Only
+    /// sized delimiters carry markers, so ordinary bars are untouched and a
+    /// delimiterless matrix stays a determinant.
+    fn resolve_sized_delimiter_pairs(&self, input: &str) -> String {
+        let single = resolve_sized_delimiter_pair(input, SIZED_BAR_SENTINEL, "abs", "bar.v ", "|");
+        resolve_sized_delimiter_pair(
+            &single,
+            SIZED_DOUBLE_BAR_SENTINEL,
+            "norm",
+            "bar.v.double ",
+            "‖",
+        )
     }
 
     /// Fix missing spaces before Typst symbol names.

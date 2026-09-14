@@ -294,6 +294,10 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("inter".to_string()),
         }));
+        m.insert("cal".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("cal".to_string()),
+        }));
         m.insert("cdot".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("dot.op".to_string()),
