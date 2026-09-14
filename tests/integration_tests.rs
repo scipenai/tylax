@@ -2005,6 +2005,80 @@ mod l2t_document {
     }
 
     #[test]
+    fn eqref_keeps_the_authors_word_and_drops_typsts_supplement() {
+        // Issue #43: `@eq-b` renders "Equation 2", so keeping the "equation" the
+        // author wrote gives "equation Equation 2". `\eqref` renders a bare
+        // number in LaTeX, so the automatic supplement is the one to suppress.
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\n\
+             See equation~\\eqref{eq:b}.\n\
+             \\begin{align}\nb &= 2 \\label{eq:b}\n\\end{align}\n\\end{document}\n",
+        );
+        // The parentheses belong to `\eqref` itself and must be literal: a
+        // supplement-less `#ref` renders the bare number even under
+        // `#set math.equation(numbering: "(1)")`.
+        assert!(
+            out.contains("equation (#ref(<eq-b>, supplement: none))"),
+            "expected `equation (<ref>)` with literal parentheses, got:\n{out}"
+        );
+        assert!(
+            !out.contains("equation @eq-b"),
+            "`@` would re-insert the supplement, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn eqref_targets_the_label_the_document_actually_carries() {
+        // Issue #43: label names are author-chosen, so nothing may be inferred
+        // from them. Prefixing equation targets with `eq-` made `\label{e}`
+        // emit `<e>` while `\eqref{e}` emitted `<eq-e>`, and Typst rejected the
+        // document with "label `<eq-e>` does not exist".
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\n\
+             See equation~\\eqref{e}.\n\
+             \\begin{align}\nb &= 2 \\label{e}\n\\end{align}\n\\end{document}\n",
+        );
+        assert!(
+            out.contains("#ref(<e>, supplement: none)"),
+            "the reference must target the emitted label, got:\n{out}"
+        );
+        assert!(
+            !out.contains("eq-e"),
+            "no `eq-` prefix may be invented, got:\n{out}"
+        );
+        assert!(
+            out.contains("<e>"),
+            "the label must be emitted, got:\n{out}"
+        );
+
+        // A name that already sanitizes to `eq-...` is unaffected.
+        let colon = latex_document_to_typst(
+            "\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\n\
+             See equation~\\eqref{eq:b}.\n\
+             \\begin{align}\nb &= 2 \\label{eq:b}\n\\end{align}\n\\end{document}\n",
+        );
+        assert!(
+            colon.contains("#ref(<eq-b>, supplement: none)") && colon.contains("<eq-b>"),
+            "a `eq:`-style name must still line up, got:\n{colon}"
+        );
+    }
+
+    #[test]
+    fn plain_ref_still_drops_the_duplicated_supplement() {
+        // The other half of the same decision: `\ref` DOES take Typst's
+        // supplement, so the word the author wrote must be dropped instead.
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\section{First}\n\\label{sec:first}\n\
+             See Section~\\ref{sec:first}.\n\\end{document}\n",
+        );
+        assert!(
+            out.contains("See @sec-first"),
+            "the duplicated word must be dropped, got:\n{out}"
+        );
+    }
+
+    #[test]
     fn nested_lists_are_indented_not_flattened() {
         // Typst nests lists by indentation, so a sublist must be written two
         // spaces further in; otherwise both levels render as siblings.
@@ -2645,6 +2719,75 @@ The formula $E = mc^2$ is famous.
         assert!(
             result.contains("/ *Bold*: a bold term."),
             "command label should convert (not be stripped to empty), got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_issue_43_full_document_fixes() {
+        // Issue #43 bundled four document-mode regressions. This pins all of them
+        // against one document so a fix to one can't silently break another.
+        let latex = r"\documentclass{article}
+\usepackage{amsmath}
+\begin{document}
+\section{First}
+\label{sec:first}
+\subsection{Sub}
+See Section~\ref{sec:first} and equation~\eqref{eq:b}.
+\begin{align}
+a &= 1 \label{eq:a}\\
+b &= 2 \label{eq:b}
+\end{align}
+\begin{itemize}
+  \item Top
+  \begin{itemize}
+    \item Nested
+  \end{itemize}
+\end{itemize}
+\end{document}";
+        let result = latex_document_to_typst(latex);
+
+        // (1) Heading levels: article's `\section` is a top-level `=` heading and
+        //     `\subsection` is `==` (not both collapsed to one level).
+        assert!(
+            result.contains("= First") && result.contains("== Sub"),
+            "section/subsection should map to `=`/`==`, got:\n{}",
+            result
+        );
+
+        // (2) `Section~\ref{...}` must not become "Section @sec-first": Typst's
+        //     `@ref` re-inserts the supplement, so the authored word is dropped.
+        assert!(
+            result.contains("@sec-first") && !result.contains("Section @sec-first"),
+            "ref supplement word should be stripped, got:\n{}",
+            result
+        );
+
+        // (3) Per-row `\label` inside align: each row becomes its own block
+        //     equation with a real, resolvable Typst label. An inline `#<..>`
+        //     marker inside math does NOT create a label (Typst errors with
+        //     "label does not exist"), so the rows must be split apart.
+        assert!(
+            result.contains("$ a & = 1 $ <eq-a>") && result.contains("$ b & = 2 $ <eq-b>"),
+            "each align row should become a separately-labelled equation, got:\n{}",
+            result
+        );
+        assert!(
+            !result.contains("#<eq-"),
+            "no inline `#<..>` label markers should survive (they don't compile), got:\n{}",
+            result
+        );
+        assert!(
+            result.contains("Multiple labelled rows in a LaTeX alignment"),
+            "the unavoidable multi-label alignment downgrade must be explicit, got:\n{}",
+            result
+        );
+
+        // (4) Nested itemize indents one level (`  - Nested`) under its parent
+        //     item, with the outer list flush at column 0.
+        assert!(
+            result.contains("- Top") && result.contains("  - Nested"),
+            "nested list should indent by two spaces, got:\n{}",
             result
         );
     }
@@ -4975,7 +5118,16 @@ mod l2t_citation_refs {
 
     #[test]
     fn test_l2t_reference_variants() {
-        assert_eq!(latex_to_typst(r#"\eqref{energy}"#).trim(), "@eq-energy");
+        // `\eqref` renders "(2)" in LaTeX, so it must NOT pick up Typst's
+        // automatic supplement — that would read "equation Equation 2" next to
+        // the word the author already wrote (issue #43). The parentheses are
+        // part of `\eqref` itself: a supplement-less `#ref` renders the bare
+        // number even under `numbering: "(1)"`. The target is the label as
+        // written — no `eq-` prefix is invented.
+        assert_eq!(
+            latex_to_typst(r#"\eqref{energy}"#).trim(),
+            "(#ref(<energy>, supplement: none))"
+        );
         assert_eq!(latex_to_typst(r#"\ref{fig:one}"#).trim(), "@fig-one");
         assert_eq!(
             latex_to_typst(r#"\hyperref[intro]{custom text}"#).trim(),
@@ -7046,6 +7198,439 @@ Hello.
             result.is_err(),
             "missing {{body}} placeholder must error, got: {:?}",
             result
+        );
+    }
+}
+
+/// Issue #37: reconcile `\cite` with the document's bibliography backend.
+///
+/// A manual `thebibliography` renders `<key>` anchors but no `#bibliography()`,
+/// so `#cite(<key>)` fails to compile ("document does not contain a
+/// bibliography"). Citations are emitted as deferred markers during the walk and
+/// resolved once the backend is known: manual -> `@key`, external/none -> keep
+/// `#cite(...)`, mixed -> keep `#cite(...)` plus a diagnostic.
+mod l2t_citation_backend {
+    use super::*;
+    use tylax::latex_to_typst_with_diagnostics;
+
+    const MARKER_START: char = '\u{E010}';
+    const MARKER_END: char = '\u{E011}';
+
+    fn assert_no_marker_leak(out: &str) {
+        assert!(
+            !out.contains(MARKER_START) && !out.contains(MARKER_END),
+            "raw citation marker leaked into output:\n{out}"
+        );
+    }
+
+    fn manual_doc(body: &str) -> String {
+        format!(
+            "\\documentclass{{article}}\n\\begin{{document}}\n{body}\n\
+             \\begin{{thebibliography}}{{9}}\n\
+             \\bibitem{{knuth}} Knuth, D. The TeXbook.\n\
+             \\bibitem{{lamport}} Lamport, L. LaTeX.\n\
+             \\bibitem{{foo.bar}} Complex, K. Dotted key.\n\
+             \\end{{thebibliography}}\n\\end{{document}}\n"
+        )
+    }
+
+    #[test]
+    fn manual_single_cite_becomes_at_ref() {
+        let out = latex_document_to_typst(&manual_doc(r"See \cite{knuth}."));
+        assert!(out.contains("@knuth"), "expected @knuth, got:\n{out}");
+        assert!(
+            !out.contains("#cite(<knuth>"),
+            "manual bib must not keep #cite, got:\n{out}"
+        );
+        // The bib entry anchor `<knuth>` that `@knuth` targets must be present.
+        assert!(out.contains("<knuth>"), "missing bib anchor, got:\n{out}");
+        assert_no_marker_leak(&out);
+    }
+
+    #[test]
+    fn manual_multi_cite_splits_into_separate_at_refs() {
+        let out = latex_document_to_typst(&manual_doc(r"See \cite{knuth,lamport}."));
+        assert!(
+            out.contains("@knuth @lamport"),
+            "expected `@knuth @lamport`, got:\n{out}"
+        );
+        assert_no_marker_leak(&out);
+    }
+
+    #[test]
+    fn manual_postnote_kept_as_literal_after_single_key() {
+        let out = latex_document_to_typst(&manual_doc(r"See \cite[p.~5]{knuth}."));
+        assert!(
+            out.contains("@knuth [p."),
+            "postnote should follow the key literally, got:\n{out}"
+        );
+        assert_no_marker_leak(&out);
+    }
+
+    #[test]
+    fn manual_postnote_emitted_once_after_multi_key() {
+        let out = latex_document_to_typst(&manual_doc(r"See \cite[p.~5]{knuth,lamport}."));
+        // `@knuth @lamport [p.~5]` — the postnote is attached once, after the
+        // last key, not repeated per key.
+        assert!(
+            out.contains("@knuth @lamport [p."),
+            "expected one trailing postnote, got:\n{out}"
+        );
+        assert_eq!(
+            out.matches("[p.").count(),
+            1,
+            "postnote must appear exactly once, got:\n{out}"
+        );
+        assert_no_marker_leak(&out);
+    }
+
+    #[test]
+    fn manual_prenote_prepended_once() {
+        let out = latex_document_to_typst(&manual_doc(r"See \cite[see][p.~5]{knuth}."));
+        assert!(
+            out.contains("see @knuth [p."),
+            "expected `see @knuth [p. ...]`, got:\n{out}"
+        );
+        assert_no_marker_leak(&out);
+    }
+
+    #[test]
+    fn manual_dotted_key_falls_back_to_ref() {
+        // `foo.bar` sanitizes to a label containing a dot, which is not a simple
+        // `@key`, so it must degrade to `#ref(<foo.bar>)` — matching the anchor.
+        let out = latex_document_to_typst(&manual_doc(r"See \cite{foo.bar}."));
+        assert!(
+            out.contains("#ref(<foo.bar>)"),
+            "dotted key should use #ref, got:\n{out}"
+        );
+        assert_no_marker_leak(&out);
+    }
+
+    #[test]
+    fn manual_author_year_mode_degrades_with_diagnostic() {
+        for cmd in [r"\citet", r"\citeauthor", r"\citeyear", r"\citeyearpar"] {
+            let out = latex_document_to_typst(&manual_doc(&format!("See {cmd}{{knuth}}.")));
+            assert!(
+                out.contains("@knuth"),
+                "{cmd} should degrade to a label ref, got:\n{out}"
+            );
+            assert!(
+                out.contains("// - ") && out.to_lowercase().contains("degraded"),
+                "{cmd} under manual bib should emit a degradation diagnostic, got:\n{out}"
+            );
+            assert_no_marker_leak(&out);
+        }
+    }
+
+    #[test]
+    fn external_bibliography_keeps_cite() {
+        let doc = "\\documentclass{article}\n\\begin{document}\n\
+                   See \\cite{knuth}.\n\\bibliography{refs}\n\\end{document}\n";
+        let out = latex_document_to_typst(doc);
+        assert!(
+            out.contains("#cite(<knuth>)"),
+            "external bib must keep #cite, got:\n{out}"
+        );
+        assert!(
+            !out.contains("@knuth"),
+            "external bib must not rewrite to @knuth, got:\n{out}"
+        );
+        assert_no_marker_leak(&out);
+    }
+
+    #[test]
+    fn external_addbibresource_keeps_cite() {
+        let doc = "\\documentclass{article}\n\\addbibresource{refs.bib}\n\\begin{document}\n\
+                   See \\cite{knuth,lamport}.\n\\printbibliography\n\\end{document}\n";
+        let out = latex_document_to_typst(doc);
+        assert!(
+            out.contains("#cite(<knuth>)") && out.contains("#cite(<lamport>)"),
+            "biblatex must keep #cite per key, got:\n{out}"
+        );
+        assert_no_marker_leak(&out);
+    }
+
+    #[test]
+    fn no_bibliography_keeps_cite_unchanged() {
+        // None backend: don't disturb (a bib may be added later, or this is a
+        // stray fragment). Matches pre-issue-#37 behavior.
+        let doc = "\\documentclass{article}\n\\begin{document}\n\
+                   See \\cite{knuth}.\n\\end{document}\n";
+        let out = latex_document_to_typst(doc);
+        assert!(
+            out.contains("#cite(<knuth>)") && !out.contains("@knuth"),
+            "no-bib document must keep #cite, got:\n{out}"
+        );
+        assert_no_marker_leak(&out);
+    }
+
+    #[test]
+    fn mixed_backend_keeps_cite_and_warns() {
+        // Both a manual `thebibliography` and an external `\bibliography`: keep
+        // the compilable external form and flag the ambiguity once.
+        let doc = "\\documentclass{article}\n\\begin{document}\n\
+                   See \\cite{knuth}.\n\\bibliography{refs}\n\
+                   \\begin{thebibliography}{9}\n\
+                   \\bibitem{knuth} Knuth, D.\n\\end{thebibliography}\n\\end{document}\n";
+        let out = latex_document_to_typst(doc);
+        assert!(
+            out.contains("#cite(<knuth>)"),
+            "mixed backend must keep #cite, got:\n{out}"
+        );
+        assert!(
+            out.to_lowercase().contains("mixes a manual"),
+            "mixed backend must emit a diagnostic, got:\n{out}"
+        );
+        assert_no_marker_leak(&out);
+    }
+
+    #[test]
+    fn bibliographystyle_and_nocite_alone_stay_manual() {
+        // `\bibliographystyle` and `\nocite` commonly accompany a manual bib and
+        // must NOT flip the backend to External/Mixed.
+        let doc = "\\documentclass{article}\n\\bibliographystyle{plain}\n\\begin{document}\n\
+                   \\nocite{*}\nSee \\cite{knuth}.\n\
+                   \\begin{thebibliography}{9}\n\
+                   \\bibitem{knuth} Knuth, D.\n\\end{thebibliography}\n\\end{document}\n";
+        let out = latex_document_to_typst(doc);
+        assert!(
+            out.contains("@knuth") && !out.contains("#cite(<knuth>)"),
+            "style/nocite must not force External; expected manual @knuth, got:\n{out}"
+        );
+        assert!(
+            !out.to_lowercase().contains("mixes a manual"),
+            "must not be treated as Mixed, got:\n{out}"
+        );
+        assert_no_marker_leak(&out);
+    }
+
+    /// Collect the bibliography-backend diagnostics reported for a document.
+    fn backend_warnings(doc: &str) -> Vec<String> {
+        latex_to_typst_with_diagnostics(doc)
+            .warnings
+            .iter()
+            .filter(|w| {
+                let m = w.message.to_lowercase();
+                m.contains("bibliograph")
+            })
+            .map(|w| w.message.clone())
+            .collect()
+    }
+
+    #[test]
+    fn external_bibliography_warns_even_without_any_citation() {
+        // The backend diagnostic must not depend on citations: `\bibliography`
+        // is dropped without emitting `#bibliography(...)` whether or not
+        // anything cites it, so a document with zero `\cite` is still broken.
+        let doc = "\\documentclass{article}\n\\begin{document}\n\
+                   Body with no citation at all.\n\\bibliography{refs}\n\\end{document}\n";
+        let warnings = backend_warnings(doc);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one backend warning, got: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("#bibliography"),
+            "warning should name the missing #bibliography, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn external_bibliography_warns_exactly_once_with_many_citations() {
+        // One diagnostic per document, not per citation.
+        let doc = "\\documentclass{article}\n\\begin{document}\n\
+                   See \\cite{a}, \\cite{b} and \\cite{c}.\n\
+                   \\bibliography{refs}\n\\end{document}\n";
+        let warnings = backend_warnings(doc);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one backend warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_backend_warns_even_without_any_citation() {
+        // `Mixed` is covered by the same unconditional finalizer.
+        let doc = "\\documentclass{article}\n\\begin{document}\n\
+                   Body with no citation at all.\n\\bibliography{refs}\n\
+                   \\begin{thebibliography}{9}\n\\bibitem{knuth} Knuth.\n\
+                   \\end{thebibliography}\n\\end{document}\n";
+        let warnings = backend_warnings(doc);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one backend warning, got: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("mixes"),
+            "expected the mixed-backend warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn manual_and_plain_documents_emit_no_backend_warning() {
+        // No spurious noise on the paths that convert cleanly.
+        assert!(
+            backend_warnings(&manual_doc(r"See \cite{knuth}.")).is_empty(),
+            "a fully reconciled manual bibliography must not warn"
+        );
+        let plain = "\\documentclass{article}\n\\begin{document}\nNo bibliography here.\n\
+                     \\end{document}\n";
+        assert!(
+            backend_warnings(plain).is_empty(),
+            "a document without any bibliography must not warn"
+        );
+    }
+
+    #[test]
+    fn structured_diagnostic_is_reported_via_api() {
+        let out = latex_to_typst_with_diagnostics(&manual_doc(r"See \citet{knuth}."));
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.message.to_lowercase().contains("degraded")),
+            "expected a structured bibliography-backend warning, got: {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn converter_reuse_does_not_leak_the_backend_between_documents() {
+        // The backend flags are the one piece of reuse state whose leak is
+        // silent in the byte-identical test above (which pairs a manual doc
+        // with a plain one). A leaked `saw_manual_bib` would classify a later
+        // external-bib document as `Mixed`, changing its diagnostic — and, for
+        // any future backend-dependent rendering, its citations too.
+        let external = "\\documentclass{article}\n\\begin{document}\n\
+                        See \\cite{knuth}.\n\\bibliography{refs}\n\\end{document}\n";
+        let fresh = latex_document_to_typst(external);
+
+        let mut reused = tylax::core::latex2typst::LatexConverter::new();
+        let _ = reused.convert_document(&manual_doc(r"See \cite{knuth}."));
+        let after_reuse = reused.convert_document(external);
+
+        assert_eq!(
+            after_reuse, fresh,
+            "reused converter diverged:\n--- reused ---\n{after_reuse}\n--- fresh ---\n{fresh}"
+        );
+        assert!(
+            after_reuse.contains("External bibliography"),
+            "second document should be classified External, got:\n{after_reuse}"
+        );
+        assert!(
+            !after_reuse.contains("mixes"),
+            "a leaked manual-bib flag would misclassify it as Mixed, got:\n{after_reuse}"
+        );
+        assert_no_marker_leak(&after_reuse);
+    }
+
+    #[test]
+    fn converter_reuse_does_not_drift_marker_indices() {
+        // Two conversions on one converter: the second must not resolve against
+        // the first document's pending citations.
+        let mut converter = tylax::core::latex2typst::LatexConverter::new();
+        let first = converter.convert_document(&manual_doc(r"See \cite{knuth}."));
+        let second = converter.convert_document(&manual_doc(r"See \cite{lamport}."));
+        assert!(first.contains("@knuth"), "first doc wrong:\n{first}");
+        assert!(
+            second.contains("@lamport") && !second.contains("@knuth"),
+            "second doc must resolve its own cites, got:\n{second}"
+        );
+        assert_no_marker_leak(&first);
+        assert_no_marker_leak(&second);
+    }
+
+    #[test]
+    fn math_fragment_citation_keeps_cite_and_no_marker() {
+        // A math-only path has no bibliography (None backend) and must still
+        // resolve the marker to `#cite(...)`, never leak it.
+        let out = latex_to_typst(r"\cite{knuth}");
+        assert_no_marker_leak(&out);
+    }
+
+    #[test]
+    fn converter_reuse_is_byte_identical_to_fresh_converter() {
+        // The general invariant behind the per-conversion reset: converting a
+        // document on a converter that already processed a *different* document
+        // must produce exactly what a freshly constructed converter produces.
+        // This covers every per-conversion field (title, counters, macros,
+        // bibliography flags, pending cites, warnings) at once, so a future
+        // state field cannot silently leak across reuse.
+        let doc_a = "\\documentclass{article}\n\
+                     \\newcommand{\\foo}{FOO}\n\
+                     \\title{First Doc}\n\\begin{document}\n\
+                     \\maketitle\n\\section{Alpha}\n\
+                     See \\cite[p.~5]{knuth}.\n\
+                     \\begin{thebibliography}{9}\n\
+                     \\bibitem{knuth} Knuth, D.\n\\end{thebibliography}\n\\end{document}\n";
+        let doc_b = "\\documentclass{article}\n\
+                     \\title{Second Doc}\n\\begin{document}\n\
+                     \\maketitle\n\\section{Beta}\nPlain \\foo body.\n\\end{document}\n";
+
+        let fresh = latex_document_to_typst(doc_b);
+
+        let mut reused = tylax::core::latex2typst::LatexConverter::new();
+        let _ = reused.convert_document(doc_a);
+        let after_reuse = reused.convert_document(doc_b);
+
+        assert_eq!(
+            after_reuse, fresh,
+            "reused converter diverged from a fresh one:\n--- reused ---\n{after_reuse}\n--- fresh ---\n{fresh}"
+        );
+        assert_no_marker_leak(&after_reuse);
+    }
+
+    #[test]
+    fn converter_reuse_does_not_leak_degradation_warning() {
+        // A reused converter must not carry a prior conversion's warnings into
+        // the next document. First convert a manual-bib doc whose postnote
+        // degrades to a label reference (emits a bibliography-backend warning),
+        // then convert a plain document with nothing to warn about.
+        let mut converter = tylax::core::latex2typst::LatexConverter::new();
+
+        let first = converter.convert_document(&manual_doc(r"See \cite[p.~5]{knuth}."));
+        assert!(
+            first.contains("degraded to a label reference"),
+            "sanity: first doc should surface the degradation warning, got:\n{first}"
+        );
+
+        let plain = "\\documentclass{article}\n\\begin{document}\nPlain text.\n\\end{document}\n";
+        let second = converter.convert_document(plain);
+        assert!(
+            !second.contains("degraded to a label reference"),
+            "legacy warning comment leaked into a reused converter's next doc, got:\n{second}"
+        );
+        assert!(
+            !second.to_lowercase().contains("bibliography"),
+            "no bibliography-backend warning should survive into the plain doc, got:\n{second}"
+        );
+        assert_no_marker_leak(&second);
+    }
+
+    #[test]
+    fn converter_reuse_does_not_leak_structured_warning() {
+        // The structured-diagnostics sink must be isolated per conversion too.
+        // The plain `convert_document` entry point does NOT drain structured
+        // warnings, so a first degrading conversion leaves them populated; the
+        // second document's `_with_diagnostics` take must not surface them.
+        let mut converter = tylax::core::latex2typst::LatexConverter::new();
+
+        // First: manual-bib author-year cite degrades → structured warning
+        // pushed but (via plain `convert_document`) never taken.
+        let first = converter.convert_document(&manual_doc(r"See \citet{knuth}."));
+        assert!(
+            first.contains("degraded to a label reference"),
+            "sanity: first doc should degrade the citation, got:\n{first}"
+        );
+
+        let plain = "\\documentclass{article}\n\\begin{document}\nPlain text.\n\\end{document}\n";
+        let second = converter.convert_document_with_diagnostics(plain);
+        assert!(
+            second.warnings.is_empty(),
+            "structured warnings leaked into a reused converter's next doc: {:?}",
+            second.warnings
         );
     }
 }

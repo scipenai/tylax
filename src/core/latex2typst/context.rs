@@ -13,7 +13,10 @@ use std::fmt::Write;
 use crate::data::constants::{AcronymDef, GlossaryDef};
 use crate::data::extended_symbols::EXTENDED_SYMBOLS;
 use crate::data::maps::TEX_COMMAND_SPEC;
-use crate::features::refs::{CitationMode, ReferenceType};
+use crate::features::refs::{
+    citation_to_typst, reference_to_typst, BibBackend, CitationMode, CiteGroup, Reference,
+    ReferenceType,
+};
 use fxhash::FxHashMap;
 use lazy_static::lazy_static;
 
@@ -23,7 +26,7 @@ use super::{ConversionResult, ConversionWarning, WarningKind};
 use super::utils::{
     clean_whitespace, convert_caption_text, extract_arg_content, extract_arg_content_with_braces,
     extract_curly_inner_content, protect_top_level_comma, protect_zero_arg_commands,
-    restore_protected_commands,
+    restore_protected_commands, sanitize_label,
 };
 
 /// Marker for a `\big`-style vertical delimiter, paired during math cleanup.
@@ -310,6 +313,19 @@ pub struct ConversionState {
     pub options: L2TOptions,
 }
 
+/// Per-document citation bookkeeping: the backends the walk saw, and the
+/// citations deferred until the backend is known. Kept on `LatexConverter`,
+/// not the re-exported `ConversionState`, whose fields are all `pub`.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct CitationSession {
+    /// A manual `thebibliography` environment was rendered in this document.
+    pub(crate) saw_manual_bib: bool,
+    /// An external bibliography command was seen (`\bibliography`, `\addbibresource`, ...).
+    pub(crate) saw_external_bib: bool,
+    /// Citations deferred during the walk; index N is the marker `TylaxCite{N}`.
+    pub(crate) pending: Vec<CiteGroup>,
+}
+
 /// One argument of an environment's `\begin{..}` header.
 pub(crate) struct EnvHeaderArg {
     /// `true` for a bracketed `[..]` slot, `false` for a braced `{..}` one.
@@ -366,6 +382,19 @@ pub(crate) enum PendingSection {
     /// `\subparagraph*`: run-in italics, which carry no number either way.
     Subparagraph,
 }
+
+impl CitationSession {
+    /// Decide the backend from recorded events; `Mixed` is only knowable after the walk.
+    pub(crate) fn backend(&self) -> BibBackend {
+        match (self.saw_manual_bib, self.saw_external_bib) {
+            (true, true) => BibBackend::Mixed,
+            (true, false) => BibBackend::Manual,
+            (false, true) => BibBackend::External,
+            (false, false) => BibBackend::None,
+        }
+    }
+}
+
 impl ConversionState {
     /// Add a structured warning
     pub fn add_warning(&mut self, warning: ConversionWarning) {
@@ -492,6 +521,8 @@ impl ConversionState {
 pub struct LatexConverter {
     pub(crate) state: ConversionState,
     pub(crate) spec: CommandSpec,
+    /// Citation bookkeeping for the document being converted (see `CitationSession`).
+    pub(crate) citations: CitationSession,
     /// Half-collected siunitx arguments, carried across sibling nodes.
     pub(crate) siunitx_arg_collector: Option<PendingSiunitx>,
     /// A starred sectioning command whose title has not been reached yet.
@@ -1350,6 +1381,7 @@ impl LatexConverter {
         Self {
             state: ConversionState::new(),
             spec: MERGED_SPEC.clone(),
+            citations: CitationSession::default(),
             siunitx_arg_collector: None,
             pending_section: None,
         }
@@ -1362,6 +1394,7 @@ impl LatexConverter {
         Self {
             state,
             spec: MERGED_SPEC.clone(),
+            citations: CitationSession::default(),
             siunitx_arg_collector: None,
             pending_section: None,
         }
@@ -1506,6 +1539,8 @@ impl LatexConverter {
             options: self.state.options.clone(),
             ..ConversionState::default()
         };
+        // Citation bookkeeping is per-document, so the reuse invariant covers it too.
+        self.citations = CitationSession::default();
         self.siunitx_arg_collector = None;
         self.pending_section = None;
     }
@@ -1545,6 +1580,10 @@ impl LatexConverter {
         // Pair the sized-delimiter sentinels only; full `postprocess_math` would corrupt prose.
         let output = self.resolve_sized_delimiter_pairs(&output);
 
+        // Report the backend, then resolve the markers; both before `build_document`.
+        self.finalize_bibliography_diagnostics();
+        let output = self.resolve_citations(&output);
+
         // Build final document with preamble
         let mut result = self.build_document(output);
 
@@ -1564,6 +1603,7 @@ impl LatexConverter {
 
     /// Convert math-only LaTeX to Typst
     pub fn convert_math(&mut self, input: &str) -> String {
+        // A math fragment has no bibliography, but the markers must still be resolved.
         self.reset_conversion_state();
         self.state.mode = ConversionMode::Math;
         self.state.in_preamble = false;
@@ -1578,8 +1618,102 @@ impl LatexConverter {
         let mut output = String::with_capacity(expanded_input.len().max(256));
         self.visit_node(&tree, &mut output);
 
+        // Resolve citation markers BEFORE math cleanup, so `#cite(...)` is post-processed.
+        let output = self.resolve_citations(&output);
+
         // Post-process
         self.postprocess_math(output)
+    }
+
+    /// Resolve the deferred `TylaxCite{N}` markers by bibliography backend:
+    /// `Manual` becomes a label reference targeting the `thebibliography`
+    /// anchors, everything else keeps `#cite(...)` — including `Mixed`, whose
+    /// two backends cannot be reconciled automatically.
+    fn resolve_citations(&mut self, input: &str) -> String {
+        let pending = std::mem::take(&mut self.citations.pending);
+        if pending.is_empty() {
+            return input.to_string();
+        }
+
+        let backend = self.citations.backend();
+        let mut result = input.to_string();
+
+        for (idx, group) in pending.iter().enumerate() {
+            let marker = format!("\u{E010}TylaxCite{}X\u{E011}", idx);
+            let replacement = match backend {
+                BibBackend::Manual => self.render_manual_citation(group),
+                BibBackend::External | BibBackend::Mixed | BibBackend::None => {
+                    citation_to_typst(group)
+                }
+            };
+            result = result.replace(&marker, &replacement);
+        }
+
+        result
+    }
+
+    /// Emit the once-per-document diagnostic for the bibliography backend.
+    ///
+    /// Separate from `resolve_citations`, which returns early when a document
+    /// has no `\cite`: an external `\bibliography{refs}` is dropped without a
+    /// `#bibliography(...)` whether or not anything cites it, so the warning
+    /// must depend on the backend, never on the citation count.
+    fn finalize_bibliography_diagnostics(&mut self) {
+        match self.citations.backend() {
+            // Recognized but not reproduced: without `#bibliography(...)` any `#cite` fails.
+            BibBackend::External => self.warn_bibliography_backend(
+                "External bibliography (`\\bibliography`/`\\addbibresource`) is not converted: \
+                 no `#bibliography(...)` is emitted, so the reference list is missing and any \
+                 `#cite(...)` will fail to compile. Add a Typst `#bibliography(\"refs.bib\")` \
+                 manually.",
+            ),
+            BibBackend::Mixed => self.warn_bibliography_backend(
+                "Document mixes a manual `thebibliography` with an external bibliography; \
+                 citations are kept as `#cite(...)` for the external backend, which emits no \
+                 `#bibliography(...)`. Verify the intended bibliography.",
+            ),
+            // Manual is fully reconciled; per-citation degradations come from the renderer.
+            BibBackend::Manual | BibBackend::None => {}
+        }
+    }
+
+    /// Render a citation against a manual `thebibliography`; forms `@key` cannot express degrade.
+    fn render_manual_citation(&mut self, group: &CiteGroup) -> String {
+        let keys: Vec<String> = group
+            .citations
+            .iter()
+            .map(|c| reference_to_typst(&Reference::new(sanitize_label(&c.key))))
+            .collect();
+        let mut rendered = keys.join(" ");
+
+        // Prenote is prepended once; the postnote follows the last key.
+        if let Some(prefix) = group.prefix.as_deref() {
+            rendered = format!("{} {}", prefix, rendered);
+        }
+        if let Some(suffix) = group.suffix.as_deref() {
+            rendered = format!("{} [{}]", rendered, suffix);
+        }
+
+        let has_note = group.prefix.is_some() || group.suffix.is_some();
+        let non_normal = group
+            .citations
+            .iter()
+            .any(|c| c.mode != CitationMode::Normal);
+        if has_note || non_normal {
+            self.warn_bibliography_backend(
+                "Manual-bibliography citation degraded to a label reference: author-year \
+                 form or note text cannot be recovered from `thebibliography` entries.",
+            );
+        }
+
+        rendered
+    }
+
+    /// Record a bibliography-backend diagnostic on both warning sinks.
+    fn warn_bibliography_backend(&mut self, message: &str) {
+        self.state.warnings.push(message.to_string());
+        self.state
+            .add_warning(ConversionWarning::new(WarningKind::ParseError, message));
     }
 
     /// Visit a syntax node and convert it.
@@ -1669,7 +1803,12 @@ impl LatexConverter {
             }
             SyntaxKind::ItemCurly if !pending.collecting_optional => {
                 if let SyntaxElement::Node(node) = elem {
-                    super::markup::emit_pending_citation_from_curly(&node, pending, output);
+                    super::markup::emit_pending_citation_from_curly(
+                        &node,
+                        pending,
+                        &mut self.citations.pending,
+                        output,
+                    );
                     return true;
                 }
                 self.state.pending_citation = Some(pending);

@@ -25,8 +25,9 @@ use super::context::{
 use super::utils::{protect_top_level_comma, sanitize_label, to_roman_numeral};
 use crate::features::images::ImageAttributes;
 use crate::features::refs::{
-    citation_mode_from_latex_command, citation_to_typst, label_to_typst, reference_to_typst,
-    reference_type_from_latex_command, Citation, CitationMode, CiteGroup, Reference, ReferenceType,
+    citation_mode_from_latex_command, label_to_typst, reference_to_typst,
+    reference_to_typst_without_supplement, reference_type_from_latex_command, Citation,
+    CitationMode, CiteGroup, Reference, ReferenceType,
 };
 
 fn has_split_optional_citation_start(cmd: &CmdItem) -> bool {
@@ -166,6 +167,7 @@ fn emit_citation_group(
     mode: CitationMode,
     prefix: Option<String>,
     suffix: Option<String>,
+    pending_cites: &mut Vec<CiteGroup>,
     output: &mut String,
 ) {
     let mut group = CiteGroup::new();
@@ -178,18 +180,24 @@ fn emit_citation_group(
         }
     }
     if !group.citations.is_empty() {
-        output.push_str(&citation_to_typst(&group));
+        // The bibliography backend is only known after the whole walk, so emit
+        // an inert marker and resolve it in `resolve_citations`. The
+        // `X\u{E011}` terminator keeps `Cite1` from prefixing `Cite11`.
+        let idx = pending_cites.len();
+        pending_cites.push(group);
+        let _ = write!(output, "\u{E010}TylaxCite{}X\u{E011}", idx);
     }
 }
 
 pub fn emit_pending_citation_from_curly(
     node: &mitex_parser::syntax::SyntaxNode,
     pending: PendingCitation,
+    pending_cites: &mut Vec<CiteGroup>,
     output: &mut String,
 ) {
     let keys = crate::core::latex2typst::utils::extract_curly_inner_content(node);
     let (prefix, suffix) = optional_args_to_prefix_suffix(&pending.optional_args);
-    emit_citation_group(&keys, pending.mode, prefix, suffix, output);
+    emit_citation_group(&keys, pending.mode, prefix, suffix, pending_cites, output);
 }
 
 pub fn emit_pending_reference_from_curly(
@@ -421,9 +429,16 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 handle_newglossaryentry(conv, &cmd);
                 return;
             }
+            // Record the external backend (so citations keep `#cite`), then
+            // drop the command. `\bibliographystyle`/`\nocite` are excluded:
+            // they coexist with a manual `thebibliography`.
+            "bibliography" | "addbibresource" | "bibdata" | "printbibliography" => {
+                conv.citations.saw_external_bib = true;
+                return;
+            }
             // Preamble/setup commands to ignore
             "usepackage" | "RequirePackage" | "input" | "include" | "includeonly"
-            | "bibliography" | "bibliographystyle" | "maketitle" | "pagestyle" 
+            | "bibliographystyle" | "maketitle" | "pagestyle"
             | "thispagestyle" | "pagenumbering" | "setcounter" | "addtocounter" 
             | "setlength" | "addtolength" | "newtheorem" | "theoremstyle" 
             | "allowdisplaybreaks" | "numberwithin" | "DeclareMathOperator"
@@ -607,7 +622,25 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                     target: clean_label,
                     ref_type,
                 };
-                output.push_str(&reference_to_typst(&reference));
+                // Typst's `@ref` re-inserts a capitalized supplement ("Section 1"),
+                // so drop a matching word the author already wrote (issue #43).
+                match ref_type {
+                    // `\eqref` renders "(2)", so the word before it is the
+                    // author's prose: keep it and suppress Typst's supplement.
+                    // The parentheses must be literal — a supplement-less
+                    // `#ref` gives the bare number even under `"(1)"`.
+                    ReferenceType::Equation => {
+                        output.push('(');
+                        output.push_str(&reference_to_typst_without_supplement(&reference));
+                        output.push(')');
+                    }
+                    // A page reference renders as a bare number either way.
+                    ReferenceType::Page => output.push_str(&reference_to_typst(&reference)),
+                    _ => {
+                        strip_trailing_ref_supplement(output);
+                        output.push_str(&reference_to_typst(&reference));
+                    }
+                }
             } else {
                 conv.state.pending_reference = Some(PendingReference { ref_type });
             }
@@ -629,7 +662,14 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 .collect::<Vec<_>>();
             if let Some(keys) = conv.get_required_arg(&cmd, 0) {
                 let (prefix, suffix) = optional_args_to_prefix_suffix(&optional_args);
-                emit_citation_group(&keys, mode, prefix, suffix, output);
+                emit_citation_group(
+                    &keys,
+                    mode,
+                    prefix,
+                    suffix,
+                    &mut conv.citations.pending,
+                    output,
+                );
             } else {
                 conv.state.pending_citation = Some(PendingCitation {
                     mode,
@@ -2761,6 +2801,12 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             let _ = write!(output, "/* \\color{{{}}} -> {} */", color_name, typst_color);
         }
 
+        // Same in the document body. `\bibstyle`/`\nocite` are excluded: they
+        // accompany a manual `thebibliography` and must not force `Mixed`.
+        "bibliography" | "addbibresource" | "bibdata" | "printbibliography" => {
+            conv.citations.saw_external_bib = true;
+        }
+
         // Ignored commands - alignment and layout
         "centering" | "raggedright" | "raggedleft" | "noindent" | "indent"
         | "pagebreak" | "nopagebreak" | "enlargethispage"
@@ -2768,7 +2814,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         | "nonfrenchspacing" | "normalfont" | "rmfamily" | "sffamily" | "ttfamily" | "bfseries"
         | "mdseries" | "itshape" | "scshape" | "upshape" | "slshape" | "normalsize" | "tiny"
         | "scriptsize" | "footnotesize" | "small" | "large" | "Large" | "LARGE" | "huge"
-        | "Huge" | "nocite" | "printbibliography" | "printglossary" | "printacronyms"
+        | "Huge" | "nocite" | "printglossary" | "printacronyms"
         | "glsresetall" | "tableofcontents" | "listoffigures" | "listoftables"
         | "frontmatter" | "mainmatter" | "backmatter"
         // IEEE and conference specific
@@ -2786,9 +2832,9 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         | "marginpar" | "marginparpush" | "reversemarginpar" | "normalmarginpar"
         // Misc invisible commands (excluding already handled: protect)
         | "expandafter" | "global" | "long" | "outer" | "inner"
-        | "noexpand" | "csname" | "endcsname" | "string" | "number" 
-        // More bibliography
-        | "addbibresource" | "bibdata" | "bibstyle" 
+        | "noexpand" | "csname" | "endcsname" | "string" | "number"
+        // Bibliography style-only command (not a backend signal on its own)
+        | "bibstyle"
         // Index
         | "makeindex" | "printindex" | "index" | "glossary" => {
             // Ignore these
@@ -3276,6 +3322,32 @@ pub(super) fn emit_siunitx(conv: &LatexConverter, pending: &PendingSiunitx, outp
         }
         SiunitxKind::Angle => {
             let _ = write!(output, "{}{}°{}", math_open, arg(0), math_close);
+        }
+    }
+}
+
+/// Drop a capitalized supplement word (e.g. `Section `/`Table~`) sitting at the
+/// end of `output`, so a `@ref` that re-inserts it does not double it (issue #43).
+fn strip_trailing_ref_supplement(output: &mut String) {
+    const SUPPLEMENTS: &[&str] = &[
+        "Section",
+        "Subsection",
+        "Subsubsection",
+        "Chapter",
+        "Table",
+        "Figure",
+        "Appendix",
+        "Part",
+    ];
+    let trimmed = output.trim_end_matches([' ', '\t', '~']);
+    for word in SUPPLEMENTS {
+        if let Some(prefix) = trimmed.strip_suffix(word) {
+            let boundary = prefix.is_empty()
+                || prefix.ends_with(|c: char| c.is_whitespace() || "~([{".contains(c));
+            if boundary {
+                output.truncate(prefix.len());
+                return;
+            }
         }
     }
 }

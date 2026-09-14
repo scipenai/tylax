@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **L2T tables**: `\cmidrule`/`\cline` column ranges are preserved, a source declaring its own rules switches off Typst's default full grid, and `|` separators from the column spec become `table.vline`. `||` is reported as a downgrade rather than silently drawn as one line (#43).
 - **L2T lists**: a nested list stays nested. The blank line emitted before every list ended the parent list too, flattening the structure (#43).
 - **L2T equation labels**: a label nested in `aligned`/`split` names the enclosing equation and is emitted once, outside the math body (#43).
+- **L2T citations**: with a manual `thebibliography`, `\cite{k}` resolves to `@k` against the rendered entry anchors, which compiles. Typst's `#cite(..)` needs a real `#bibliography(..)` that the manual path never emits, so the output previously failed with "the document does not contain a bibliography". Documents using external BibTeX keep `#cite(..)` unchanged (#37).
+- **L2T references**: `\eqref{k}` targets the label the document actually defines -- an injected `eq-` prefix pointed at a label that was never created -- and renders as `(2)` without Typst re-inserting a supplement the author already wrote (#43).
 
 ## [0.3.7] - 2026-07-18
 

@@ -1046,6 +1046,10 @@ fn convert_theorem(
 
 /// Convert a bibliography environment
 fn convert_bibliography(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut String) {
+    // Record the manual-bibliography event so `resolve_citations` rewrites
+    // `\cite{k}` to `@k`, matching the `<key>` anchors emitted below, instead
+    // of an uncompilable `#cite(<k>)` with no `#bibliography()`.
+    conv.citations.saw_manual_bib = true;
     conv.state.push_env(EnvironmentContext::Bibliography);
 
     output.push_str("\n= References\n\n");

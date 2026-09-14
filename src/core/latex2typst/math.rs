@@ -52,7 +52,12 @@ pub fn convert_curly(conv: &mut LatexConverter, elem: SyntaxElement, output: &mu
     };
 
     if let Some(pending) = conv.state.pending_citation.take() {
-        super::markup::emit_pending_citation_from_curly(&node, pending, output);
+        super::markup::emit_pending_citation_from_curly(
+            &node,
+            pending,
+            &mut conv.citations.pending,
+            output,
+        );
         return;
     }
 
