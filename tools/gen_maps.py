@@ -2,15 +2,20 @@
 """
 Generate Rust symbol mapping code for Tylax
 
-This script generates the maps.rs file containing symbol mappings.
+This script generates a baseline for the maps.rs symbol mappings.
 The mappings are based on tex2typst project but are now embedded directly.
+
+The checked-in map has accumulated mappings outside this legacy embedded data.
+Before writing, the script verifies that its output would not discard any
+existing public map or known key. If it would, it exits without modifying the
+file. Update the generator's source data first instead of overwriting maps.rs.
 
 Note: This script is only needed when you want to update the symbol mappings.
 For normal usage, the pre-generated maps.rs is sufficient.
 
 Usage:
-    python gen_maps.py                    # Use embedded mappings
-    python gen_maps.py path/to/map.ts     # Update from tex2typst source
+    python gen_maps.py                    # Regenerate only when lossless
+    python gen_maps.py path/to/map.ts     # Add mappings from tex2typst, then regenerate
 """
 
 import re
@@ -23,6 +28,10 @@ from pathlib import Path
 # ============================================================================
 
 SYMBOL_MAP = {
+    # Multi-integral symbols
+    "iiiint": "integral.quad",
+    "oiiint": "integral.vol",
+    "oiint": "integral.surf",
     # Greek lowercase
     "alpha": "alpha", "beta": "beta", "gamma": "gamma", "delta": "delta",
     "epsilon": "epsilon.alt", "varepsilon": "epsilon", "zeta": "zeta",
@@ -37,13 +46,19 @@ SYMBOL_MAP = {
     "Gamma": "Gamma", "Delta": "Delta", "Theta": "Theta", "Lambda": "Lambda",
     "Xi": "Xi", "Pi": "Pi", "Sigma": "Sigma", "Upsilon": "Upsilon",
     "Phi": "Phi", "Psi": "Psi", "Omega": "Omega",
+    # newtxmath/txfonts slanted capital Greek. Typst has no distinct slanted
+    # capital glyphs, so preserve the mathematical symbol with its plain form.
+    "varGamma": "Gamma", "varDelta": "Delta", "varTheta": "Theta",
+    "varLambda": "Lambda", "varXi": "Xi", "varPi": "Pi",
+    "varSigma": "Sigma", "varUpsilon": "Upsilon", "varPhi": "Phi",
+    "varPsi": "Psi", "varOmega": "Omega",
     
     # Binary operators
     "pm": "plus.minus", "mp": "minus.plus", "times": "times", "div": "div",
     "cdot": "dot.op", "ast": "ast", "star": "star", "circ": "circle.small",
     "bullet": "bullet", "oplus": "plus.o", "ominus": "minus.o",
     "otimes": "times.o", "oslash": "slash.o", "odot": "dot.o",
-    "cap": "sect", "cup": "union", "sqcap": "sect.sq", "sqcup": "union.sq",
+    "cap": "inter", "cup": "union", "sqcap": "sect.sq", "sqcup": "union.sq",
     "vee": "or", "wedge": "and", "setminus": "without",
     "wr": "wreath", "diamond": "diamond", "bigtriangleup": "triangle.t",
     "bigtriangledown": "triangle.b", "triangleleft": "triangle.l",
@@ -110,7 +125,7 @@ SYMBOL_MAP = {
     # Big operators
     "sum": "sum", "prod": "product", "coprod": "product.co",
     "int": "integral", "iint": "integral.double", "iiint": "integral.triple",
-    "oint": "integral.cont", "bigcap": "sect.big", "bigcup": "union.big",
+    "oint": "integral.cont", "bigcap": "inter.big", "bigcup": "union.big",
     "bigsqcup": "union.sq.big", "bigvee": "or.big", "bigwedge": "and.big",
     "bigoplus": "plus.o.big", "bigotimes": "times.o.big",
     "bigodot": "dot.o.big",
@@ -126,7 +141,7 @@ SYMBOL_MAP = {
     "hom": "hom", "ker": "ker", "Pr": "Pr", "deg": "deg",
     
     # Spacing
-    "displaystyle": "display", "textstyle": "inline",
+    "displaystyle": "display", "textstyle": "inline", "cal": "cal",
     "hspace": "#h", ",": "thin", ":": "med", ";": "thick",
     ">": "med", " ": "med", "~": "space.nobreak",
     
@@ -135,6 +150,8 @@ SYMBOL_MAP = {
     "widetilde": "tilde", "acute": "acute", "grave": "grave",
     "dot": "dot", "ddot": "dot.double", "dddot": "dot.triple",
     "breve": "breve", "bar": "macron", "vec": "arrow",
+    "overrightarrow": "arrow", "overleftarrow": "arrow.l",
+    "overleftrightarrow": "arrow.l.r",
     "overline": "overline", "underline": "underline",
     "overbrace": "overbrace", "underbrace": "underbrace",
     
@@ -154,10 +171,115 @@ SYMBOL_MAP = {
 # Format: "command_name": num_required_args
 # ============================================================================
 
+# Argument signature of each environment's `\begin{env}` header, in the same
+# glob language the commands use: `b` is an optional `[..]` slot, `t` a required
+# `{..}` one, and `{,X}` makes a slot optional.
+#
+# Without a signature the header's arguments are not bound and leak into the
+# body — and a "skip one leading bracket" heuristic cannot express a shape like
+# minipage's three optional slots, or multicols' required-before-optional order.
+# An environment absent from this table consumes nothing, which is correct:
+# after `\begin{center}` a `[x]` really is the text LaTeX prints.
+ENVIRONMENT_SIGNATURES = {
+    # Floats: `[htbp]` placement.
+    "figure": "{,b}", "figure*": "{,b}", "table": "{,b}", "table*": "{,b}",
+    "wrapfigure": "{,b}",
+    # enumitem and friends: `[label=.., itemsep=..]`.
+    "enumerate": "{,b}", "itemize": "{,b}", "description": "{,b}", "list": "{,b}",
+    # Layout / listing-style boxes.
+    "adjustbox": "{,b}", "tcolorbox": "{,b}",
+    "algorithm": "{,b}", "algorithmic": "{,b}",
+    "lstlisting": "{,b}",
+    # `\begin{minipage}[pos][height][inner-pos]{width}`
+    "minipage": "{,b}{,b}{,b}t",
+    # `\begin{multicols}{2}[Header]` — required slot BEFORE the optional one.
+    "multicols": "t{,b}", "multicols*": "t{,b}",
+    # `\begin{tabular}[pos]{cols}`; the starred/x forms take a width first.
+    "tabular": "{,b}t", "longtable": "{,b}t", "longtabu": "{,b}t", "array": "{,b}t",
+    "tabular*": "t{,b}t", "tabularx": "t{,b}t",
+}
+
+# Commands shaped `\cmd[optional]{required}`. A fixed arity cannot express the
+# optional argument: the parser then binds nothing at all and BOTH arguments
+# degrade to body text. They are emitted with a glob pattern instead.
+OPTIONAL_ARG_COMMANDS = [
+    "part", "chapter", "section", "subsection", "subsubsection",
+    "paragraph", "subparagraph",
+    # `\caption[short]{long}` — the short form is a list-of-figures entry.
+    "caption",
+    # `\sqrt[n]{x}` has the same shape; a fixed arity of 1 would drop the index.
+    "sqrt",
+    "dd",
+    "differential",
+    "hyperref",
+]
+
+# Commands whose glob shape is neither a fixed arity nor `{,b}t`:
+# `\cmd[opt]{a}{b}` and `\cmd[opt]{a}{b}{c}`.
+# Glob patterns that `maps.rs` has a local closure for. Anything outside this
+# table is still emitted, just spelled out in full.
+GLOB_CLOSURES = {
+    "{,b}t": "cmd1_opt",
+    "{,b}tt": "cmd2_opt",
+    "{,b}ttt": "cmd3_opt",
+}
+
+GLOB_ARG_COMMANDS = {
+    "derivative": "{,b}tt",
+    "dv": "{,b}tt",
+    "dv*": "{,b}tt",
+    "fderivative": "{,b}tt",
+    "fdv": "{,b}tt",
+    "fdv*": "{,b}tt",
+    "functionalderivative": "{,b}tt",
+    "partialderivative": "{,b}ttt",
+    "pderivative": "{,b}ttt",
+    "pdv": "{,b}ttt",
+    "pdv*": "{,b}ttt",
+}
+
+# Zero-argument commands with no Typst alias: known to the parser so
+# they are not mistaken for text, rendered by the converter.
+BARE_COMMANDS = [
+    "cp",
+    "cross",
+    "crossproduct",
+    "divisionsymbol",
+    "dotproduct",
+    "injlim",
+    "projlim",
+    "qall",
+    "qand",
+    "qas",
+    "qassume",
+    "qc",
+    "qcc",
+    "qcomma",
+    "qelse",
+    "qeven",
+    "qfor",
+    "qgiven",
+    "qif",
+    "qin",
+    "qinteger",
+    "qlet",
+    "qodd",
+    "qor",
+    "qotherwise",
+    "qsince",
+    "qthen",
+    "qunless",
+    "qusing",
+    "varinjlim",
+    "varprojlim",
+    "vdot",
+]
+
 COMMANDS_WITH_ARGS = {
     # Document structure (1 arg)
-    "part": 1, "chapter": 1, "section": 1, "subsection": 1, "subsubsection": 1,
-    "paragraph": 1, "title": 1, "author": 1, "date": 1, "caption": 1, "label": 1,
+    # NOTE: the sectioning commands are NOT here — they take an optional
+    # `[short title]` that a fixed arity cannot express. See OPTIONAL_ARG_COMMANDS.
+    "title": 1, "author": 1, "date": 1, "label": 1,
     
     # Macro definitions (2 args)
     "newcommand": 2, "renewcommand": 2, "providecommand": 2, "DeclareMathOperator": 2,
@@ -170,7 +292,8 @@ COMMANDS_WITH_ARGS = {
     
     # Accents (1 arg) - these override the symbol-only definitions
     "hat": 1, "widehat": 1, "tilde": 1, "widetilde": 1, "bar": 1,
-    "overline": 1, "underline": 1, "vec": 1, "dot": 1, "ddot": 1,
+    "overline": 1, "underline": 1, "vec": 1, "overleftarrow": 1,
+    "overleftrightarrow": 1, "overrightarrow": 1, "dot": 1, "ddot": 1,
     "overbrace": 1, "underbrace": 1, "check": 1, "acute": 1, "grave": 1,
     "breve": 1,
     
@@ -185,15 +308,33 @@ COMMANDS_WITH_ARGS = {
     "mathopen": 1, "mathclose": 1, "mathpunct": 1, "mathinner": 1,
     
     # Misc math (1 arg)
+    # `textcircled` must stay here: without a pattern mitex leaves `{..}` as a
+    # following sibling instead of binding it, and the converter can no longer
+    # see the operator it wraps, so `\textcircled{\cdot}` loses its circle.
     "pmod": 1, "pod": 1, "displaylines": 1, "set": 1, "Set": 1,
-    "sqrt": 1, "not": 1, "phantom": 1, "cancel": 1, "bcancel": 1,
+    "not": 1, "phantom": 1, "cancel": 1, "bcancel": 1,
     "boxed": 1, "fbox": 1, "hspace": 1, "hspace*": 1, "vspace": 1, "vspace*": 1,
+    "textcircled": 1,
     
     # Fractions and roots (2 args)
     "frac": 2, "dfrac": 2, "tfrac": 2, "cfrac": 2, "binom": 2,
     
-    # Colors (1-2 args)
-    "textcolor": 2, "colorbox": 2, "color": 1,
+    # Colors (1-3 args)
+    "textcolor": 2, "colorbox": 2, "color": 1, "fcolorbox": 3,
+    "highlight": 1, "hl": 1,
+
+    # Table cell spans (3 args)
+    "multicolumn": 3, "multirow": 3,
+
+    # Bibliography entry: `ibitem{key}`
+    "bibitem": 1,
+
+    # Extensible arrow variants (1 arg)
+    "xLeftarrow": 1, "xLeftrightarrow": 1, "xRightarrow": 1,
+    "xhookleftarrow": 1, "xhookrightarrow": 1, "xleftharpoondown": 1,
+    "xleftharpoonup": 1, "xleftrightharpoons": 1, "xlongequal": 1,
+    "xrightharpoondown": 1, "xrightharpoonup": 1, "xrightleftharpoons": 1,
+    "xtofrom": 1, "xtwoheadleftarrow": 1, "xtwoheadrightarrow": 1,
     
     # Links (1-2 args)
     "url": 1, "href": 2,
@@ -215,57 +356,631 @@ COMMANDS_WITH_ARGS = {
     
     # Special cite command
     "typstcite": 1,
+    # Physics / mathtools commands that `maps.rs` carried only through its
+    # local `cmd1()`/`cmd2()`/`cmd3()` shorthands.
+    "Bqty": 1, "PV": 1, "Pmqty": 1, "Res": 1, "Residue": 1, "abs": 1, "abs*": 1, "absolutevalue": 1, "admat": 1, "antidiagonalmatrix": 1, "bmqty": 1, "bqty": 1, "bra": 1, "bra*": 1, "curl": 1, "diagonalmatrix": 1, "divergence": 1, "dmat": 1, "eval": 1, "eval*": 1, "evaluated": 1, "grad": 1, "gradient": 1, "identitymatrix": 1, "imat": 1, "ket": 1, "ket*": 1, "laplacian": 1, "matrixdeterminant": 1, "matrixquantity": 1, "mdet": 1, "mqty": 1, "norm": 1, "norm*": 1, "order": 1, "order*": 1, "paulimatrix": 1, "pmat": 1, "pmqty": 1, "pqty": 1, "principalvalue": 1, "pv": 1, "qq": 1, "qqtext": 1, "sPmqty": 1, "sbmqty": 1, "smallmatrixdeterminant": 1, "smallmatrixquantity": 1, "smdet": 1, "smqty": 1, "spmqty": 1, "svmqty": 1, "va": 1, "var": 1, "variation": 1, "vb": 1, "vectorarrow": 1, "vectorbold": 1, "vectorunit": 1, "vev": 1, "vmqty": 1, "vqty": 1, "vu": 1,
+    "acomm": 2, "acomm*": 2, "acommutator": 2, "anticommutator": 2, "braket": 2, "braket*": 2, "comm": 2, "comm*": 2, "commutator": 2, "dyad": 2, "dyad*": 2, "ev": 2, "ev*": 2, "expectationvalue": 2, "expval": 2, "expval*": 2, "flatfrac": 2, "innerproduct": 2, "ip": 2, "ketbra": 2, "op": 2, "outerproduct": 2, "pb": 2, "pb*": 2, "poissonbracket": 2, "zeromatrix": 2, "zmat": 2,
+    "matrixel": 3, "matrixelement": 3, "mel": 3, "mel*": 3, "xmat": 3, "xmatrix": 3,
+}
+
+DELIMITER_MAP = {
+    # Typst delimiter -> LaTeX, for lr() conversion.
+    # Parentheses
+    '(': '(',
+    ')': ')',
+    'paren.l': '(',
+    'paren.r': ')',
+    # Brackets
+    '[': '[',
+    ']': ']',
+    'bracket.l': '[',
+    'bracket.r': ']',
+    # Braces
+    '{': '\\{',
+    '}': '\\}',
+    'brace.l': '\\{',
+    'brace.r': '\\}',
+    # Single bars
+    '|': '|',
+    'bar.v': '|',
+    'vert': '|',
+    # Double bars
+    '||': '\\|',
+    'bar.v.double': '\\|',
+    'vert.double': '\\|',
+    # Angle brackets (Unicode)
+    '⟨': '\\langle',
+    '⟩': '\\rangle',
+    '〈': '\\langle',
+    '〉': '\\rangle',
+    # Angle brackets (Typst names)
+    'angle.l': '\\langle',
+    'angle.r': '\\rangle',
+    'chevron.l': '\\langle',
+    'chevron.r': '\\rangle',
+    # Floor (Unicode)
+    '⌊': '\\lfloor',
+    '⌋': '\\rfloor',
+    # Floor (Typst names)
+    'floor.l': '\\lfloor',
+    'floor.r': '\\rfloor',
+    # Ceiling (Unicode)
+    '⌈': '\\lceil',
+    '⌉': '\\rceil',
+    # Ceiling (Typst names)
+    'ceil.l': '\\lceil',
+    'ceil.r': '\\rceil',
 }
 
 TYPST_TO_TEX = {
-    # Greek lowercase
-    "alpha": "alpha", "beta": "beta", "gamma": "gamma", "delta": "delta",
-    "epsilon": "varepsilon", "epsilon.alt": "epsilon", "zeta": "zeta",
-    "eta": "eta", "theta": "theta", "theta.alt": "vartheta",
-    "iota": "iota", "kappa": "kappa", "lambda": "lambda", "mu": "mu",
-    "nu": "nu", "xi": "xi", "pi": "pi", "pi.alt": "varpi",
-    "rho": "rho", "rho.alt": "varrho", "sigma": "sigma", "sigma.alt": "varsigma",
-    "tau": "tau", "upsilon": "upsilon", "phi": "varphi", "phi.alt": "phi",
-    "chi": "chi", "psi": "psi", "omega": "omega",
-    
-    # Greek uppercase
-    "Gamma": "Gamma", "Delta": "Delta", "Theta": "Theta", "Lambda": "Lambda",
-    "Xi": "Xi", "Pi": "Pi", "Sigma": "Sigma", "Upsilon": "Upsilon",
-    "Phi": "Phi", "Psi": "Psi", "Omega": "Omega",
-    
-    # Operators
-    "plus.minus": "pm", "minus.plus": "mp", "times": "times", "div": "div",
-    "dot.op": "cdot", "sect": "cap", "union": "cup",
-    "plus.o": "\\oplus", "plus.o.big": "\\bigoplus",
-    "minus.o": "\\ominus",
-    "times.o": "\\otimes", "times.o.big": "\\bigotimes",
-    "dot.o": "\\odot", "dot.o.big": "\\bigodot",
-    "slash.o": "\\oslash",
-    "lt.eq": "leq", "gt.eq": "geq", "eq.not": "neq",
-    "approx": "approx", "equiv": "equiv", "tilde.op": "sim",
-    "subset": "subset", "supset": "supset", "subset.eq": "subseteq",
-    "supset.eq": "supseteq", "in": "in", "in.not": "notin",
-    "forall": "forall", "exists": "exists", "not": "neg",
-    
-    # Arrows
-    "arrow.r": "rightarrow", "arrow.l": "leftarrow",
-    "arrow.l.r": "leftrightarrow", "arrow.r.double": "Rightarrow",
-    "arrow.l.double": "Leftarrow", "arrow.l.r.double": "Leftrightarrow",
-    
+    # Typst -> LaTeX symbol mapping, emitted as a phf map.
+    # =========================================================================
+    'Delta': 'Delta',
+    'Gamma': 'Gamma',
+    'Lambda': 'Lambda',
+    'Omega': 'Omega',
+    'Phi': 'Phi',
+    'Pi': 'Pi',
+    'Psi': 'Psi',
+    'Sigma': 'Sigma',
+    'Theta': 'Theta',
+    'Upsilon': 'Upsilon',
+    'Xi': 'Xi',
+    # =========================================================================
+    'alpha': 'alpha',
+    'beta': 'beta',
+    'gamma': 'gamma',
+    'delta': 'delta',
+    'epsilon': 'varepsilon',
+    'epsilon.alt': 'epsilon',
+    'zeta': 'zeta',
+    'eta': 'eta',
+    'theta': 'theta',
+    'theta.alt': 'vartheta',
+    'iota': 'iota',
+    'kappa': 'kappa',
+    'kappa.alt': 'varkappa',
+    'lambda': 'lambda',
+    'mu': 'mu',
+    'nu': 'nu',
+    'xi': 'xi',
+    'pi': 'pi',
+    'pi.alt': 'varpi',
+    'rho': 'rho',
+    'rho.alt': 'varrho',
+    'sigma': 'sigma',
+    'sigma.alt': 'varsigma',
+    'tau': 'tau',
+    'upsilon': 'upsilon',
+    'phi': 'varphi',
+    'phi.alt': 'phi',
+    'chi': 'chi',
+    'psi': 'psi',
+    'omega': 'omega',
+    # =========================================================================
+    'arrow.r': 'rightarrow',
+    'arrow.l': 'leftarrow',
+    'arrow.t': 'uparrow',
+    'arrow.b': 'downarrow',
+    'arrow.l.r': 'leftrightarrow',
+    'arrow.t.b': 'updownarrow',
+    'arrow.r.double': 'Rightarrow',
+    'arrow.l.double': 'Leftarrow',
+    'arrow.t.double': 'Uparrow',
+    'arrow.b.double': 'Downarrow',
+    'arrow.l.r.double': 'Leftrightarrow',
+    'arrow.t.b.double': 'Updownarrow',
+    'arrow.r.long': 'longrightarrow',
+    'arrow.l.long': 'longleftarrow',
+    'arrow.l.r.long': 'longleftrightarrow',
+    'arrow.r.double.long': 'Longrightarrow',
+    'arrow.l.double.long': 'Longleftarrow',
+    'arrow.l.r.double.long': 'Longleftrightarrow',
+    'arrow.r.tail': 'rightarrowtail',
+    'arrow.l.tail': 'leftarrowtail',
+    'arrow.r.hook': 'hookrightarrow',
+    'arrow.l.hook': 'hookleftarrow',
+    'arrow.r.squiggly': 'rightsquigarrow',
+    'arrow.l.squiggly': 'leftsquigarrow',
+    'arrow.r.twohead': 'twoheadrightarrow',
+    'arrow.l.twohead': 'twoheadleftarrow',
+    'arrow.r.bar': 'mapsto',
+    'arrow.l.bar': 'mapsfrom',
+    'arrow.r.long.bar': 'longmapsto',
+    'harpoon.rt': 'rightharpoonup',
+    'harpoon.rb': 'rightharpoondown',
+    'harpoon.lt': 'leftharpoonup',
+    'harpoon.lb': 'leftharpoondown',
+    'harpoons.ltrb': 'leftrightharpoons',
+    'harpoons.rtlb': 'rightleftharpoons',
+    'arrows.rr': 'rightrightarrows',
+    'arrows.ll': 'leftleftarrows',
+    'arrows.lr': 'leftrightarrows',
+    'arrows.rl': 'rightleftarrows',
+    'arrow.ne': 'nearrow',
+    'arrow.se': 'searrow',
+    'arrow.sw': 'swarrow',
+    'arrow.nw': 'nwarrow',
+    # =========================================================================
+    'plus.minus': 'pm',
+    'minus.plus': 'mp',
+    'times': 'times',
+    'div': 'div',
+    'ast': 'ast',
+    'star': 'star',
+    'circle.small': 'circ',
+    'bullet': 'bullet',
+    'dot.op': 'cdot',
+    'dot.c': 'cdot',
+    'circle.plus': 'oplus',
+    'circle.minus': 'ominus',
+    'circle.times': 'otimes',
+    'circle.div': 'oslash',
+    'circle.dot': 'odot',
+    'square.plus': 'boxplus',
+    'square.minus': 'boxminus',
+    'square.times': 'boxtimes',
+    'square.dot': 'boxdot',
+    'wreath': 'wr',
+    'diamond.op': 'diamond',
+    'triangle.t': 'bigtriangleup',
+    'triangle.b': 'bigtriangledown',
+    'triangle.l': 'triangleleft',
+    'triangle.r': 'triangleright',
+    'dagger': 'dagger',
+    'dagger.double': 'ddagger',
+    'amalg': 'amalg',
+    'sect': 'cap',
+    'union': 'cup',
+    'sect.sq': 'sqcap',
+    'union.sq': 'sqcup',
+    'sect.big': 'bigcap',
+    'union.big': 'bigcup',
+    'union.sq.big': 'bigsqcup',
+    'sect.sq.big': 'bigsqcap',
+    'and': 'wedge',
+    'or': 'vee',
+    'and.big': 'bigwedge',
+    'or.big': 'bigvee',
+    'plus.circle': 'oplus',
+    'plus.circle.big': 'bigoplus',
+    'times.circle': 'otimes',
+    'times.circle.big': 'bigotimes',
+    'dot.circle.big': 'bigodot',
+    # pre-0.12 deprecated form kept for backward compatibility.
+    'plus.o': '\\oplus',
+    'plus.o.big': '\\bigoplus',
+    'minus.o': '\\ominus',
+    'times.o': '\\otimes',
+    'times.o.big': '\\bigotimes',
+    'dot.o': '\\odot',
+    'dot.o.big': '\\bigodot',
+    'slash.o': '\\oslash',
+    # =========================================================================
+    'lt': 'lt',
+    'gt': 'gt',
+    'lt.eq': 'leq',
+    'gt.eq': 'geq',
+    'lt.eq.slant': 'leqslant',
+    'gt.eq.slant': 'geqslant',
+    'lt.double': 'll',
+    'gt.double': 'gg',
+    'lt.triple': 'lll',
+    'gt.triple': 'ggg',
+    'lt.not': 'nless',
+    'gt.not': 'ngtr',
+    'lt.eq.not': 'nleq',
+    'gt.eq.not': 'ngeq',
+    'eq': 'eq',
+    'eq.not': 'neq',
+    'equiv': 'equiv',
+    'equiv.not': 'nequiv',
+    'approx': 'approx',
+    'approx.not': 'napprox',
+    'tilde.op': 'sim',
+    'tilde.eq': 'simeq',
+    'tilde.eq.not': 'nsimeq',
+    'tilde.equiv': 'cong',
+    'tilde.equiv.not': 'ncong',
+    'prop': 'propto',
+    'prec': 'prec',
+    'succ': 'succ',
+    'prec.eq': 'preceq',
+    'succ.eq': 'succeq',
+    'prec.not': 'nprec',
+    'succ.not': 'nsucc',
+    'subset': 'subset',
+    'supset': 'supset',
+    'subset.eq': 'subseteq',
+    'supset.eq': 'supseteq',
+    'subset.not': 'nsubset',
+    'supset.not': 'nsupset',
+    'subset.eq.not': 'nsubseteq',
+    'supset.eq.not': 'nsupseteq',
+    'subset.sq': 'sqsubset',
+    'supset.sq': 'sqsupset',
+    'subset.eq.sq': 'sqsubseteq',
+    'supset.eq.sq': 'sqsupseteq',
+    'in': 'in',
+    'in.not': 'notin',
+    'in.rev': 'ni',
+    'in.rev.not': 'notni',
+    'divides': 'mid',
+    'divides.not': 'nmid',
+    'parallel': 'parallel',
+    'parallel.not': 'nparallel',
+    'perp': 'perp',
+    'models': 'models',
+    'forces': 'Vdash',
+    'tack.r': 'vdash',
+    'tack.l': 'dashv',
+    'tack.t': 'top',
+    'tack.b': 'bot',
+    'tack.r.double': 'vDash',
+    'tack.l.double': 'Dashv',
+    'tack.r.not': 'nvdash',
+    'tack.r.double.not': 'nvDash',
+    'colon': 'colon',
+    'coloneq': 'coloneqq',
+    'eqcolon': 'eqqcolon',
+    'doteq': 'doteq',
+    'asymp': 'asymp',
+    'bowtie': 'bowtie',
+    'smile': 'smile',
+    'frown': 'frown',
+    # =========================================================================
+    'sum': 'sum',
+    'product': 'prod',
+    'coproduct': 'coprod',
+    'integral': 'int',
+    'integral.double': 'iint',
+    'integral.triple': 'iiint',
+    'integral.quad': 'iiiint',
+    'integral.cont': 'oint',
+    'integral.surf': 'oiint',
+    'integral.vol': 'oiiint',
+    # =========================================================================
+    'sin': 'sin',
+    'cos': 'cos',
+    'tan': 'tan',
+    'cot': 'cot',
+    'sec': 'sec',
+    'csc': 'csc',
+    'arcsin': 'arcsin',
+    'arccos': 'arccos',
+    'arctan': 'arctan',
+    'sinh': 'sinh',
+    'cosh': 'cosh',
+    'tanh': 'tanh',
+    'coth': 'coth',
+    'exp': 'exp',
+    'log': 'log',
+    'ln': 'ln',
+    'lg': 'lg',
+    'lim': 'lim',
+    'limsup': 'limsup',
+    'liminf': 'liminf',
+    'max': 'max',
+    'min': 'min',
+    'sup': 'sup',
+    'inf': 'inf',
+    'arg': 'arg',
+    'det': 'det',
+    'dim': 'dim',
+    'gcd': 'gcd',
+    'lcm': 'operatorname{lcm}',
+    'deg': 'deg',
+    'hom': 'hom',
+    'ker': 'ker',
+    'Pr': 'Pr',
+    'Im': 'Im',
+    'Re': 'Re',
+    'argmin': 'argmin',
+    'argmax': 'argmax',
+    # =========================================================================
+    'paren.l': '(',
+    'paren.r': ')',
+    'bracket.l': '[',
+    'bracket.r': ']',
+    'brace.l': '\\{',
+    'brace.r': '\\}',
+    'chevron.l': 'langle',
+    'chevron.r': 'rangle',
+    'angle.l': 'langle',
+    'angle.r': 'rangle',
+    'floor.l': 'lfloor',
+    'floor.r': 'rfloor',
+    'ceil.l': 'lceil',
+    'ceil.r': 'rceil',
+    'vert': 'vert',
+    'vert.double': 'Vert',
+    'bar.v': '|',
+    'bar.v.double': '\\|',
+    # =========================================================================
+    'infinity': 'infty',
+    'oo': 'infty',
+    'diff': 'partial',
+    'partial': 'partial',
+    'nabla': 'nabla',
+    'gradient': 'nabla',
+    'laplace': 'Delta',
+    'emptyset': 'emptyset',
+    'nothing': 'varnothing',
+    'aleph': 'aleph',
+    'beth': 'beth',
+    'gimel': 'gimel',
+    'daleth': 'daleth',
+    'ell': 'ell',
+    'planck': 'hbar',
+    'planck.reduce': 'hbar',
+    'hbar': 'hbar',
+    'imath': 'imath',
+    'jmath': 'jmath',
+    'wp': 'wp',
+    'prime': 'prime',
+    'forall': 'forall',
+    'exists': 'exists',
+    'exists.not': 'nexists',
+    'not': 'neg',
+    'complement': 'complement',
+    'circle': 'circ',
+    'degree': 'degree',
+    'angle': 'angle',
+    'angle.arc': 'measuredangle',
+    'angle.spheric': 'sphericalangle',
+    'diameter': 'diameter',
+    'therefore': 'therefore',
+    'because': 'because',
+    'qed': 'square',
+    'square': 'square',
+    'square.stroked': 'square',
+    'square.filled': 'blacksquare',
+    'checkmark': 'checkmark',
+    'ballot': 'times',
+    # =========================================================================
+    'dots': 'ldots',
+    'dots.h': 'ldots',
+    'dots.c': 'cdots',
+    'dots.v': 'vdots',
+    'dots.down': 'ddots',
+    'dots.up': 'iddots',
+    # =========================================================================
+    'space': '\\ ',
+    'space.thin': '\\,',
+    'space.med': '\\:',
+    'space.thick': '\\;',
+    'space.quad': '\\quad',
+    'space.wide': '\\qquad',
+    'space.neg': '\\!',
+    # =========================================================================
+    'hat': 'hat',
+    'grave': 'grave',
+    'acute': 'acute',
+    'tilde': 'tilde',
+    'macron': 'bar',
+    'breve': 'breve',
+    'dot': 'cdot',
+    'diaer': 'ddot',
+    'caron': 'check',
+    'circle.stroked.tiny': 'mathring',
+    'vec': 'vec',
+    # =========================================================================
+    'suit.club': 'clubsuit',
+    'suit.diamond': 'diamondsuit',
+    'suit.heart': 'heartsuit',
+    'suit.spade': 'spadesuit',
+    # =========================================================================
+    'sharp': 'sharp',
+    'flat': 'flat',
+    'natural': 'natural',
+    # =========================================================================
+    'dollar': '\\$',
+    'euro': 'euro',
+    'pound': 'pounds',
+    'yen': 'textyen',
+    'percent': '\\%',
+    'copyright': 'copyright',
+    'trademark': 'texttrademark',
+    'registered': 'textregistered',
+    'section': 'S',
+    'paragraph': 'P',
+    'star.filled': 'bigstar',
+    # =========================================================================
+    'dif': 'mathrm{d}',
+    'RR': 'mathbb{R}',
+    'NN': 'mathbb{N}',
+    'ZZ': 'mathbb{Z}',
+    'QQ': 'mathbb{Q}',
+    'CC': 'mathbb{C}',
+    'AA': 'forall',
+    'EE': 'exists',
+    # Shorthand arrows
+    '->': 'rightarrow',
+    '<-': 'leftarrow',
+    '=>': 'Rightarrow',
+    '<=>': 'Leftrightarrow',
+    '<->': 'leftrightarrow',
+    '-->': 'longrightarrow',
+    '<--': 'longleftarrow',
+    '==>': 'Longrightarrow',
+    '<==': 'Longleftarrow',
+    '<==>': 'Longleftrightarrow',
+    '<-->': 'longleftrightarrow',
+    '|->': 'mapsto',
+    '|=>': 'Mapsto',
+    '~>': 'rightsquigarrow',
+    '<~': 'leftsquigarrow',
+    '~~>': 'leadsto',
+    '->>': 'twoheadrightarrow',
+    '<<-': 'twoheadleftarrow',
+    '>->': 'rightarrowtail',
+    '<-<': 'leftarrowtail',
+    # Shorthand operators
+    '!=': 'neq',
+    '>=': 'geq',
+    '<=': 'leq',
+    '>>': 'gg',
+    '<<': 'll',
+    '>>>': 'ggg',
+    '<<<': 'lll',
+    '||': '|',
+    ':=': 'coloneqq',
+    '=:': 'eqqcolon',
+    '::=': 'Coloneqq',
+    '...': 'ldots',
+    # Additional Typst symbols
+    'hyph': '-',
+    'hyph.minus': '-',
+    'comma': ',',
+    'thin': ',',
+    'med': ':',
+    'thick': ';',
+    'space.nobreak': '~',
+    'eq.def': 'overset{\\text{def}}{=}',
+    'eq.delta': 'triangleq',
+    'eq.star': 'stackrel{*}{=}',
+    'eq.quest': 'stackrel{?}{=}',
+    # Additional unique symbols
+    'star.op': '*',
+    # Greek uppercase (trivial — rendered as Roman letters in LaTeX)
+    'Alpha': 'A',
+    'Beta': 'B',
+    'Chi': 'X',
+    'Digamma': '\\Digamma',
+    'Epsilon': 'E',
+    'Eta': 'H',
+    'Iota': 'I',
+    'Kappa': 'K',
+    'Mu': 'M',
+    'Nu': 'N',
+    'Omicron': 'O',
+    'Rho': 'P',
+    'Tau': 'T',
+    'Zeta': 'Z',
+    'digamma': '\\digamma',
+    # Blackboard bold (missing letters)
+    'BB': '\\mathbb{B}',
+    'DD': '\\mathbb{D}',
+    'FF': '\\mathbb{F}',
+    'GG': '\\mathbb{G}',
+    'HH': '\\mathbb{H}',
+    'II': '\\mathbb{I}',
+    'JJ': '\\mathbb{J}',
+    'KK': '\\mathbb{K}',
+    'LL': '\\mathbb{L}',
+    'MM': '\\mathbb{M}',
+    'OO': '\\mathbb{O}',
+    'PP': '\\mathbb{P}',
+    'SS': '\\mathbb{S}',
+    'TT': '\\mathbb{T}',
+    'UU': '\\mathbb{U}',
+    'VV': '\\mathbb{V}',
+    'WW': '\\mathbb{W}',
+    'XX': '\\mathbb{X}',
+    'YY': '\\mathbb{Y}',
+    # Arrows (negated/curved variants)
+    'arrow.r.not': '\\nrightarrow',
+    'arrow.l.not': '\\nleftarrow',
+    'arrow.r.double.not': '\\nRightarrow',
+    'arrow.l.double.not': '\\nLeftarrow',
+    'arrow.l.r.not': '\\nleftrightarrow',
+    'arrow.l.r.double.not': '\\nLeftrightarrow',
+    'arrow.l.r.wave': '\\leftrightsquigarrow',
+    'arrow.ccw': '\\curvearrowleft',
+    'arrow.cw': '\\curvearrowright',
+    # Comparison variants
+    'lt.approx': '\\lessapprox',
+    'lt.equiv': '\\leqq',
+    'lt.gt': '\\lessgtr',
+    'lt.tilde': '\\lesssim',
+    'lt.tri': '\\vartriangleleft',
+    'lt.tri.eq': '\\trianglelefteq',
+    'lt.tri.not': '\\ntriangleleft',
+    'lt.tri.eq.not': '\\ntrianglelefteq',
+    'gt.approx': '\\gtrapprox',
+    'gt.equiv': '\\geqq',
+    'gt.lt': '\\gtrless',
+    'gt.tilde': '\\gtrsim',
+    'gt.tri': '\\vartriangleright',
+    'gt.tri.eq': '\\trianglerighteq',
+    'gt.tri.not': '\\ntriangleright',
+    'gt.tri.eq.not': '\\ntrianglerighteq',
+    # Precedence / Succession variants
+    'prec.approx': '\\precapprox',
+    'prec.curly.eq': '\\preccurlyeq',
+    'prec.curly.eq.not': '\\npreccurlyeq',
+    'prec.tilde': '\\precsim',
+    'succ.approx': '\\succapprox',
+    'succ.curly.eq': '\\succcurlyeq',
+    'succ.curly.eq.not': '\\nsucccurlyeq',
+    'succ.tilde': '\\succsim',
+    # Tilde / Approx variants
+    'tilde.not': '\\nsim',
+    'tilde.rev': '\\backsim',
+    'tilde.rev.equiv': '\\backcong',
+    'approx.eq': '\\approxeq',
+    'forces.not': '\\nVdash',
+    # Set operation variants
+    'subset.double': '\\Subset',
+    'subset.neq': '\\subsetneq',
+    'supset.double': '\\Supset',
+    'supset.neq': '\\supsetneq',
+    'union.dot': '\\cupdot',
+    'union.double': '\\Cup',
+    'union.plus': '\\uplus',
+    'inter': '\\cap',
+    'inter.big': '\\bigcap',
+    'inter.double': '\\Cap',
+    'inter.sq': '\\sqcap',
+    'without': '\\setminus',
+    # Binary operator variants
+    'plus': '+',
+    'plus.square': '\\boxplus',
+    'minus': '-',
+    'minus.circle': '\\ominus',
+    'minus.square': '\\boxminus',
+    'times.square': '\\boxtimes',
+    'dot.circle': '\\odot',
+    'ast.op': '\\ast',
+    'xor': '\\oplus',
+    'xor.big': '\\bigoplus',
+    'product.co': '\\coprod',
+    'dots.h.c': '\\cdots',
+    # Triangle variants
+    'triangle.stroked.t': '\\triangle',
+    'triangle.stroked.b': '\\triangledown',
+    'triangle.stroked.r': '\\triangleright',
+    'triangle.stroked.l': '\\triangleleft',
+    'triangle.stroked.small.t': '\\vartriangle',
+    'triangle.filled.t': '\\blacktriangle',
+    'triangle.filled.b': '\\blacktriangledown',
+    'triangle.filled.r': '\\blacktriangleright',
+    'triangle.filled.l': '\\blacktriangleleft',
+    # Delimiter variants
+    'angle.l.double': '\\lAngle',
+    'angle.r.double': '\\rAngle',
+    'shell.l': '\\lgroup',
+    'shell.r': '\\rgroup',
+    # Shapes
+    'circle.stroked': '\\circ',
+    'circle.stroked.small': '\\circ',
+    'diamond.stroked': '\\diamond',
+    'diamond.stroked.small': '\\diamond',
+    # Dotless letters
+    'dotless.i': '\\imath',
+    'dotless.j': '\\jmath',
+    # Suits
+    'suit.club.filled': '\\clubsuit',
+    'suit.spade.filled': '\\spadesuit',
+    'suit.heart.stroked': '\\heartsuit',
+    'suit.diamond.stroked': '\\diamondsuit',
     # Misc
-    "infinity": "infty", "emptyset": "emptyset",
-    "diff": "partial", "nabla": "nabla",
-    "sum": "sum", "product": "prod", "integral": "int",
-    
-    # Functions
-    "sin": "sin", "cos": "cos", "tan": "tan", "log": "log", "ln": "ln",
-    "exp": "exp", "lim": "lim", "max": "max", "min": "min",
-    
-    # Dots
-    "dots.h": "ldots", "dots.c": "cdots", "dots.v": "vdots",
-    
-    # Special
-    "oo": "infty",
+    'join': '\\bowtie',
+    'maltese': '\\maltese',
+    'pilcrow': '\\P',
+    'prime.double': '\\prime\\prime',
+    'harpoons.rtlt': '\\upharpoonright\\!\\upharpoonleft',
+    'space.en': '\\;',
 }
 
 def escape_rust_string(s):
@@ -280,13 +995,13 @@ def generate_rust_code():
     - phf::phf_map! for TYPST_TO_TEX (compile-time perfect hash)
     """
     lines = [
-        "// Generated by tools/gen_maps.py",
-        "// This file contains static symbol mappings from tex2typst project",
-        "// Do not edit manually - regenerate using: python tools/gen_maps.py",
+        "// Static symbol mappings derived from tex2typst and project-specific additions.",
+        "// Regenerate with `python tools/gen_maps.py`, which refuses an overwrite that",
+        "// would drop or alter any mapping. Keep edits here and in the generator in step.",
         "",
-        "use mitex_spec::{CommandSpec, CommandSpecItem, CmdShape, ArgShape, ArgPattern};",
         "use fxhash::FxHashMap;",
         "use lazy_static::lazy_static;",
+        "use mitex_spec::{ArgPattern, ArgShape, CmdShape, CommandSpec, CommandSpecItem, GlobStr};",
         "use phf::phf_map;",
         "",
         "// =============================================================================",
@@ -299,6 +1014,46 @@ def generate_rust_code():
         "    pub static ref TEX_COMMAND_SPEC: CommandSpec = {",
         "        let mut m = FxHashMap::default();",
     ]
+    lines.append('        // Helper closures for conciseness: these shapes repeat')
+    lines.append('        // hundreds of times, and the guards in tests/integration_tests.rs')
+    lines.append('        // expand their names when comparing this file with the generator.')
+    lines.append('        let cmd1 = || CommandSpecItem::Cmd(CmdShape {')
+    lines.append('            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },')
+    lines.append('            alias: None,')
+    lines.append('        });')
+    lines.append('        let cmd2 = || CommandSpecItem::Cmd(CmdShape {')
+    lines.append('            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },')
+    lines.append('            alias: None,')
+    lines.append('        });')
+    lines.append('        let cmd3 = || CommandSpecItem::Cmd(CmdShape {')
+    lines.append('            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 3 } },')
+    lines.append('            alias: None,')
+    lines.append('        });')
+    lines.append('        let cmd1_opt = || CommandSpecItem::Cmd(CmdShape {')
+    lines.append('            args: ArgShape::Right {')
+    lines.append('                pattern: ArgPattern::Glob {')
+    lines.append('                    pattern: GlobStr::from("{,b}t"),')
+    lines.append('                },')
+    lines.append('            },')
+    lines.append('            alias: None,')
+    lines.append('        });')
+    lines.append('        let cmd2_opt = || CommandSpecItem::Cmd(CmdShape {')
+    lines.append('            args: ArgShape::Right {')
+    lines.append('                pattern: ArgPattern::Glob {')
+    lines.append('                    pattern: GlobStr::from("{,b}tt"),')
+    lines.append('                },')
+    lines.append('            },')
+    lines.append('            alias: None,')
+    lines.append('        });')
+    lines.append('        let cmd3_opt = || CommandSpecItem::Cmd(CmdShape {')
+    lines.append('            args: ArgShape::Right {')
+    lines.append('                pattern: ArgPattern::Glob {')
+    lines.append('                    pattern: GlobStr::from("{,b}ttt"),')
+    lines.append('                },')
+    lines.append('            },')
+    lines.append('            alias: None,')
+    lines.append('        });')
+    lines.append('')
     
     # Generate CommandSpec entries for symbols (no args)
     for cmd, alias in sorted(SYMBOL_MAP.items()):
@@ -319,6 +1074,28 @@ def generate_rust_code():
     lines.append('            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },')
     lines.append('            alias: Some("__typstcite__".to_string()),')
     lines.append('        }));')
+
+    # `\\item` has no required argument, but its optional `[...]` label must be
+    # parsed for description lists. This cannot be represented by the fixed-arity
+    # COMMANDS_WITH_ARGS table.
+    lines.append('        m.insert("item".to_string(), CommandSpecItem::Cmd(CmdShape {')
+    lines.append('            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}") } },')
+    lines.append('            alias: None,')
+    lines.append('        }));')
+
+    # These take an optional `[..]` before the required argument, so a fixed
+    # arity would leave the `[..]` unconsumed: the parser then binds no argument
+    # at all and the whole construct degrades to body text.
+    for cmd in OPTIONAL_ARG_COMMANDS:
+        lines.append(f'        m.insert("{cmd}".to_string(), cmd1_opt());')
+
+    # Zero-argument commands the parser must know but that have no alias
+    for cmd in sorted(BARE_COMMANDS):
+        cmd_esc = escape_rust_string(cmd)
+        lines.append(f'        m.insert("{cmd_esc}".to_string(), CommandSpecItem::Cmd(CmdShape {{')
+        lines.append('            args: ArgShape::Right { pattern: ArgPattern::None },')
+        lines.append('            alias: None,')
+        lines.append('        }));')
     
     # Add aligned environment
     lines.append('        m.insert("aligned".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {')
@@ -326,17 +1103,44 @@ def generate_rust_code():
     lines.append('            ctx_feature: mitex_spec::ContextFeature::None,')
     lines.append('            alias: None,')
     lines.append('        }));')
+
+    # Environment header signatures (see ENVIRONMENT_SIGNATURES).
+    for env, pattern in ENVIRONMENT_SIGNATURES.items():
+        env_esc = escape_rust_string(env)
+        lines.append(f'        m.insert("{env_esc}".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {{')
+        lines.append(f'            args: ArgPattern::Glob {{ pattern: GlobStr::from("{pattern}") }},')
+        lines.append('            ctx_feature: mitex_spec::ContextFeature::None,')
+        lines.append('            alias: None,')
+        lines.append('        }));')
     
     lines.append('')
     lines.append('        // Commands with required arguments')
-    
+
     # Generate CommandSpec entries for commands with args
     for cmd, num_args in sorted(COMMANDS_WITH_ARGS.items()):
         if cmd == "typstcite":  # Already handled above with alias
             continue
         cmd_esc = escape_rust_string(cmd)
+        if num_args in (1, 2, 3):
+            lines.append(f'        m.insert("{cmd_esc}".to_string(), cmd{num_args}());')
+            continue
         lines.append(f'        m.insert("{cmd_esc}".to_string(), CommandSpecItem::Cmd(CmdShape {{')
         lines.append(f'            args: ArgShape::Right {{ pattern: ArgPattern::FixedLenTerm {{ len: {num_args} }} }},')
+        lines.append('            alias: None,')
+        lines.append('        }));')
+
+    # Globs matching a closure use it, so every closure above is used. Any OTHER
+    # pattern is written out in full rather than skipped: silently dropping a
+    # command the table declares would leave the generator exiting 0 while the
+    # map lost an entry.
+    for cmd, pattern in sorted(GLOB_ARG_COMMANDS.items()):
+        cmd_esc = escape_rust_string(cmd)
+        shorthand = GLOB_CLOSURES.get(pattern)
+        if shorthand:
+            lines.append(f'        m.insert("{cmd_esc}".to_string(), {shorthand}());')
+            continue
+        lines.append(f'        m.insert("{cmd_esc}".to_string(), CommandSpecItem::Cmd(CmdShape {{')
+        lines.append(f'            args: ArgShape::Right {{ pattern: ArgPattern::Glob {{ pattern: GlobStr::from("{pattern}") }} }},')
         lines.append('            alias: None,')
         lines.append('        }));')
     
@@ -365,9 +1169,30 @@ def generate_rust_code():
     
     lines.extend([
         "};",
+        "",
+        "// =============================================================================",
+        "// DELIMITER_MAP: Single source of truth for lr() delimiter conversion",
+        "// Maps Typst delimiter representations to LaTeX output",
+        "// =============================================================================",
+        "",
+        "/// Map from Typst delimiter names/chars to LaTeX",
+        "/// Key: Typst representation (symbol name or Unicode char)",
+        "/// Value: LaTeX output string",
+        "pub static DELIMITER_MAP: phf::Map<&'static str, &'static str> = phf_map! {",
     ])
-    
-    return "\n".join(lines)
+
+    for typst, latex in sorted(DELIMITER_MAP.items()):
+        if not typst or not latex:
+            continue
+        lines.append(f'    "{escape_rust_string(typst)}" => "{escape_rust_string(latex)}",')
+
+    lines.extend([
+        "};",
+    ])
+
+    # Trailing newline: rustfmt wants one, and the generated file has to pass
+    # the same gate as the checked-in one.
+    return "\n".join(lines) + "\n"
 
 def parse_map_ts(filepath):
     """Parse map.ts file if provided (optional, for updating mappings)"""
@@ -389,6 +1214,129 @@ def parse_map_ts(filepath):
     
     return mappings
 
+
+def extract_public_map_names(rust_code):
+    """Return public static map names declared by a generated Rust source."""
+    return set(re.findall(r"pub static(?: ref)? ([A-Z][A-Z0-9_]*):", rust_code))
+
+
+RUST_STR = r'"((?:[^"\\]|\\.)*)"'
+
+# `maps.rs` declares most command shapes through local closures. Comparing the
+# generated verbose form against them needs the same expansion the closures do.
+COMMAND_SHORTHANDS = {
+    "cmd1()": ("FixedLenTerm:1", None),
+    "cmd2()": ("FixedLenTerm:2", None),
+    "cmd3()": ("FixedLenTerm:3", None),
+    "cmd1_opt()": ("Glob:{,b}t", None),
+    "cmd2_opt()": ("Glob:{,b}tt", None),
+    "cmd3_opt()": ("Glob:{,b}ttt", None),
+}
+
+
+def extract_command_entries(rust_code):
+    """Return {name: (pattern, alias)} for every command spec entry."""
+    entries = {}
+    for chunk in rust_code.split('m.insert("')[1:]:
+        if '".to_string(), ' not in chunk:
+            continue
+        name, rest = chunk.split('".to_string(), ', 1)
+        head = rest[:300]
+
+        shorthand = next((v for k, v in COMMAND_SHORTHANDS.items() if head.startswith(k)), None)
+        if shorthand:
+            entries[name] = shorthand
+            continue
+        m = re.match(r"cmd0\(Some\(" + RUST_STR + r"(?:\.to_string\(\))?\)\)", head)
+        if m:
+            entries[name] = ("None", m.group(1))
+            continue
+        if head.startswith("cmd0(None)"):
+            entries[name] = ("None", None)
+            continue
+
+        # `maps.rs` writes `Some("x".to_string())`, the generated form
+        # `Some("x".to_string())` too, and the `cmd0` closure `Some("x")`.
+        alias = re.search(r"alias: Some\(" + RUST_STR + r"(?:\.to_string\(\))?\)", head)
+        alias = alias.group(1) if alias else None
+        glob = re.search(r'GlobStr::from\("([^"]*)"\)', head)
+        if "CommandSpecItem::Env(" in head:
+            entries[name] = ("Env:" + (glob.group(1) if glob else "None"), None)
+        elif "ArgPattern::None" in head:
+            entries[name] = ("None", alias)
+        elif "FixedLenTerm" in head:
+            entries[name] = ("FixedLenTerm:" + re.search(r"len: (\d+)", head).group(1), alias)
+        elif glob:
+            entries[name] = ("Glob:" + glob.group(1), alias)
+        else:
+            entries[name] = ("?" + head[:40], alias)
+    return entries
+
+
+def extract_phf_entries(rust_code):
+    """Return {(table, key): value} for every `phf_map!` table."""
+    entries = {}
+    pattern = r"pub static ([A-Z][A-Z0-9_]*): phf::Map<[^>]*> = phf_map! \{(.*?)\n\};"
+    for name, body in re.findall(pattern, rust_code, re.S):
+        for key, value in re.findall(RUST_STR + r"\s*=>\s*" + RUST_STR + ",", body):
+            entries[(name, key)] = value
+    return entries
+
+
+def describe_drift(kind, existing, generated):
+    """Lines describing entries the regeneration would lose or change."""
+    lost = sorted(set(existing) - set(generated))
+    changed = sorted(k for k in set(existing) & set(generated) if existing[k] != generated[k])
+    details = []
+    if lost:
+        details.append(f"{len(lost)} {kind} (for example: {', '.join(map(str, lost[:8]))})")
+    if changed:
+        sample = ", ".join(f"{k}: {existing[k]!r} -> {generated[k]!r}" for k in changed[:5])
+        details.append(f"{len(changed)} changed {kind} ({sample})")
+    return details
+
+
+def ensure_lossless_regeneration(output_path, rust_code):
+    """Reject a generated file that would discard or alter checked-in coverage.
+
+    Values are compared, not only names: an entry whose alias or mapping has
+    drifted is as much a regression as a missing one, and a name-only check
+    cannot see it. `maps.rs`'s local `cmdN()` shorthands are expanded first, so
+    the two spellings of the same spec compare equal.
+    """
+    if not output_path.exists():
+        return
+
+    existing = output_path.read_text(encoding="utf-8")
+    details = []
+
+    # Every insert must name its command literally, or the comparison below
+    # reads past it in silence. A runtime `for` loop over a name list hid 11
+    # entries from this guard for exactly that reason.
+    opaque = existing.count("m.insert(") - existing.count('m.insert("')
+    if opaque:
+        details.append(
+            f"{opaque} insert(s) that do not name their command literally, "
+            "which this guard cannot compare"
+        )
+
+    missing_maps = extract_public_map_names(existing) - extract_public_map_names(rust_code)
+    if missing_maps:
+        details.append("public maps: " + ", ".join(sorted(missing_maps)))
+
+    details += describe_drift(
+        "commands", extract_command_entries(existing), extract_command_entries(rust_code))
+    details += describe_drift(
+        "mappings", extract_phf_entries(existing), extract_phf_entries(rust_code))
+
+    if not details:
+        return
+
+    raise RuntimeError(
+        "refusing a lossy maps.rs overwrite; synchronize tools/gen_maps.py "
+        "with src/data/maps.rs first (" + "; ".join(details) + ")"
+    )
+
 def main():
     # Output to the new data module location
     output_path = Path(__file__).parent.parent / "src" / "data" / "maps.rs"
@@ -406,11 +1354,17 @@ def main():
     print(f"Using: lazy_static for TEX_COMMAND_SPEC, phf for TYPST_TO_TEX")
     
     rust_code = generate_rust_code()
-    
+    try:
+        ensure_lossless_regeneration(output_path, rust_code)
+    except RuntimeError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(rust_code)
     
     print(f"Generated: {output_path}")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

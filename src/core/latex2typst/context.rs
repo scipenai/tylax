@@ -9,11 +9,15 @@ use mitex_spec_gen::DEFAULT_SPEC;
 use rowan::ast::AstNode;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use crate::data::constants::{AcronymDef, GlossaryDef};
 use crate::data::extended_symbols::EXTENDED_SYMBOLS;
 use crate::data::maps::TEX_COMMAND_SPEC;
-use crate::features::refs::{CitationMode, ReferenceType};
+use crate::features::refs::{
+    citation_to_typst, reference_to_typst, BibBackend, CitationMode, CiteGroup, Reference,
+    ReferenceType,
+};
 use fxhash::FxHashMap;
 use lazy_static::lazy_static;
 
@@ -22,8 +26,15 @@ use super::{ConversionResult, ConversionWarning, WarningKind};
 
 use super::utils::{
     clean_whitespace, convert_caption_text, extract_arg_content, extract_arg_content_with_braces,
-    extract_curly_inner_content, protect_zero_arg_commands, restore_protected_commands,
+    extract_curly_inner_content, protect_top_level_comma, protect_zero_arg_commands,
+    restore_protected_commands, sanitize_label,
 };
+
+/// Marker for a `\big`-style vertical delimiter, paired during math cleanup.
+pub(crate) const SIZED_BAR_SENTINEL: &str = "\u{1f}";
+
+/// Internal marker for a double vertical delimiter introduced by `\big\|`.
+pub(crate) const SIZED_DOUBLE_BAR_SENTINEL: &str = "\u{1e}";
 
 // =============================================================================
 // LaTeX → Typst Conversion Options
@@ -236,6 +247,29 @@ pub struct PendingReference {
     pub ref_type: ReferenceType,
 }
 
+/// Shape of a siunitx command, used to format its collected arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiunitxKind {
+    /// `\SI{value}{unit}` / `\qty{value}{unit}` → `value "unit"`.
+    NumberUnit,
+    /// `\si{unit}` / `\unit{unit}` → just the unit.
+    UnitOnly,
+    /// `\num{value}` → just the number.
+    NumberOnly,
+    /// `\ang{degrees}` → `value°`.
+    Angle,
+}
+
+/// Pending siunitx state; mitex has no argument pattern, so groups arrive as siblings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSiunitx {
+    pub kind: SiunitxKind,
+    pub needed: usize,
+    pub args: Vec<String>,
+    /// Nesting depth while skipping a leading optional siunitx configuration.
+    pub optional_bracket_depth: usize,
+}
+
 /// Conversion state maintained during AST traversal
 #[derive(Debug, Default)]
 pub struct ConversionState {
@@ -280,6 +314,88 @@ pub struct ConversionState {
     pub options: L2TOptions,
 }
 
+/// Per-document citation bookkeeping: the backends the walk saw, and the
+/// citations deferred until the backend is known. Kept on `LatexConverter`,
+/// not the re-exported `ConversionState`, whose fields are all `pub`.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct CitationSession {
+    /// A manual `thebibliography` environment was rendered in this document.
+    pub(crate) saw_manual_bib: bool,
+    /// An external bibliography command was seen (`\bibliography`, `\addbibresource`, ...).
+    pub(crate) saw_external_bib: bool,
+    /// Citations deferred during the walk; index N is the marker `TylaxCite{N}`.
+    pub(crate) pending: Vec<CiteGroup>,
+}
+
+/// One argument of an environment's `\begin{..}` header.
+pub(crate) struct EnvHeaderArg {
+    /// `true` for a bracketed `[..]` slot, `false` for a braced `{..}` one.
+    pub(crate) optional: bool,
+    pub(crate) content: String,
+}
+
+/// Parse the argument slots of an environment header, in source order.
+///
+/// Slots come from the environment's signature in the command spec
+/// (`EnvShape`), so mixed, repeated and out-of-order optional/required slots
+/// all parse; converters read the result instead of guessing at a leading
+/// bracket. mitex attaches the bound slots to the `\begin` marker, so they are
+/// collected from there rather than from the environment's children.
+pub(crate) fn env_header_args(node: &SyntaxNode) -> Vec<EnvHeaderArg> {
+    let mut args = Vec::new();
+    for child in node.children() {
+        if child.kind() != SyntaxKind::ItemBegin {
+            continue;
+        }
+        for slot in child.children() {
+            if slot.kind() != SyntaxKind::ClauseArgument {
+                continue;
+            }
+            let optional = slot
+                .children()
+                .any(|item| item.kind() == SyntaxKind::ItemBracket);
+            let braced = slot
+                .children()
+                .any(|item| item.kind() == SyntaxKind::ItemCurly);
+            if optional || braced {
+                args.push(EnvHeaderArg {
+                    optional,
+                    content: extract_arg_content(&slot),
+                });
+            }
+        }
+    }
+    args
+}
+
+/// A starred sectioning command whose title group has not been reached yet,
+/// and which form is waiting.
+///
+/// mitex's argument patterns know only term/bracket/paren kinds, so the `*` is
+/// bound as the title, and a greedy `RangeLenTerm` is worse still. The star is
+/// treated as a modifier and the title taken from the next group (issue #45).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PendingSection {
+    /// `\section*`..`\paragraph*`, `\chapter*`: unnumbered heading at this 0-based depth.
+    Heading { level: u8 },
+    /// `\part*`: the centred part block, without its "Part N" line or a part number.
+    Part,
+    /// `\subparagraph*`: run-in italics, which carry no number either way.
+    Subparagraph,
+}
+
+impl CitationSession {
+    /// Decide the backend from recorded events; `Mixed` is only knowable after the walk.
+    pub(crate) fn backend(&self) -> BibBackend {
+        match (self.saw_manual_bib, self.saw_external_bib) {
+            (true, true) => BibBackend::Mixed,
+            (true, false) => BibBackend::Manual,
+            (false, true) => BibBackend::External,
+            (false, false) => BibBackend::None,
+        }
+    }
+}
+
 impl ConversionState {
     /// Add a structured warning
     pub fn add_warning(&mut self, warning: ConversionWarning) {
@@ -297,12 +413,23 @@ impl ConversionState {
         Self::default()
     }
 
+    /// Whether a list context is already open (used to indent only nested lists).
+    fn has_list_ancestor(&self) -> bool {
+        self.env_stack.iter().any(|e| {
+            matches!(
+                e,
+                EnvironmentContext::Itemize | EnvironmentContext::Enumerate
+            )
+        })
+    }
+
     /// Push a new environment onto the stack
     pub fn push_env(&mut self, env: EnvironmentContext) {
         if matches!(
             env,
             EnvironmentContext::Itemize | EnvironmentContext::Enumerate
-        ) {
+        ) && self.has_list_ancestor()
+        {
             self.indent += 2;
         }
         self.env_stack.push(env);
@@ -315,7 +442,8 @@ impl ConversionState {
             if matches!(
                 e,
                 EnvironmentContext::Itemize | EnvironmentContext::Enumerate
-            ) {
+            ) && self.has_list_ancestor()
+            {
                 self.indent = self.indent.saturating_sub(2);
             }
         }
@@ -394,6 +522,15 @@ impl ConversionState {
 pub struct LatexConverter {
     pub(crate) state: ConversionState,
     pub(crate) spec: CommandSpec,
+    /// Citation bookkeeping for the document being converted (see `CitationSession`).
+    pub(crate) citations: CitationSession,
+    /// Half-collected siunitx arguments, carried across sibling nodes.
+    pub(crate) siunitx_arg_collector: Option<PendingSiunitx>,
+    /// A starred sectioning command whose title has not been reached yet.
+    pub(crate) pending_section: Option<PendingSection>,
+
+    /// Repairs the math cleanup applied to `_`/`^` attachments.
+    pub(crate) attachment_repairs: AttachmentRepairs,
 }
 
 /// A `ClauseArgument` is a *required* argument iff it does not carry an
@@ -475,6 +612,768 @@ fn element_is_mathy(elem: &SyntaxElement) -> bool {
     }
 }
 
+/// Glue a lone identifier/number to a following `(`/`[` (`f (x)` -> `f(x)`),
+/// but keep the space after a multi-letter token: `tilde (b)` (relation `~` on
+/// a group, from `\sim (b)`) must not collapse to the accent call `tilde(b)`
+/// (issue #34).
+fn glue_lone_identifier_calls(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        // <ident-char> <whitespace-run> `(`/`[`
+        if c.is_whitespace() && i > 0 && chars[i - 1].is_ascii_alphanumeric() {
+            let mut after_space = i;
+            while chars
+                .get(after_space)
+                .is_some_and(|next| next.is_whitespace())
+            {
+                after_space += 1;
+            }
+            // Lone token: the char before it is absent or non-alphanumeric.
+            let is_lone = i < 2 || !chars[i - 2].is_ascii_alphanumeric();
+            if is_lone && matches!(chars.get(after_space), Some('(') | Some('[')) {
+                i = after_space; // drop the space
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Split `s` on top-level occurrences of `sep`, respecting nesting of `()`,
+/// `[]`, and `{}` so a separator inside e.g. `frac(a, b)` is left alone.
+fn split_top_level(s: &str, sep: char) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for c in s.chars() {
+        match c {
+            '(' | '[' | '{' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' | ']' | '}' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            _ if c == sep && depth == 0 => {
+                parts.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    parts.push(cur.trim().to_string());
+    parts
+}
+
+/// Escape commas at the top level of a `cases` row. Inside a row that already
+/// has explicit `&` columns, a comma is literal content, not another column or
+/// row separator. Nested function/group commas remain untouched.
+fn escape_top_level_case_commas(s: &str) -> String {
+    let mut depth = 0i32;
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '(' | '[' | '{' => {
+                depth += 1;
+                out.push(c);
+            }
+            ')' | ']' | '}' => {
+                depth -= 1;
+                out.push(c);
+            }
+            ',' if depth == 0 => out.push_str("\\,"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// If `s` is exactly a single call `name(...)` — the paren matching the opening
+/// one is the final character — return the inner argument text; else `None`.
+fn strip_call<'a>(s: &'a str, name: &str) -> Option<&'a str> {
+    let inner = s.strip_prefix(name)?.strip_prefix('(')?.strip_suffix(')')?;
+    // Reject `name(a)(b)`: the first '(' must stay open until the end.
+    let mut depth = 1i32;
+    for c in inner.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            return None;
+        }
+    }
+    Some(inner)
+}
+
+/// Render the operand between a matched pair of sized vertical delimiters.
+///
+/// A delimiterless matrix becomes a determinant (or a norm matrix) when it is
+/// enclosed by bars. Every other operand uses Typst's scalar `abs`/`norm`
+/// function. Top-level commas need grouping because Typst parses them as
+/// function argument separators.
+fn render_sized_delimiter_operand(operand: &str, function: &str, matrix_delim: &str) -> String {
+    let operand = operand.trim();
+    if let Some(inner) = strip_call(operand, "mat") {
+        let inner = inner.trim();
+        if let Some(content) = inner
+            .strip_prefix("delim: #none,")
+            .or_else(|| inner.strip_prefix("delim: #none ,"))
+        {
+            return format!("mat(delim: \"{}\", {})", matrix_delim, content.trim());
+        }
+    }
+
+    let operand = if operand.is_empty() { "zws" } else { operand };
+    format!("{}({})", function, protect_top_level_comma(operand))
+}
+
+/// Pair the markers emitted for `\big`-style vertical delimiters, after
+/// rendering, where a delimiterless matrix is still distinguishable from a
+/// scalar operand. An unmatched marker is a legal one-sided delimiter.
+fn resolve_sized_delimiter_pair(
+    input: &str,
+    marker: &str,
+    function: &str,
+    fallback: &str,
+    matrix_delim: &str,
+) -> String {
+    // Adjacent equal bars are ambiguous without a delimiter tree; keep the tokens.
+    if markers_are_adjacent(input, marker) {
+        return input.replace(marker, fallback);
+    }
+
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+
+    while let Some(open) = remaining.find(marker) {
+        output.push_str(&remaining[..open]);
+        let after_open = &remaining[open + marker.len()..];
+
+        // A blank line cannot occur inside one math expression, so these are not a pair.
+        let close = after_open
+            .find(marker)
+            .filter(|&offset| !contains_paragraph_break(&after_open[..offset]));
+
+        let Some(close) = close else {
+            output.push_str(fallback);
+            // Keep scanning: a later pair in a following paragraph still resolves.
+            remaining = after_open;
+            continue;
+        };
+
+        output.push_str(&render_sized_delimiter_operand(
+            &after_open[..close],
+            function,
+            matrix_delim,
+        ));
+        remaining = &after_open[close + marker.len()..];
+    }
+
+    output.push_str(remaining);
+    output
+}
+
+/// Repairs the math cleanup applied to `_`/`^` attachments, so the converter
+/// can report what it actually changed.
+///
+/// Counted at the point of repair rather than predicted from the tree: whether
+/// Typst needs a base cannot be decided from the LaTeX shape. `^{2}` needs one,
+/// but `\left\langle ^{2}\right.` renders as `lr(chevron.l^(2))`, where the
+/// delimiter serves as the base and nothing is inserted. Only the rewrite
+/// itself knows.
+///
+/// Interior mutability is needed because the rewrites run inside
+/// `postprocess_math` / `cleanup_math_spacing`, public `&self` methods whose
+/// signatures are fixed for 0.3.x, while the report is emitted by the
+/// `&mut self` finalizer.
+///
+/// ATOMICS, not `Cell`: `LatexConverter` is public, so its auto traits are part
+/// of the API. A `Cell` here would silently take away its `Sync` impl and break
+/// any downstream `Arc<LatexConverter>` or `T: Sync` bound. `Relaxed` is enough
+/// -- these are independent tallies that order nothing else.
+#[derive(Debug, Default)]
+pub(crate) struct AttachmentRepairs {
+    empty_bases: AtomicUsize,
+    nested_collapsed: AtomicUsize,
+}
+
+impl AttachmentRepairs {
+    /// An empty `""` base was inserted before a script Typst would reject.
+    fn note_empty_base(&self) {
+        self.empty_bases.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// A `_(_(X))` wrapper was flattened to `_(X)`, losing one level of
+    /// lowering: a downgrade, not a neutral cleanup.
+    fn note_nested_collapsed(&self) {
+        self.nested_collapsed.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// Read and clear both counters.
+    fn take(&self) -> (usize, usize) {
+        (
+            self.empty_bases.swap(0, AtomicOrdering::Relaxed),
+            self.nested_collapsed.swap(0, AtomicOrdering::Relaxed),
+        )
+    }
+}
+
+/// Split a math word into Typst atoms, separated by spaces.
+///
+/// Adjacent letters in TeX math are distinct symbols multiplied together, so
+/// `AB` has to become `A B` or Typst reads one variable named `AB`. A NUMBER is
+/// not a product of its digits, though: splitting it gives `1 2 0`, which
+/// renders as three separate numerals. Digits therefore stay in one run, and a
+/// `.` between digits stays with them so `0.008` survives as one literal.
+fn push_math_atoms(text: &str, output: &mut String) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_ascii_digit() {
+            let start = i;
+            // A `.` only continues the run when a digit follows it, so a
+            // sentence-ending `1.` keeps the period as its own atom.
+            while i < chars.len()
+                && (chars[i].is_ascii_digit()
+                    || (chars[i] == '.' && chars.get(i + 1).is_some_and(char::is_ascii_digit)))
+            {
+                i += 1;
+            }
+            output.extend(&chars[start..i]);
+        } else {
+            output.push(chars[i]);
+            i += 1;
+        }
+        output.push(' ');
+    }
+}
+
+/// Whether `input` has a blank line (spaces or CRLF allowed between the breaks).
+fn contains_paragraph_break(input: &str) -> bool {
+    let mut after_line_break = false;
+
+    for c in input.chars() {
+        if c == '\n' {
+            if after_line_break {
+                return true;
+            }
+            after_line_break = true;
+        } else if after_line_break && !c.is_whitespace() {
+            after_line_break = false;
+        }
+    }
+
+    false
+}
+
+/// Whether two occurrences of `marker` have only whitespace between them.
+fn markers_are_adjacent(input: &str, marker: &str) -> bool {
+    let mut remaining = input;
+    while let Some(start) = remaining.find(marker) {
+        let after_marker = &remaining[start + marker.len()..];
+        if after_marker.trim_start().starts_with(marker) {
+            return true;
+        }
+        remaining = after_marker;
+    }
+    false
+}
+
+/// Protect complete TikZ environments before macro expansion and AST parsing.
+///
+/// MiTeX represents an environment semantically: its `SyntaxNode::text()`
+/// omits delimiters such as the braces in `\begin{tikzpicture}`, node option
+/// brackets, and coordinate parentheses. Passing that reconstructed text to
+/// the TikZ parser loses the first command in the picture. TikZ is its own
+/// language, so preserve each complete source block verbatim, convert it with
+/// the dedicated parser, and restore the rendered CeTZ after document output
+/// has been built.
+fn shield_tikz_blocks(
+    input: &str,
+    protected: &[(usize, usize)],
+) -> (String, Vec<(String, String)>) {
+    const BEGIN: &str = r"\begin{tikzpicture}";
+    const END: &str = r"\end{tikzpicture}";
+
+    let mut out = String::with_capacity(input.len());
+    let mut rendered_blocks = Vec::new();
+    let mut cursor = 0;
+
+    // `protected` holds lstlisting/minted bodies; verbatim and `\verb` are shielded upstream.
+    while let Some(begin) = find_uncommented_latex_command(input, BEGIN, cursor, protected) {
+        let content_start = begin + BEGIN.len();
+        let Some(end) = find_uncommented_latex_command(input, END, content_start, protected) else {
+            // Leave an unterminated environment to the normal diagnostics.
+            break;
+        };
+        let block_end = end + END.len();
+        // Private-use delimiters cannot collide with prose yet survive MiTeX as text.
+        let marker = format!("\u{E010}TylaxTikzBlock{}X\u{E011}", rendered_blocks.len());
+
+        out.push_str(&input[cursor..begin]);
+        out.push_str(&marker);
+        rendered_blocks.push((
+            marker,
+            format!(
+                "\n// TikZ converted to CeTZ\n{}\n",
+                crate::tikz::convert_tikz_to_cetz(&input[begin..block_end])
+            ),
+        ));
+        cursor = block_end;
+    }
+
+    out.push_str(&input[cursor..]);
+    (out, rendered_blocks)
+}
+
+/// Find `needle` after `from`, skipping comments and `protected` ranges.
+fn find_uncommented_latex_command(
+    input: &str,
+    needle: &str,
+    from: usize,
+    protected: &[(usize, usize)],
+) -> Option<usize> {
+    let mut search_from = from;
+    while let Some(relative) = input[search_from..].find(needle) {
+        let position = search_from + relative;
+        if !is_latex_comment_position(input, position)
+            && !is_position_protected(position, protected)
+        {
+            return Some(position);
+        }
+        search_from = position + needle.len();
+    }
+    None
+}
+
+/// Whether `position` falls within any `[start, end)` protected range.
+fn is_position_protected(position: usize, protected: &[(usize, usize)]) -> bool {
+    protected
+        .iter()
+        .any(|&(start, end)| position >= start && position < end)
+}
+
+/// Environments whose body is literal source, markered before MiTeX. `alltt` is excluded.
+const TRUE_VERBATIM_ENVS: [&str; 4] = ["verbatim", "verbatim*", "Verbatim", "Verbatim*"];
+
+/// fancyvrb environments taking a leading `[key=val]`; plain `verbatim` takes none.
+const FANCYVRB_ENVS: [&str; 2] = ["Verbatim", "Verbatim*"];
+
+/// Environments MiTeX converts semantically but whose body is literal, so the scan skips it.
+const SKIP_SCAN_ENVS: [&str; 2] = ["lstlisting", "minted"];
+
+/// Result of [`shield_verbatim_regions`].
+struct VerbatimShield {
+    /// Source with true verbatim and inline `\verb` replaced by opaque markers.
+    source: String,
+    /// Marker → Typst-raw restorations to splice back after the document builds.
+    restorations: Vec<(String, String)>,
+    /// Byte ranges of `lstlisting`/`minted` bodies: kept for MiTeX, skipped by the TikZ scan.
+    tikz_skip_ranges: Vec<(usize, usize)>,
+}
+
+/// Shield verbatim-like source regions before any LaTeX interpretation.
+///
+/// A single left-to-right lexical scan recognizes real command tokens, `%` line
+/// comments, and inline `\verb`, so a `\begin{verbatim}` shown inside a comment
+/// (or a `\verb` span) is never mistaken for a real environment, and a `%` that
+/// is itself inside verbatim stays literal.
+fn shield_verbatim_regions(input: &str) -> VerbatimShield {
+    let mut out = String::with_capacity(input.len());
+    let mut restorations: Vec<(String, String)> = Vec::new();
+    let mut skip_ranges = Vec::new();
+    let mut i = 0;
+    let n = input.len();
+
+    while i < n {
+        let rest = &input[i..];
+        let b = rest.as_bytes()[0];
+
+        // `%` line comment: copy through end of line; `\%` is consumed by the backslash branch.
+        if b == b'%' {
+            let line_end = rest.find('\n').map(|r| i + r + 1).unwrap_or(n);
+            out.push_str(&input[i..line_end]);
+            i = line_end;
+            continue;
+        }
+
+        if b == b'\\' {
+            if let Some((consumed, content)) = parse_inline_verb(rest) {
+                let marker = format!("\u{E010}TylaxVerbatim{}X\u{E011}", restorations.len());
+                out.push_str(&marker);
+                restorations.push((marker, typst_raw_inline(content)));
+                i += consumed;
+                continue;
+            }
+            if let Some((consumed, env, body)) = parse_env_block(rest) {
+                if TRUE_VERBATIM_ENVS.contains(&env) {
+                    // fancyvrb reads a `%` prefix and `[key=val]` header, neither a body.
+                    let body = if FANCYVRB_ENVS.contains(&env) {
+                        strip_fancyvrb_header(body)
+                    } else {
+                        body
+                    };
+                    let marker = format!("\u{E010}TylaxVerbatim{}X\u{E011}", restorations.len());
+                    out.push_str(&marker);
+                    restorations.push((marker, typst_raw_block(body)));
+                    i += consumed;
+                    continue;
+                }
+                if SKIP_SCAN_ENVS.contains(&env) {
+                    // Keep the environment for MiTeX, recording its span so the TikZ scan skips it.
+                    let start = out.len();
+                    out.push_str(&input[i..i + consumed]);
+                    skip_ranges.push((start, out.len()));
+                    i += consumed;
+                    continue;
+                }
+            }
+            // Copy the backslash with its next char, so a following `%` or `{` is not reread.
+            out.push('\\');
+            i += 1;
+            if i < n {
+                let l = input[i..].chars().next().unwrap().len_utf8();
+                out.push_str(&input[i..i + l]);
+                i += l;
+            }
+            continue;
+        }
+
+        let l = rest.chars().next().unwrap().len_utf8();
+        out.push_str(&input[i..i + l]);
+        i += l;
+    }
+
+    VerbatimShield {
+        source: out,
+        restorations,
+        tikz_skip_ranges: skip_ranges,
+    }
+}
+
+/// Parse a leading inline `\verb`/`\verb*`: bytes consumed and literal content.
+fn parse_inline_verb(rest: &str) -> Option<(usize, &str)> {
+    let after = rest.strip_prefix(r"\verb")?;
+    let mut chars = after.char_indices();
+    let (_, first) = chars.next()?;
+    // A real inline `\verb` is followed by `*` or a non-letter delimiter, never a letter.
+    if first.is_ascii_alphabetic() {
+        return None;
+    }
+    let (delim, delim_start) = if first == '*' {
+        let (off, d) = chars.next()?;
+        (d, off)
+    } else {
+        (first, 0usize)
+    };
+    let content_start = delim_start + delim.len_utf8();
+    let region = &after[content_start..];
+    let close = region.find(delim)?;
+    let content = &region[..close];
+    let consumed = r"\verb".len() + content_start + close + delim.len_utf8();
+    Some((consumed, content))
+}
+
+/// Byte length of the leading run of TeX-ignorable separators in `s`: ASCII
+/// whitespace and `%` line comments (through their terminating newline).
+/// Used ONLY between the `\begin`/`\end` control word and its `{env}`
+/// argument, which TeX reads the same either way, never for body content.
+fn ignorable_separator(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
+            b'%' => match s[i..].find('\n') {
+                Some(rel) => i += rel + 1,
+                None => return s.len(),
+            },
+            _ => break,
+        }
+    }
+    i
+}
+
+/// Match `\begin`/`\end` followed by TeX-ignorable separators and `{env}`,
+/// returning the byte length of the whole tag if `env` matches. TeX ignores
+/// spaces and comments after a control word, so `\begin {verbatim}` is valid.
+fn match_env_tag(s: &str, keyword: &str, env: &str) -> Option<usize> {
+    let after_kw = s.strip_prefix(keyword)?;
+    let sep = ignorable_separator(after_kw);
+    let braced = after_kw[sep..].strip_prefix('{')?;
+    let close = braced.find('}')?;
+    if &braced[..close] != env {
+        return None;
+    }
+    Some(keyword.len() + sep + 1 + close + 1)
+}
+
+/// Find the first `\end{ENV}` (separator-tolerant) in `hay`: start offset and tag length.
+fn find_env_end(hay: &str, env: &str) -> Option<(usize, usize)> {
+    let mut from = 0;
+    while let Some(rel) = hay[from..].find(r"\end") {
+        let pos = from + rel;
+        if let Some(len) = match_env_tag(&hay[pos..], r"\end", env) {
+            return Some((pos, len));
+        }
+        from = pos + r"\end".len();
+    }
+    None
+}
+
+/// Parse a leading `\begin{ENV}`..`\end{ENV}` block into the bytes consumed,
+/// the environment name and the raw body. The first matching `\end` ends it,
+/// since verbatim-like environments cannot nest.
+fn parse_env_block(rest: &str) -> Option<(usize, &str, &str)> {
+    let after_kw = rest.strip_prefix(r"\begin")?;
+    let sep = ignorable_separator(after_kw);
+    let braced = after_kw[sep..].strip_prefix('{')?;
+    let name_end = braced.find('}')?;
+    let env = &braced[..name_end];
+    if env.is_empty() {
+        return None;
+    }
+    let header_len = r"\begin".len() + sep + 1 + name_end + 1;
+    let body_region = &rest[header_len..];
+    let (end_rel, end_len) = find_env_end(body_region, env)?;
+    let body = &body_region[..end_rel];
+    let consumed = header_len + end_rel + end_len;
+    Some((consumed, env, body))
+}
+
+/// Strip a `[..]` argument only when it follows the tag IMMEDIATELY, as fancyvrb requires.
+fn strip_leading_optional_arg(body: &str) -> &str {
+    let Some(inner) = body.strip_prefix('[') else {
+        return body;
+    };
+    let mut depth = 1usize;
+    for (idx, ch) in inner.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &inner[idx + ch.len_utf8()..];
+                }
+            }
+            _ => {}
+        }
+    }
+    // Unbalanced bracket: not a well-formed optional argument, leave as-is.
+    body
+}
+
+/// Strip a fancyvrb `Verbatim` header, returning the raw content.
+///
+/// fancyvrb reads the `[key=val]` argument in non-verbatim mode, so a `%`
+/// comment ending the `\begin{Verbatim}` line is honored and the argument may
+/// follow on the next line (checked against TeX Live `pdflatex`). A bare newline
+/// ends the header instead, making the next line literal body.
+fn strip_fancyvrb_header(body: &str) -> &str {
+    let mut rest = body;
+    // Consume comment-only header lines: optional spaces, `%`, through the newline.
+    loop {
+        let after_hspace = rest.trim_start_matches([' ', '\t']);
+        let Some(after_pct) = after_hspace.strip_prefix('%') else {
+            break;
+        };
+        rest = match after_pct.find('\n') {
+            Some(nl) => &after_pct[nl + 1..],
+            None => &after_pct[after_pct.len()..],
+        };
+    }
+    // With no comment consumed `rest == body`, enforcing the exact-start rule.
+    strip_leading_optional_arg(rest)
+}
+
+/// Longest run of consecutive backticks in `s`, used to size a raw fence.
+fn max_backtick_run(s: &str) -> usize {
+    let mut max = 0usize;
+    let mut cur = 0usize;
+    for c in s.chars() {
+        if c == '`' {
+            cur += 1;
+            max = max.max(cur);
+        } else {
+            cur = 0;
+        }
+    }
+    max
+}
+
+/// Render literal text as a fenced Typst raw block; the fence grows past any backtick run.
+fn typst_raw_block(body: &str) -> String {
+    // Drop one newline adjacent to each tag so the block is tight; keep interior bytes.
+    let body = body
+        .strip_prefix("\r\n")
+        .or_else(|| body.strip_prefix('\n'))
+        .unwrap_or(body);
+    let body = body
+        .strip_suffix("\r\n")
+        .or_else(|| body.strip_suffix('\n'))
+        .unwrap_or(body);
+    let fence = "`".repeat(max_backtick_run(body).max(2) + 1);
+    format!("\n{fence}\n{body}\n{fence}\n")
+}
+
+/// Render literal text as inline Typst raw, growing the fence past any backtick run.
+fn typst_raw_inline(content: &str) -> String {
+    let ticks = max_backtick_run(content) + 1;
+    let fence = "`".repeat(ticks);
+    if ticks == 1 {
+        format!("{fence}{content}{fence}")
+    } else {
+        // A multi-backtick raw span trims one edge space, so the guards keep backticks apart.
+        format!("{fence} {content} {fence}")
+    }
+}
+
+/// Whether `position` sits after a real LaTeX comment marker on its line.
+fn is_latex_comment_position(input: &str, position: usize) -> bool {
+    let line_start = input[..position].rfind('\n').map_or(0, |index| index + 1);
+    let mut preceding_backslashes = 0usize;
+
+    for character in input[line_start..position].chars() {
+        match character {
+            '\\' => preceding_backslashes += 1,
+            '%' if preceding_backslashes & 1 == 0 => return true,
+            _ => preceding_backslashes = 0,
+        }
+    }
+    false
+}
+
+/// String fallback that turns an already-converted `\left\{ ... \right.` body
+/// into `cases(...)` arguments, for shapes the AST path (see math.rs
+/// `classify_lr_cases_environment`) doesn't catch: `atop(a, b)`, a bare
+/// expression, or a leftover `mat(...)`. A row without an explicit `&` treats a
+/// top-level comma as a column hint; a row with `&` keeps commas as content.
+fn body_to_cases(body: &str) -> String {
+    let body = body.trim();
+
+    let rows: Vec<String> = if let Some(inner) = strip_call(body, "mat") {
+        let inner = inner.trim();
+        // Drop a leading `delim: #none` keyword argument, if present.
+        let inner = inner
+            .strip_prefix("delim: #none,")
+            .or_else(|| inner.strip_prefix("delim: #none ,"))
+            .map(str::trim)
+            .unwrap_or(inner);
+        split_top_level(inner, ';')
+    } else if let Some(inner) = strip_call(body, "atop") {
+        split_top_level(inner, ',')
+    } else {
+        // aligned / plain body: rows are separated by Typst line breaks `\`.
+        body.split('\\').map(|r| r.trim().to_string()).collect()
+    };
+
+    let cells: Vec<String> = rows
+        .iter()
+        .map(|r| r.trim_start_matches('&').trim())
+        .filter(|r| !r.is_empty())
+        .map(|r| {
+            if r.contains('&') {
+                escape_top_level_case_commas(r)
+            } else {
+                split_top_level(r, ',')
+                    .into_iter()
+                    .filter(|c| !c.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" & ")
+            }
+        })
+        .collect();
+
+    format!("cases({})", cells.join(", "))
+}
+
+/// The verbatim source text of a syntax element (node or token).
+fn element_source_text(el: &SyntaxElement) -> String {
+    match el {
+        SyntaxElement::Node(n) => n.text().to_string(),
+        SyntaxElement::Token(t) => t.text().to_string(),
+    }
+}
+
+/// Whether `el` is a command with exactly `name` (without its leading slash).
+fn is_command_named(el: &SyntaxElement, name: &str) -> bool {
+    let Some(node) = el.as_node() else {
+        return false;
+    };
+    CmdItem::cast(node.clone())
+        .and_then(|cmd| cmd.name_tok())
+        .is_some_and(|token| token.text().trim_start_matches('\\') == name)
+}
+
+/// Whether `s` is a TeX dimension (`6pt`, `-1.5em`, `0.5 ex`) or a length
+/// command (`\baselineskip`). Used to drop the optional row-spacing arg of `\\`
+/// (`\\[6pt]`) instead of leaking it into a matrix/aligned body (issue #41).
+/// Conservative: needs a numeric factor + known unit, or a control sequence;
+/// any other bracket group is left untouched.
+fn is_tex_dimension(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    // A control sequence may be a user length (\baselineskip); can't resolve
+    // without macro expansion, so accept it.
+    if s.starts_with('\\') {
+        return true;
+    }
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    if bytes[i] == b'+' || bytes[i] == b'-' {
+        i += 1;
+    }
+    let num_start = i;
+    let mut saw_digit = false;
+    let mut saw_decimal_point = false;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            saw_digit = true;
+            i += 1;
+        } else if bytes[i] == b'.' && !saw_decimal_point {
+            saw_decimal_point = true;
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if i == num_start || !saw_digit {
+        return false; // no numeric factor -> not a dimension
+    }
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    // TeX accepts an optional `true` modifier (e.g. `1truept`).
+    let unit = s[i..]
+        .strip_prefix("true")
+        .map(str::trim_start)
+        .unwrap_or(&s[i..]);
+    // Elastic glue units are valid too; long forms precede `fil` for correct
+    // suffix matching.
+    const UNITS: [&str; 16] = [
+        "filll", "fill", "fil", "pt", "pc", "mm", "cm", "in", "ex", "em", "bp", "dd", "cc", "sp",
+        "mu", "nd",
+    ];
+    UNITS.iter().any(|u| {
+        let Some(after_unit) = unit.strip_prefix(u) else {
+            return false;
+        };
+        after_unit.is_empty()
+            || after_unit.starts_with('\\')
+            || after_unit.chars().next().is_some_and(char::is_whitespace)
+    })
+}
+
 fn command_is_math_like(name: &str) -> bool {
     let base_name = name.strip_suffix('*').unwrap_or(name);
 
@@ -528,7 +1427,10 @@ fn command_is_math_like(name: &str) -> bool {
             | "op"
             | "outerproduct"
             | "overbrace"
+            | "overleftarrow"
+            | "overleftrightarrow"
             | "overline"
+            | "overrightarrow"
             | "overset"
             | "qty"
             | "sqrt"
@@ -558,6 +1460,10 @@ impl LatexConverter {
         Self {
             state: ConversionState::new(),
             spec: MERGED_SPEC.clone(),
+            citations: CitationSession::default(),
+            siunitx_arg_collector: None,
+            pending_section: None,
+            attachment_repairs: AttachmentRepairs::default(),
         }
     }
 
@@ -568,6 +1474,10 @@ impl LatexConverter {
         Self {
             state,
             spec: MERGED_SPEC.clone(),
+            citations: CitationSession::default(),
+            siunitx_arg_collector: None,
+            pending_section: None,
+            attachment_repairs: AttachmentRepairs::default(),
         }
     }
 
@@ -677,33 +1587,63 @@ impl LatexConverter {
 
     /// Check if input contains a real `\begin{document}` that is not commented out.
     ///
-    /// This function scans line-by-line, ignoring lines where `\begin{document}`
-    /// appears after a `%` comment marker.
+    /// Reuses the verbatim lexer's boundary rules: [`match_env_tag`] accepts the
+    /// TeX-ignorable separators (whitespace and `%` comments) that may sit between
+    /// the `\begin` control word and its `{document}` argument, so `\begin {document}`
+    /// and `\begin% c\n{document}` are recognized. A `\begin` that is itself after a
+    /// `%` comment on its line is ignored via [`is_latex_comment_position`] (which
+    /// is escaped-`\%`-aware). Verbatim examples of `\begin{document}` are already
+    /// replaced by markers before this runs, so any remaining match is real.
     fn has_real_begin_document(input: &str) -> bool {
-        for line in input.lines() {
-            // Find position of \begin{document} in this line
-            if let Some(doc_pos) = line.find("\\begin{document}") {
-                // Check if there's a % comment before it
-                let before_doc = &line[..doc_pos];
-                // If % exists before \begin{document}, this line is commented
-                if !before_doc.contains('%') {
-                    return true;
-                }
+        let mut from = 0;
+        while let Some(rel) = input[from..].find(r"\begin") {
+            let pos = from + rel;
+            if match_env_tag(&input[pos..], r"\begin", "document").is_some()
+                && !is_latex_comment_position(input, pos)
+            {
+                return true;
             }
+            from = pos + r"\begin".len();
         }
         false
     }
 
+    /// Reset all per-conversion state before a new top-level conversion.
+    ///
+    /// A converter may be reused across documents, so every input-derived field
+    /// must start clean or macros, counters, citations and warnings leak into
+    /// the next one. Replacing the whole `ConversionState` (rather than
+    /// clearing fields individually) keeps a reused converter identical to a
+    /// fresh one and resets future fields automatically.
+    fn reset_conversion_state(&mut self) {
+        self.state = ConversionState {
+            options: self.state.options.clone(),
+            ..ConversionState::default()
+        };
+        // Citation bookkeeping is per-document, so the reuse invariant covers it too.
+        self.citations = CitationSession::default();
+        self.siunitx_arg_collector = None;
+        self.pending_section = None;
+        self.attachment_repairs.take();
+    }
+
     /// Convert a complete LaTeX document to Typst
     pub fn convert_document(&mut self, input: &str) -> String {
-        // Only enter preamble mode if there's actually a \begin{document}
-        // that is NOT inside a comment. This avoids false positives from:
-        //   % \begin{document}  (commented out)
-        //   \begin{verbatim}\begin{document}\end{verbatim}  (inside verbatim - rare edge case)
-        self.state.in_preamble = Self::has_real_begin_document(input);
+        // A reused converter must start each document identical to a fresh one.
+        self.reset_conversion_state();
 
-        // Preprocess: protect zero-argument commands that MiTeX would otherwise lose
-        let protected_input = protect_zero_arg_commands(input);
+        // Shield verbatim and `\verb` first; lstlisting/minted stay for MiTeX.
+        let verbatim = shield_verbatim_regions(input);
+
+        // Enter preamble mode only for a real `\begin{document}`, read from shielded source.
+        self.state.in_preamble = Self::has_real_begin_document(&verbatim.source);
+
+        // Preserve raw TikZ before expansion: its punctuation is unrecoverable afterwards.
+        let (tikz_protected_input, rendered_tikz_blocks) =
+            shield_tikz_blocks(&verbatim.source, &verbatim.tikz_skip_ranges);
+
+        // Preprocess: protect zero-argument commands that MiTeX would otherwise lose.
+        let protected_input = protect_zero_arg_commands(&tikz_protected_input);
 
         // Optionally expand macros using the SOTA token-based engine
         // This correctly handles nested braces and complex macro arguments
@@ -719,8 +1659,26 @@ impl LatexConverter {
         // Walk the tree
         self.visit_node(&tree, &mut output);
 
+        // Pair the sized-delimiter sentinels only; full `postprocess_math` would corrupt prose.
+        let output = self.resolve_sized_delimiter_pairs(&output);
+
+        // Report the backend, then resolve the markers; both before `build_document`.
+        self.finalize_bibliography_diagnostics();
+        let output = self.resolve_citations(&output);
+        self.warn_attachment_repairs();
+
         // Build final document with preamble
-        let result = self.build_document(output);
+        let mut result = self.build_document(output);
+
+        // Restore TikZ only after cleanup: the markers travel as inert text.
+        for (marker, rendered) in rendered_tikz_blocks {
+            result = result.replace(&marker, &rendered);
+        }
+
+        // Restore shielded verbatim after TikZ, so literal bodies never re-enter a scan.
+        for (marker, raw) in verbatim.restorations {
+            result = result.replace(&marker, &raw);
+        }
 
         // Restore protected commands
         restore_protected_commands(&result)
@@ -728,6 +1686,8 @@ impl LatexConverter {
 
     /// Convert math-only LaTeX to Typst
     pub fn convert_math(&mut self, input: &str) -> String {
+        // A math fragment has no bibliography, but the markers must still be resolved.
+        self.reset_conversion_state();
         self.state.mode = ConversionMode::Math;
         self.state.in_preamble = false;
 
@@ -741,14 +1701,185 @@ impl LatexConverter {
         let mut output = String::with_capacity(expanded_input.len().max(256));
         self.visit_node(&tree, &mut output);
 
+        // Resolve citation markers BEFORE math cleanup, so `#cite(...)` is post-processed.
+        let output = self.resolve_citations(&output);
+
         // Post-process
-        self.postprocess_math(output)
+        let output = self.postprocess_math(output);
+        self.warn_attachment_repairs();
+        output
     }
 
-    /// Visit a syntax node and convert it
+    /// Report the repairs the math cleanup applied to `_`/`^` attachments.
+    ///
+    /// Reported separately because they are different events. Inserting an
+    /// empty base changes nothing semantically -- it satisfies a Typst rule
+    /// that LaTeX does not have -- while flattening a nested script loses a
+    /// level of lowering. Neither says the source is invalid: TeX supplies an
+    /// empty atom, so `$^{2}$` compiles under pdfTeX. They say what the
+    /// converter changed, which for OCR input is usually a base that went
+    /// missing upstream.
+    fn warn_attachment_repairs(&mut self) {
+        let (empty_bases, nested_collapsed) = self.attachment_repairs.take();
+
+        if empty_bases > 0 {
+            self.warn_repair(format!(
+                "{empty_bases} subscript/superscript given an empty base, \
+                 which Typst requires and LaTeX does not. The source is valid \
+                 either way, so check whether it lost a base upstream."
+            ));
+        }
+        if nested_collapsed > 0 {
+            self.warn_repair(format!(
+                "{nested_collapsed} nested subscript/superscript flattened \
+                 (`x_{{_{{y}}}}` -> `x_(y)`). Typst has no equivalent, so one \
+                 level of lowering is lost."
+            ));
+        }
+    }
+
+    /// Record a repair notice on both warning sinks.
+    fn warn_repair(&mut self, message: String) {
+        self.state.warnings.push(message.clone());
+        self.state
+            .add_warning(ConversionWarning::new(WarningKind::ParseError, message));
+    }
+
+    /// Resolve the deferred `TylaxCite{N}` markers by bibliography backend:
+    /// `Manual` becomes a label reference targeting the `thebibliography`
+    /// anchors, everything else keeps `#cite(...)` — including `Mixed`, whose
+    /// two backends cannot be reconciled automatically.
+    fn resolve_citations(&mut self, input: &str) -> String {
+        let pending = std::mem::take(&mut self.citations.pending);
+        if pending.is_empty() {
+            return input.to_string();
+        }
+
+        let backend = self.citations.backend();
+        let mut result = input.to_string();
+
+        for (idx, group) in pending.iter().enumerate() {
+            let marker = format!("\u{E010}TylaxCite{}X\u{E011}", idx);
+            let replacement = match backend {
+                BibBackend::Manual => self.render_manual_citation(group),
+                BibBackend::External | BibBackend::Mixed | BibBackend::None => {
+                    citation_to_typst(group)
+                }
+            };
+            result = result.replace(&marker, &replacement);
+        }
+
+        result
+    }
+
+    /// Emit the once-per-document diagnostic for the bibliography backend.
+    ///
+    /// Separate from `resolve_citations`, which returns early when a document
+    /// has no `\cite`: an external `\bibliography{refs}` is dropped without a
+    /// `#bibliography(...)` whether or not anything cites it, so the warning
+    /// must depend on the backend, never on the citation count.
+    fn finalize_bibliography_diagnostics(&mut self) {
+        match self.citations.backend() {
+            // Recognized but not reproduced: without `#bibliography(...)` any `#cite` fails.
+            BibBackend::External => self.warn_bibliography_backend(
+                "External bibliography (`\\bibliography`/`\\addbibresource`) is not converted: \
+                 no `#bibliography(...)` is emitted, so the reference list is missing and any \
+                 `#cite(...)` will fail to compile. Add a Typst `#bibliography(\"refs.bib\")` \
+                 manually.",
+            ),
+            BibBackend::Mixed => self.warn_bibliography_backend(
+                "Document mixes a manual `thebibliography` with an external bibliography; \
+                 citations are kept as `#cite(...)` for the external backend, which emits no \
+                 `#bibliography(...)`. Verify the intended bibliography.",
+            ),
+            // Manual is fully reconciled; per-citation degradations come from the renderer.
+            BibBackend::Manual | BibBackend::None => {}
+        }
+    }
+
+    /// Render a citation against a manual `thebibliography`; forms `@key` cannot express degrade.
+    fn render_manual_citation(&mut self, group: &CiteGroup) -> String {
+        let keys: Vec<String> = group
+            .citations
+            .iter()
+            .map(|c| reference_to_typst(&Reference::new(sanitize_label(&c.key))))
+            .collect();
+        let mut rendered = keys.join(" ");
+
+        // Prenote is prepended once; the postnote follows the last key.
+        if let Some(prefix) = group.prefix.as_deref() {
+            rendered = format!("{} {}", prefix, rendered);
+        }
+        if let Some(suffix) = group.suffix.as_deref() {
+            rendered = format!("{} [{}]", rendered, suffix);
+        }
+
+        let has_note = group.prefix.is_some() || group.suffix.is_some();
+        let non_normal = group
+            .citations
+            .iter()
+            .any(|c| c.mode != CitationMode::Normal);
+        if has_note || non_normal {
+            self.warn_bibliography_backend(
+                "Manual-bibliography citation degraded to a label reference: author-year \
+                 form or note text cannot be recovered from `thebibliography` entries.",
+            );
+        }
+
+        rendered
+    }
+
+    /// Record a bibliography-backend diagnostic on both warning sinks.
+    fn warn_bibliography_backend(&mut self, message: &str) {
+        self.state.warnings.push(message.to_string());
+        self.state
+            .add_warning(ConversionWarning::new(WarningKind::ParseError, message));
+    }
+
+    /// Visit a syntax node and convert it.
     pub fn visit_node(&mut self, node: &SyntaxNode, output: &mut String) {
-        for child in node.children_with_tokens() {
-            self.visit_element(child, output);
+        let children: Vec<SyntaxElement> = node.children_with_tokens().collect();
+        self.visit_elements(&children, output);
+    }
+
+    /// Visit a sequence of elements, keeping TeX declaration scopes intact.
+    ///
+    /// TeX declarations are emitted by mitex with their affected expression as
+    /// siblings. Wrap that suffix while visiting the current group, so the style
+    /// cannot leak into its parent scope.
+    pub fn visit_elements(&mut self, children: &[SyntaxElement], output: &mut String) {
+        let mut index = 0;
+        while index < children.len() {
+            let child = &children[index];
+            let style = if matches!(self.state.mode, ConversionMode::Math) {
+                if is_command_named(child, "displaystyle") {
+                    Some("display")
+                } else if is_command_named(child, "textstyle") {
+                    Some("inline")
+                } else if is_command_named(child, "cal") {
+                    // Plain TeX's `\cal` is a declaration, not an
+                    // argument-taking `\mathcal{...}`: it applies through the
+                    // enclosing group, or the rest of an ungrouped formula.
+                    Some("cal")
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(style) = style {
+                let mut styled_content = String::new();
+                self.visit_elements(&children[index + 1..], &mut styled_content);
+                let styled_content = styled_content.trim();
+                if !styled_content.is_empty() {
+                    let _ = write!(output, "{}({})", style, styled_content);
+                }
+                return;
+            }
+
+            self.visit_element(child.clone(), output);
+            index += 1;
         }
     }
 
@@ -792,7 +1923,12 @@ impl LatexConverter {
             }
             SyntaxKind::ItemCurly if !pending.collecting_optional => {
                 if let SyntaxElement::Node(node) = elem {
-                    super::markup::emit_pending_citation_from_curly(&node, pending, output);
+                    super::markup::emit_pending_citation_from_curly(
+                        &node,
+                        pending,
+                        &mut self.citations.pending,
+                        output,
+                    );
                     return true;
                 }
                 self.state.pending_citation = Some(pending);
@@ -814,6 +1950,48 @@ impl LatexConverter {
                 self.state.pending_citation = Some(pending);
                 false
             }
+        }
+    }
+
+    /// Take the title group following a starred sectioning command and emit
+    /// the heading. TeX skips whitespace AND `%` comments before the argument
+    /// it scans for, so `\section* % note\n{Title}` is `\section*{Title}`.
+    fn handle_pending_section(&mut self, elem: SyntaxElement, output: &mut String) -> bool {
+        let Some(pending) = self.pending_section.take() else {
+            return false;
+        };
+
+        match elem.kind() {
+            SyntaxKind::TokenWhiteSpace
+            | SyntaxKind::TokenLineBreak
+            | SyntaxKind::TokenComment
+            | SyntaxKind::ItemBlockComment
+            | SyntaxKind::TokenAsterisk => {
+                self.pending_section = Some(pending);
+                true
+            }
+            SyntaxKind::ItemCurly => {
+                if let SyntaxElement::Node(node) = elem {
+                    // Convert the title so markup inside it is translated, not copied.
+                    let body: Vec<SyntaxElement> = node
+                        .children_with_tokens()
+                        .filter(|child| {
+                            !matches!(
+                                child.kind(),
+                                SyntaxKind::TokenLBrace | SyntaxKind::TokenRBrace
+                            )
+                        })
+                        .collect();
+                    let mut title = String::new();
+                    self.visit_elements(&body, &mut title);
+                    super::markup::emit_starred_section(pending, title.trim(), output);
+                    return true;
+                }
+                self.pending_section = Some(pending);
+                false
+            }
+            // No title group follows (`\section*` alone): emit nothing rather than invent it.
+            _ => false,
         }
     }
 
@@ -844,6 +2022,74 @@ impl LatexConverter {
         }
     }
 
+    /// Consume the curly-sibling arguments of a pending siunitx command.
+    fn handle_pending_siunitx(&mut self, elem: SyntaxElement, output: &mut String) -> bool {
+        let Some(mut pending) = self.siunitx_arg_collector.take() else {
+            return false;
+        };
+
+        if pending.optional_bracket_depth > 0 {
+            match elem.kind() {
+                SyntaxKind::TokenLBracket => pending.optional_bracket_depth += 1,
+                SyntaxKind::TokenRBracket => pending.optional_bracket_depth -= 1,
+                _ => {}
+            }
+            self.siunitx_arg_collector = Some(pending);
+            return true;
+        }
+
+        match elem.kind() {
+            // Whitespace and TeX comments are transparent to argument collection.
+            SyntaxKind::TokenWhiteSpace
+            | SyntaxKind::TokenLineBreak
+            | SyntaxKind::TokenComment
+            | SyntaxKind::ItemBlockComment => {
+                self.siunitx_arg_collector = Some(pending);
+                true
+            }
+            SyntaxKind::TokenLBracket => {
+                pending.optional_bracket_depth = 1;
+                self.siunitx_arg_collector = Some(pending);
+                true
+            }
+            // siunitx allows a key-value configuration; Typst has none, so skip it.
+            SyntaxKind::ItemBracket => {
+                self.siunitx_arg_collector = Some(pending);
+                true
+            }
+            // mitex may wrap the same optional bracket in a `ClauseArgument`.
+            SyntaxKind::ClauseArgument
+                if elem.as_node().is_some_and(|node| {
+                    node.children()
+                        .any(|child| child.kind() == SyntaxKind::ItemBracket)
+                }) =>
+            {
+                self.siunitx_arg_collector = Some(pending);
+                true
+            }
+            SyntaxKind::ItemCurly => {
+                if let SyntaxElement::Node(node) = &elem {
+                    let raw = super::utils::extract_curly_inner_content(node);
+                    pending.args.push(raw);
+                    if pending.args.len() >= pending.needed {
+                        super::markup::emit_siunitx(self, &pending, output);
+                    } else {
+                        self.siunitx_arg_collector = Some(pending);
+                    }
+                    return true;
+                }
+                // Not a node: flush what we have and let the element fall through.
+                super::markup::emit_siunitx(self, &pending, output);
+                false
+            }
+            // A non-group element means arguments are missing; flush and handle it.
+            _ => {
+                super::markup::emit_siunitx(self, &pending, output);
+                false
+            }
+        }
+    }
+
     /// Visit a syntax element (node or token)
     pub fn visit_element(&mut self, elem: SyntaxElement, output: &mut String) {
         use SyntaxKind::*;
@@ -852,6 +2098,12 @@ impl LatexConverter {
             return;
         }
         if self.handle_pending_reference(elem.clone(), output) {
+            return;
+        }
+        if self.handle_pending_section(elem.clone(), output) {
+            return;
+        }
+        if self.handle_pending_siunitx(elem.clone(), output) {
             return;
         }
 
@@ -930,10 +2182,7 @@ impl LatexConverter {
                 if let SyntaxElement::Token(t) = elem {
                     let text = t.text();
                     if matches!(self.state.mode, ConversionMode::Math) {
-                        for c in text.chars() {
-                            output.push(c);
-                            output.push(' ');
-                        }
+                        push_math_atoms(text, output);
                     } else {
                         output.push_str(text);
                     }
@@ -1046,13 +2295,14 @@ impl LatexConverter {
             TokenDitto => output.push('"'),
             TokenLParen => output.push('('),
             TokenRParen => output.push(')'),
+            // Brackets here are literal text: a real optional argument is consumed by the grammar.
             TokenLBracket => {
-                if matches!(self.state.mode, ConversionMode::Math) {
+                if !self.state.in_preamble {
                     output.push('[');
                 }
             }
             TokenRBracket => {
-                if matches!(self.state.mode, ConversionMode::Math) {
+                if !self.state.in_preamble {
                     output.push(']');
                 }
             }
@@ -1127,6 +2377,41 @@ impl LatexConverter {
         None
     }
 
+    /// Recursively convert an optional `[...]` argument (bracket-clause analogue
+    /// of [`Self::convert_required_arg`]). Unlike [`Self::get_optional_arg`],
+    /// which returns raw brace-stripped text and mangles `\textbf{X}` into
+    /// `\textbfX`, this handles embedded math/commands — e.g. `\item[$O(n)$]`.
+    pub fn convert_optional_arg(&mut self, cmd: &CmdItem, index: usize) -> Option<String> {
+        let mut optional_count = 0;
+        for child in cmd.syntax().children() {
+            if child.kind() != SyntaxKind::ClauseArgument {
+                continue;
+            }
+            let Some(bracket) = child
+                .children()
+                .find(|c| c.kind() == SyntaxKind::ItemBracket)
+            else {
+                continue;
+            };
+            if optional_count == index {
+                let mut output = String::new();
+                let content: Vec<_> = bracket
+                    .children_with_tokens()
+                    .filter(|element| {
+                        !matches!(
+                            element.kind(),
+                            SyntaxKind::TokenLBracket | SyntaxKind::TokenRBracket
+                        )
+                    })
+                    .collect();
+                self.visit_elements(&content, &mut output);
+                return Some(output.trim().to_string());
+            }
+            optional_count += 1;
+        }
+        None
+    }
+
     /// Convert a required argument - recursively processes the content.
     ///
     /// Handles both braced (`{...}`) and unbraced single-token arguments. Empty
@@ -1139,15 +2424,19 @@ impl LatexConverter {
             if is_required_clause(&child) {
                 if required_count == index {
                     let mut output = String::new();
-                    for content in child.children_with_tokens() {
-                        match content.kind() {
-                            SyntaxKind::TokenLBrace
-                            | SyntaxKind::TokenRBrace
-                            | SyntaxKind::TokenLBracket
-                            | SyntaxKind::TokenRBracket => continue,
-                            _ => self.visit_element(content, &mut output),
-                        }
-                    }
+                    let content: Vec<_> = child
+                        .children_with_tokens()
+                        .filter(|element| {
+                            !matches!(
+                                element.kind(),
+                                SyntaxKind::TokenLBrace
+                                    | SyntaxKind::TokenRBrace
+                                    | SyntaxKind::TokenLBracket
+                                    | SyntaxKind::TokenRBracket
+                            )
+                        })
+                        .collect();
+                    self.visit_elements(&content, &mut output);
                     return Some(output.trim().to_string());
                 }
                 required_count += 1;
@@ -1156,11 +2445,16 @@ impl LatexConverter {
         None
     }
 
-    /// Convert a required *term* argument such as `b` in `\frac{a}b` or `\sim`
-    /// in `\overset{p}\sim`. Thin alias of [`Self::convert_required_arg`], which
-    /// already handles unbraced single-token terms (and pads empty groups).
-    pub fn convert_required_term_arg(&mut self, cmd: &CmdItem, index: usize) -> Option<String> {
-        self.convert_required_arg(cmd, index)
+    /// Convert a required argument as MATH content whatever the surrounding
+    /// mode: accents and roots always take a math expression. On the document
+    /// path `\overrightarrow{PC}` would otherwise emit `arrow(PC)`, a single
+    /// Typst variable that fails to compile, not `arrow(P C)` (issue #35).
+    pub fn convert_required_math_arg(&mut self, cmd: &CmdItem, index: usize) -> Option<String> {
+        let previous_mode = self.state.mode;
+        self.state.mode = ConversionMode::Math;
+        let converted = self.convert_required_arg(cmd, index);
+        self.state.mode = previous_mode;
+        converted
     }
 
     /// Get a required argument from a command and convert it to Typst
@@ -1175,38 +2469,31 @@ impl LatexConverter {
 
     /// Get optional argument from an environment
     pub fn get_env_optional_arg(&self, node: &SyntaxNode) -> Option<String> {
-        for child in node.children() {
-            if child.kind() == SyntaxKind::ItemBegin {
-                for begin_child in child.children() {
-                    if begin_child.kind() == SyntaxKind::ClauseArgument {
-                        let has_bracket = begin_child
-                            .children()
-                            .any(|c| c.kind() == SyntaxKind::ItemBracket);
-                        if has_bracket {
-                            return Some(extract_arg_content(&begin_child));
-                        }
-                    }
-                }
-            }
-        }
-        None
+        env_header_args(node)
+            .into_iter()
+            .find(|arg| arg.optional)
+            .map(|arg| arg.content)
+    }
+
+    /// The n-th OPTIONAL argument of the environment header, in source order.
+    ///
+    /// `\begin{minipage}[pos][height][inner-pos]{width}` has three, so a single
+    /// "the optional argument" accessor cannot describe it.
+    pub fn get_env_optional_arg_at(&self, node: &SyntaxNode, index: usize) -> Option<String> {
+        env_header_args(node)
+            .into_iter()
+            .filter(|arg| arg.optional)
+            .nth(index)
+            .map(|arg| arg.content)
     }
 
     /// Get a required argument from an environment
     pub fn get_env_required_arg(&self, node: &SyntaxNode, index: usize) -> Option<String> {
-        let mut required_count = 0;
-        for child in node.children() {
-            if child.kind() == SyntaxKind::ClauseArgument {
-                let is_curly = child.children().any(|c| c.kind() == SyntaxKind::ItemCurly);
-                if is_curly {
-                    if required_count == index {
-                        return Some(extract_arg_content(&child));
-                    }
-                    required_count += 1;
-                }
-            }
-        }
-        None
+        env_header_args(node)
+            .into_iter()
+            .filter(|arg| !arg.optional)
+            .nth(index)
+            .map(|arg| arg.content)
     }
 
     /// Extract and convert argument for metadata (title, author, date)
@@ -1244,6 +2531,15 @@ impl LatexConverter {
         result = result.replace(" ^", "^");
         result = result.replace(" _", "_");
 
+        result = self.resolve_sized_delimiter_pairs(&result);
+
+        // Rewrite `\left\{ ... \right.` (`lr({ ... )`) into Typst `cases(...)`.
+        result = self.fix_left_brace_cases(&result);
+
+        // Repair base-less `_`/`^` attachments now that spacing is canonical
+        // (`(_(` and leading `^(` are literal). Typst rejects these otherwise.
+        result = self.fix_baseless_attachment(&result);
+
         result.trim().to_string()
     }
 
@@ -1258,12 +2554,37 @@ impl LatexConverter {
         result = result.replace(" ,", ",");
         result = result.replace("( ", "(");
         result = result.replace(" )", ")");
-        result = result.replace(" (", "(");
-        result = result.replace(" [", "[");
+        // Only glue a lone identifier/number to a following `(`/`[` (function
+        // application like `f (x)` -> `f(x)`). We must NOT strip the space after
+        // a multi-letter symbol name: in Typst math `tilde (b)` (relation `~`
+        // on a group) and `tilde(b)` (the `tilde` accent call) mean different
+        // things, so the space in front of `(` is significant there (issue #34).
+        result = glue_lone_identifier_calls(&result);
         result = result.replace(" ^", "^");
         result = result.replace(" _", "_");
 
+        result = self.resolve_sized_delimiter_pairs(&result);
+
+        // Rewrite `\left\{ ... \right.` and repair base-less `_`/`^` attachments
+        // (see `postprocess_math`); the inline `$...$` path flows through here.
+        result = self.fix_left_brace_cases(&result);
+        result = self.fix_baseless_attachment(&result);
+
         result.trim().to_string()
+    }
+
+    /// Turn matched `\big|`/`\big\|` pairs into `abs(...)`/`norm(...)`. Only
+    /// sized delimiters carry markers, so ordinary bars are untouched and a
+    /// delimiterless matrix stays a determinant.
+    fn resolve_sized_delimiter_pairs(&self, input: &str) -> String {
+        let single = resolve_sized_delimiter_pair(input, SIZED_BAR_SENTINEL, "abs", "bar.v ", "|");
+        resolve_sized_delimiter_pair(
+            &single,
+            SIZED_DOUBLE_BAR_SENTINEL,
+            "norm",
+            "bar.v.double ",
+            "‖",
+        )
     }
 
     /// Fix missing spaces before Typst symbol names.
@@ -1420,8 +2741,14 @@ impl LatexConverter {
     /// Fix bb() (blackboard bold)
     pub fn fix_blackboard_bold(&self, input: &str) -> String {
         let mut result = input.to_string();
+        // Byte cursor into `result`. We must advance past every match we
+        // process, otherwise a `bb(...)` that rewrites to itself (any letter
+        // other than the special number sets, or an empty `bb()`) would be
+        // re-found at the same position on the next `find`, looping forever.
+        let mut search_from = 0;
 
-        while let Some(start) = result.find("bb(") {
+        while let Some(rel) = result[search_from..].find("bb(") {
+            let start = search_from + rel;
             let after = &result[start + 3..];
             if let Some(end) = self.find_matching_paren(after) {
                 let content = &after[..end];
@@ -1446,11 +2773,125 @@ impl LatexConverter {
                     replacement,
                     &result[total_end..]
                 );
+                // Resume scanning after the text we just wrote. Guarantees the
+                // cursor strictly advances even when the replacement still
+                // begins with `bb(`.
+                search_from = start + replacement.len();
             } else {
                 break;
             }
         }
 
+        result
+    }
+
+    /// Repair base-less `_`/`^` attachments that Typst rejects (from OCR-style
+    /// input like `V_{_{M-ABF}}` or a `^{a,b}` fragment), in two passes:
+    /// collapse a pure double attachment `_(_(X))` -> `_(X)`, then insert an
+    /// empty base `""` before any attachment still lacking one.
+    pub fn fix_baseless_attachment(&self, input: &str) -> String {
+        let collapsed = self.collapse_double_attachment(input);
+        self.insert_empty_attachment_base(&collapsed)
+    }
+
+    /// Collapse `_(_(X))` -> `_(X)` and `^(^(X))` -> `^(X)` when the inner
+    /// attachment is the outer group's only content (a pure wrapper).
+    fn collapse_double_attachment(&self, input: &str) -> String {
+        let mut result = input.to_string();
+        for op in ['_', '^'] {
+            // e.g. "_(_(" — an attachment whose content starts with the same
+            // base-less attachment.
+            let pat = format!("{op}({op}(");
+            let mut from = 0;
+            while let Some(rel) = result[from..].find(&pat) {
+                let start = from + rel; // outer op
+                let outer_open = start + 1; // outer '('
+                let inner_open = start + 3; // inner '('
+                let outer_end = self.find_matching_paren(&result[outer_open + 1..]);
+                let inner_end = self.find_matching_paren(&result[inner_open + 1..]);
+                if let (Some(o), Some(i)) = (outer_end, inner_end) {
+                    let outer_close = outer_open + 1 + o;
+                    let inner_close = inner_open + 1 + i;
+                    // Pure wrapper: the inner group's ')' is immediately
+                    // followed by the outer ')'.
+                    if inner_close + 1 == outer_close {
+                        self.attachment_repairs.note_nested_collapsed();
+                        let inner_content = result[inner_open + 1..inner_close].to_string();
+                        let replacement = format!("{op}({inner_content})");
+                        result = format!(
+                            "{}{}{}",
+                            &result[..start],
+                            replacement,
+                            &result[outer_close + 1..]
+                        );
+                        from = start + replacement.len();
+                        continue;
+                    }
+                }
+                from = start + 2;
+            }
+        }
+        result
+    }
+
+    /// Insert an empty base `""` before a `_(`/`^(` attachment that has no base
+    /// (at the start of the string or right after an opening `(`). Both are
+    /// positions where Typst would otherwise report an unexpected `_`/`^`.
+    fn insert_empty_attachment_base(&self, input: &str) -> String {
+        let mut out = String::with_capacity(input.len() + 4);
+        let mut last_nonspace: Option<char> = None;
+        let mut chars = input.chars().peekable();
+        while let Some(c) = chars.next() {
+            if (c == '_' || c == '^')
+                && chars.peek() == Some(&'(')
+                && matches!(last_nonspace, None | Some('('))
+            {
+                self.attachment_repairs.note_empty_base();
+                out.push_str("\"\"");
+                last_nonspace = Some('"');
+            }
+            out.push(c);
+            if !c.is_whitespace() {
+                last_nonspace = Some(c);
+            }
+        }
+        out
+    }
+
+    /// Rewrite a `\left\{ ... \right.` piecewise idiom into `cases(...)`. The
+    /// converter emits it as `lr({ ... )` with a null right delimiter, so the
+    /// `{` never closes and Typst reports "unclosed delimiter". Detect exactly
+    /// that shape (an `lr(` whose content opens with an unmatched `{`) and
+    /// rewrite it; a balanced `lr({ ... })` (a genuine set) is left alone.
+    pub fn fix_left_brace_cases(&self, input: &str) -> String {
+        let mut result = input.to_string();
+        let mut from = 0;
+        while let Some(rel) = result[from..].find("lr(") {
+            let lr_start = from + rel;
+            let open_paren = lr_start + 2; // the '(' of `lr(`
+            let Some(close_rel) = self.find_matching_paren(&result[open_paren + 1..]) else {
+                from = lr_start + 3;
+                continue;
+            };
+            let lr_close = open_paren + 1 + close_rel; // the matching ')'
+            let inner = &result[open_paren + 1..lr_close];
+            let inner_trim = inner.trim_start();
+            // Null right delimiter <=> the leading '{' has no matching '}'.
+            if let Some(body) = inner_trim.strip_prefix('{') {
+                if inner.matches('{').count() > inner.matches('}').count() {
+                    let cases = body_to_cases(body.trim());
+                    result = format!(
+                        "{}{}{}",
+                        &result[..lr_start],
+                        cases,
+                        &result[lr_close + 1..]
+                    );
+                    from = lr_start + cases.len();
+                    continue;
+                }
+            }
+            from = lr_start + 3;
+        }
         result
     }
 
@@ -1662,21 +3103,51 @@ impl LatexConverter {
 
     /// Process SI unit string
     pub fn process_si_unit(&self, input: &str) -> String {
-        let mut result = input.to_string();
-
-        for (cmd, val) in crate::siunitx::SI_UNITS.iter() {
-            result = result.replace(cmd, val);
+        // Map whole `\macro` names: `\m`/`\s` are prefixes of `\micro`/`\second` (issue #40).
+        let chars: Vec<char> = input.chars().collect();
+        let mut result = String::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\\' {
+                let name_start = i + 1;
+                let mut j = name_start;
+                while j < chars.len() && chars[j].is_ascii_alphabetic() {
+                    j += 1;
+                }
+                let name: String = chars[name_start..j].iter().collect();
+                if name.is_empty() {
+                    // Lone backslash (e.g. an escaped symbol): keep it verbatim.
+                    result.push('\\');
+                    i += 1;
+                    continue;
+                }
+                let full: String = chars[i..j].iter().collect(); // includes '\'
+                match name.as_str() {
+                    "per" => result.push('/'),
+                    "squared" => result.push('²'),
+                    "cubed" => result.push('³'),
+                    _ => {
+                        if let Some(val) = crate::siunitx::SI_PREFIXES
+                            .get(full.as_str())
+                            .or_else(|| crate::siunitx::SI_UNITS.get(full.as_str()))
+                        {
+                            result.push_str(val);
+                        } else {
+                            // Unknown unit macro: keep the bare name rather than dropping it.
+                            result.push_str(&name);
+                        }
+                    }
+                }
+                i = j;
+            } else if c.is_whitespace() {
+                // Unit strings carry no significant whitespace: `\metre \per \second` is `m/s`.
+                i += 1;
+            } else {
+                result.push(c);
+                i += 1;
+            }
         }
-        for (cmd, val) in crate::siunitx::SI_PREFIXES.iter() {
-            result = result.replace(cmd, val);
-        }
-
-        result = result
-            .replace("\\per", "/")
-            .replace("\\squared", "²")
-            .replace("\\cubed", "³")
-            .replace(" ", "");
-
         result
     }
 
@@ -1702,11 +3173,78 @@ impl LatexConverter {
 
     /// Visit environment content (excluding begin/end)
     pub fn visit_env_content(&mut self, node: &SyntaxNode, output: &mut String) {
-        for child in node.children_with_tokens() {
+        let children: Vec<SyntaxElement> = node.children_with_tokens().collect();
+        let mut content = Vec::with_capacity(children.len());
+        let mut i = 0;
+        // Header argument slots are bound by the environment signature, so this is body.
+        while i < children.len() {
+            let child = &children[i];
             match child.kind() {
-                SyntaxKind::ItemBegin | SyntaxKind::ItemEnd => continue,
-                _ => self.visit_element(child, output),
+                SyntaxKind::ItemBegin | SyntaxKind::ItemEnd => {
+                    i += 1;
+                }
+                SyntaxKind::ItemNewLine => {
+                    content.push(child.clone());
+                    // Drop the optional row-spacing arg of `\\` (`\\[6pt]`),
+                    // else it leaks into the row as a stray cell (issue #41).
+                    // mitex emits it as sibling `[`/body/`]` tokens or one
+                    // `ItemBracket`; `skip_optional_row_spacing` handles both.
+                    i = self.skip_optional_row_spacing(&children, i + 1);
+                }
+                _ => {
+                    content.push(child.clone());
+                    i += 1;
+                }
             }
+        }
+        self.visit_elements(&content, output);
+    }
+
+    /// Index past an optional `[<dimension>]` group at `start`, else `start`.
+    /// Only a dimension-like body ([`is_tex_dimension`]) is consumed, so real
+    /// bracketed row content survives. `%` comments are trivia like whitespace,
+    /// so `\\% note<newline>[6pt]` is `\\[6pt]` (issue #41).
+    fn skip_optional_row_spacing(&self, children: &[SyntaxElement], start: usize) -> usize {
+        let mut j = start;
+        while j < children.len()
+            && (matches!(
+                children[j].kind(),
+                SyntaxKind::TokenWhiteSpace | SyntaxKind::TokenLineBreak | SyntaxKind::TokenComment
+            ) || is_command_named(&children[j], "par"))
+        {
+            j += 1;
+        }
+        if j >= children.len() {
+            return start;
+        }
+
+        if children[j].kind() == SyntaxKind::ItemBracket {
+            let raw = element_source_text(&children[j]);
+            let is_dimension = raw
+                .strip_prefix('[')
+                .and_then(|body| body.strip_suffix(']'))
+                .is_some_and(is_tex_dimension);
+            return if is_dimension { j + 1 } else { start };
+        }
+
+        if children[j].kind() != SyntaxKind::TokenLBracket {
+            return start;
+        }
+        let mut k = j + 1;
+        let mut body = String::new();
+        let mut closed = false;
+        while k < children.len() {
+            if children[k].kind() == SyntaxKind::TokenRBracket {
+                closed = true;
+                break;
+            }
+            body.push_str(&element_source_text(&children[k]));
+            k += 1;
+        }
+        if closed && is_tex_dimension(body.trim()) {
+            k + 1 // consume through the closing ']'
+        } else {
+            start
         }
     }
 

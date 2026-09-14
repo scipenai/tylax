@@ -181,9 +181,15 @@ pub struct ConvertContext {
     /// Pending label to be attached to the next figure/table environment
     pub pending_label: Option<String>,
     /// Whether a math line break (`\`) should render as LaTeX's `\\` row
-    /// separator. Defaults to false because new contexts often render inline
-    /// fragments (scripts, matrix cells, function arguments); row-level callers
-    /// opt in explicitly.
+    /// separator.
+    ///
+    /// Compatibility override retained for the 0.3.x API.
+    ///
+    /// Internal conversion derives row-level rendering from
+    /// `EnvironmentContext::Align`, so new internal paths do not need to keep a
+    /// parallel flag in sync. The public field remains functional for callers
+    /// that construct `ConvertContext` directly; it can be removed only in the
+    /// next breaking release. New callers should prefer the environment stack.
     pub linebreak_as_row: bool,
 }
 

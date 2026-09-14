@@ -118,6 +118,10 @@ pub fn call_builtin(
         "path" => builtin_layout_func("path", args, named).into(),
         "image" => builtin_image(args, named).into(),
         "figure" => builtin_layout_func("figure", args, named).into(),
+        "table" => builtin_layout_func("table", args, named).into(),
+        "table.header" | "table.cell" | "table.hline" | "table.vline" => {
+            builtin_layout_func(name, args, named).into()
+        }
         "h" => builtin_layout_func("h", args, named).into(),
         "v" => builtin_layout_func("v", args, named).into(),
         "par" => builtin_layout_func("par", args, named).into(),

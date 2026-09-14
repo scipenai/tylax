@@ -750,6 +750,9 @@ pub struct TikZNode {
 /// Drawing options/styles
 #[derive(Debug, Clone, Default)]
 pub struct DrawOptions {
+    /// Last stroke color set, independent of whether stroking is on. Never
+    /// holds `none`: `draw=none` is a mode switch, not a color, so it must not
+    /// erase one. Whether it is painted is `DrawOptions::stroke_enabled`.
     pub color: Option<String>,
     pub fill_color: Option<String>,
     pub line_width: Option<String>,
@@ -810,11 +813,22 @@ impl DrawOptions {
                 _ => {}
             }
 
-            // Line style
-            if part == "dashed" {
-                opts.dashed = true;
-            } else if part == "dotted" {
-                opts.dotted = true;
+            // Line style. TikZ applies options left to right, so a later style
+            // must clear the previous mutually exclusive style as well.
+            match part {
+                "solid" => {
+                    opts.dashed = false;
+                    opts.dotted = false;
+                }
+                "dashed" => {
+                    opts.dashed = true;
+                    opts.dotted = false;
+                }
+                "dotted" => {
+                    opts.dashed = false;
+                    opts.dotted = true;
+                }
+                _ => {}
             }
 
             // Arrows
@@ -834,13 +848,22 @@ impl DrawOptions {
                 opts.rounded_corners = true;
             }
 
-            // Colors
-            if part.starts_with("draw=") {
-                opts.color = Some(part.trim_start_matches("draw=").to_string());
-            } else if part.starts_with("fill=") {
-                opts.fill_color = Some(part.trim_start_matches("fill=").to_string());
-            } else if part.starts_with("color=") {
-                opts.color = Some(part.trim_start_matches("color=").to_string());
+            // Colors. TikZ permits whitespace around `=`, so parse the key
+            // structurally instead of requiring the compact `draw=red` form.
+            if let Some((key, value)) = part.split_once('=') {
+                match key.trim() {
+                    "draw" => {
+                        let value = value.trim();
+                        // `draw=none` is `drawfalse`, not a color: leave the
+                        // chosen color so a later bare `draw` resumes it.
+                        if !value.eq_ignore_ascii_case("none") {
+                            opts.color = Some(value.to_string());
+                        }
+                    }
+                    "fill" => opts.fill_color = Some(value.trim().to_string()),
+                    "color" => opts.color = Some(value.trim().to_string()),
+                    _ => {}
+                }
             } else if is_color_name(part) {
                 opts.color = Some(part.to_string());
             }
@@ -885,6 +908,25 @@ impl DrawOptions {
         opts
     }
 
+    /// The option list's FINAL stroke switch; the last mention wins. Neither
+    /// `draw=none` nor a bare `draw` touches the color, so this is derived here
+    /// rather than smuggled into `color`.
+    ///
+    /// A helper over `raw_options`, not a new field: every field of this struct
+    /// is `pub`, so adding one breaks downstream literals. All callers must
+    /// share it, or the border decision and painted stroke can disagree.
+    fn stroke_enabled(&self) -> Option<bool> {
+        self.raw_options.as_deref()?.split(',').rev().find_map(|p| {
+            let part = p.trim();
+            if part == "draw" {
+                return Some(true);
+            }
+            part.split_once('=').and_then(|(key, value)| {
+                (key.trim() == "draw").then(|| !value.trim().eq_ignore_ascii_case("none"))
+            })
+        })
+    }
+
     /// Convert to CeTZ style string
     pub fn to_cetz_style(&self) -> String {
         let mut parts = Vec::new();
@@ -906,8 +948,11 @@ impl DrawOptions {
             stroke_parts.push("dash: \"dotted\"".to_string());
         }
 
-        // Generate stroke attribute
-        if !stroke_parts.is_empty() {
+        // Generate stroke attribute. An explicit `draw=none` suppresses the
+        // stroke outright; the recorded color is kept but simply not drawn.
+        if self.stroke_enabled() == Some(false) {
+            parts.push("stroke: none".to_string());
+        } else if !stroke_parts.is_empty() {
             // Simple color-only stroke (no width, no dash pattern)
             let is_simple = stroke_parts.len() == 1
                 && self.line_width.is_none()
@@ -1832,12 +1877,14 @@ fn convert_command_to_cetz(output: &mut String, cmd: &TikZCommand, indent_level:
             convert_node_command_with_indent(output, node, indent_level);
         }
         TikZCommand::Coordinate { name, position } => {
+            // A named empty `content` draws nothing but registers the name,
+            // so later `line("g1", ..)` resolves (issue #39).
             let _ = writeln!(
                 output,
-                "{}// Coordinate: {} at {}",
+                "{}content({}, [], name: \"{}\")",
                 indent,
-                name,
-                position.to_cetz()
+                position.to_cetz(),
+                name
             );
         }
         TikZCommand::Foreach {
@@ -1913,6 +1960,27 @@ fn convert_node_command_with_indent(output: &mut String, node: &TikZNode, indent
     // Only escape # which has special meaning in Typst
     let text = node.text.replace("#", "\\#");
 
+    // A `\node[draw, ...]` draws a border: emit the shape (named, so references
+    // resolve) with the label on top, or only the letters remain (issue #39).
+    if let Some(rect_args) = node_rect_args(node) {
+        let mut rect_options = Vec::new();
+        if let Some(name) = &node.name {
+            rect_options.push(format!("name: \"{}\"", name));
+        }
+        let style = node.options.to_cetz_style();
+        if !style.is_empty() {
+            rect_options.push(style);
+        }
+        let options = if rect_options.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", rect_options.join(", "))
+        };
+        let _ = writeln!(output, "{}rect({}{})", indent, rect_args, options);
+        let _ = writeln!(output, "{}content({}, [{}])", indent, pos, text);
+        return;
+    }
+
     let mut opts = Vec::new();
     if let Some(ref anchor) = node.options.anchor {
         // Map TikZ position to CeTZ anchor (they have opposite semantics!)
@@ -1935,6 +2003,148 @@ fn convert_node_command_with_indent(output: &mut String, node: &TikZNode, indent
             opts.join(", ")
         );
     }
+}
+
+/// Parse a concrete TikZ length into CeTZ's centimetre-like coordinate unit.
+///
+/// A bare numeric value or a relative unit such as `em` cannot be interpreted
+/// without TikZ's current style/font context, so callers must preserve their
+/// existing fallback rather than inventing geometry.
+fn parse_tikz_length(raw: &str) -> Option<f64> {
+    let trimmed = raw.trim().trim_start_matches('=').trim();
+    let number_end = trimmed
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
+        .count();
+    let number = trimmed[..number_end].parse::<f64>().ok()?;
+    let unit = trimmed[number_end..].trim();
+
+    match unit {
+        "cm" => Some(number),
+        "mm" => Some(number / 10.0),
+        "in" => Some(number * 2.54),
+        "pt" => Some(number / 28.45),
+        "bp" => Some(number / 28.346),
+        "pc" => Some(number * 12.0 / 28.45),
+        _ => None,
+    }
+}
+
+/// Two-corner arguments for a CeTZ `rect(..)`, when a node declares a drawn
+/// rectangle with concrete dimensions at an absolute position. Anything relying
+/// on layout defaults or font metrics falls back to `content` (issue #39).
+fn node_rect_args(node: &TikZNode) -> Option<String> {
+    let raw = node.options.raw_options.as_deref()?;
+    let parts: Vec<&str> = raw.split(',').map(|p| p.trim()).collect();
+
+    // TikZ applies options left to right, so a repeated key takes its LAST
+    // value; every lookup below therefore scans in reverse.
+
+    // Read the state `parse` already resolved: a second scan could disagree
+    // with the emitted stroke and draw the border invisibly.
+    if node.options.stroke_enabled() != Some(true) {
+        return None;
+    }
+    // A CeTZ `rect` is axis-aligned and sized only from the centre and minimum
+    // dimensions, so it needs POSITIVE evidence: TikZ options are open-ended and
+    // an unrecognized one may be the shape or transform that changes the
+    // geometry. Both whitelists below are derived from `DrawOptions::parse` and
+    // must be extended in step with it; anything else degrades (issue #39).
+    let eq_ci = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+
+    // Bare tokens the parser records and `to_cetz_style` emits, plus faithful
+    // no-ops. Absent because neither parses them: `semithick`, `densely`/
+    // `loosely` variants, `dash dot`, `double`, bare `fill`.
+    const SAFE_BARE_STYLES: &[&str] = &[
+        // Border action; the stroke itself is emitted by `to_cetz_style`.
+        "draw",
+        // Faithful no-ops: both restate the CeTZ/TikZ default for a rectangle.
+        "solid",
+        "sharp corners",
+        // Line widths mapped to a `thickness:` in `DrawOptions::parse`.
+        "ultra thin",
+        "very thin",
+        "thin",
+        "thick",
+        "very thick",
+        "ultra thick",
+        // Line styles mapped to a `dash:` in `DrawOptions::parse`.
+        "dashed",
+        "dotted",
+    ];
+
+    // Keys rendered faithfully or consumed as geometry. `line width=<len>` is
+    // absent — the parser reads only bare width keywords — as is every key that
+    // pads, transforms, re-places or resizes the box.
+    const SAFE_KEYS: &[&str] = &[
+        // Stroke/fill colors, incl. mixes (`draw=red!50`) via `convert_color`.
+        "draw",
+        "fill",
+        "color",
+        // Consumed as the box geometry below.
+        "minimum width",
+        "minimum height",
+    ];
+
+    // Vet EVERY option, whether or not the shape was declared explicitly: an
+    // explicit `shape=rectangle` says nothing about the other keys.
+    let mut shape_is_rectangle = true;
+    for part in &parts {
+        let token = part.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match token.split_once('=') {
+            Some((key, value)) => {
+                let key = key.trim();
+                // A declared shape is authoritative and applied in order, so
+                // a later declaration overwrites an earlier one.
+                if eq_ci(key, "shape") {
+                    shape_is_rectangle = eq_ci(value.trim(), "rectangle");
+                } else if !SAFE_KEYS.iter().any(|k| eq_ci(key, k)) {
+                    return None;
+                }
+            }
+            // A bare color counts only when `is_color_name` accepts it, the
+            // same test `parse` applies, so `red!50` is not silently dropped.
+            None => {
+                if eq_ci(token, "rectangle") {
+                    // The bare form is a shape declaration too, so it overrides
+                    // an earlier `shape=` exactly like a later `shape=` would.
+                    shape_is_rectangle = true;
+                } else if !(is_color_name(token)
+                    || SAFE_BARE_STYLES.iter().any(|s| eq_ci(token, s)))
+                {
+                    return None;
+                }
+            }
+        }
+    }
+    if !shape_is_rectangle {
+        return None;
+    }
+
+    // Border geometry needs a concrete centre.
+    let (cx, cy) = match node.position.as_ref()? {
+        Coordinate::Absolute(x, y) => (*x, *y),
+        _ => return None,
+    };
+
+    // Take the LAST declaration and require THAT one to parse, or an unusable
+    // `2em` would silently size the box from an overridden earlier value.
+    let find_len = |key: &str| {
+        parts
+            .iter()
+            .rev()
+            .find_map(|p| p.strip_prefix(key))
+            .and_then(parse_tikz_length)
+    };
+    let width = find_len("minimum width")?;
+    let height = find_len("minimum height")?;
+
+    let (x1, y1) = (cx - width / 2.0, cy - height / 2.0);
+    let (x2, y2) = (cx + width / 2.0, cy + height / 2.0);
+    Some(format!("({}, {}), ({}, {})", x1, y1, x2, y2))
 }
 
 /// Convert relative positioning to CeTZ coordinate expression
@@ -3380,6 +3590,336 @@ canvas({
         let cetz = convert_tikz_to_cetz(tikz);
         assert!(cetz.contains("content"));
         assert!(cetz.contains("Hello"));
+    }
+
+    #[test]
+    fn test_node_shape_circle_is_not_drawn_as_rect() {
+        // `shape=circle` is a standard TikZ form; sizing it as a CeTZ `rect`
+        // would draw a box where a circle was requested. Fall back to content.
+        let tikz = r"\begin{tikzpicture}\node[draw,shape=circle,minimum width=1cm,minimum height=1cm] at (0,0) {A};\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(
+            !cetz.contains("rect("),
+            "shape=circle must not be drawn as a rectangle, got:\n{cetz}"
+        );
+        assert!(
+            cetz.contains("content("),
+            "expected a content fallback, got:\n{cetz}"
+        );
+    }
+
+    #[test]
+    fn test_node_bare_ellipse_is_not_drawn_as_rect() {
+        let tikz = r"\begin{tikzpicture}\node[draw,ellipse,minimum width=2cm,minimum height=1cm] at (0,0) {B};\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(
+            !cetz.contains("rect("),
+            "bare ellipse must not be drawn as a rectangle, got:\n{cetz}"
+        );
+        assert!(cetz.contains("content("), "expected content, got:\n{cetz}");
+    }
+
+    #[test]
+    fn test_node_rounded_corners_is_not_drawn_as_sharp_rect() {
+        // A rounded rectangle drawn as a sharp `rect` misrepresents the border.
+        let tikz = r"\begin{tikzpicture}\node[draw,rounded corners,minimum width=2cm,minimum height=1cm] at (0,0) {C};\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(
+            !cetz.contains("rect("),
+            "rounded corners must not become a sharp rect, got:\n{cetz}"
+        );
+        assert!(cetz.contains("content("), "expected content, got:\n{cetz}");
+    }
+
+    #[test]
+    fn test_node_library_shape_single_arrow_is_not_drawn_as_rect() {
+        // `single arrow` is a legal shape absent from any fixed blacklist, so
+        // positive-evidence detection must reject it.
+        let tikz = r"\begin{tikzpicture}\node[draw,single arrow,minimum width=2cm,minimum height=1cm] at (0,0) {A};\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(
+            !cetz.contains("rect("),
+            "an unknown library shape must not be drawn as a rectangle, got:\n{cetz}"
+        );
+        assert!(cetz.contains("content("), "expected content, got:\n{cetz}");
+    }
+
+    #[test]
+    fn test_node_repeated_minimum_size_uses_the_last_value() {
+        // A repeated key takes its last value; reading the first sizes the box
+        // from a setting the input already overrode.
+        let tikz = r"\begin{tikzpicture}\node[draw,minimum width=1cm,minimum width=2cm,minimum height=1cm] at (0,0) {A};\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(
+            cetz.contains("rect((-1, -0.5), (1, 0.5))"),
+            "the later `minimum width=2cm` must win, got:\n{cetz}"
+        );
+    }
+
+    #[test]
+    fn test_node_overridden_minimum_size_falls_back_when_final_value_is_unusable() {
+        // The override counts: `2em` needs font metrics, so the node degrades
+        // rather than sizing itself from the superseded `1cm`.
+        let tikz = r"\begin{tikzpicture}\node[draw,minimum width=1cm,minimum width=2em,minimum height=1cm] at (0,0) {A};\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(
+            !cetz.contains("rect("),
+            "an unusable final width must not fall back to the overridden one, got:\n{cetz}"
+        );
+        assert!(cetz.contains("content("), "expected content, got:\n{cetz}");
+    }
+
+    #[test]
+    fn test_node_repeated_shape_uses_the_last_declaration() {
+        // Same override rule for the shape, in both directions.
+        let to_rect = r"\begin{tikzpicture}\node[draw,shape=circle,shape=rectangle,minimum width=2cm,minimum height=1cm] at (0,0) {A};\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(to_rect);
+        assert!(
+            cetz.contains("rect("),
+            "a later `shape=rectangle` must win, got:\n{cetz}"
+        );
+
+        let to_circle = r"\begin{tikzpicture}\node[draw,shape=rectangle,shape=circle,minimum width=2cm,minimum height=1cm] at (0,0) {A};\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(to_circle);
+        assert!(
+            !cetz.contains("rect("),
+            "a later `shape=circle` must win, got:\n{cetz}"
+        );
+    }
+
+    #[test]
+    fn test_node_repeated_draw_action_uses_the_last_declaration() {
+        // `draw=none` after `draw` removes the border; the reverse restores it.
+        let disabled = r"\begin{tikzpicture}\node[draw,draw=none,minimum width=2cm,minimum height=1cm] at (0,0) {A};\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(disabled);
+        assert!(
+            !cetz.contains("rect("),
+            "a later `draw=none` must remove the border, got:\n{cetz}"
+        );
+
+        let enabled = r"\begin{tikzpicture}\node[draw=none,draw,minimum width=2cm,minimum height=1cm] at (0,0) {A};\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(enabled);
+        assert!(
+            cetz.contains("rect("),
+            "a later `draw` must restore the border, got:\n{cetz}"
+        );
+        // A restored border must be visible: the stroke state has to agree
+        // with the decision to draw.
+        assert!(
+            !cetz.contains("stroke: none"),
+            "the restored border must not stay invisible, got:\n{cetz}"
+        );
+    }
+
+    #[test]
+    fn test_draw_none_is_a_mode_switch_not_a_color() {
+        // TikZ's `draw=none` sets `drawfalse` only; it never clears the stroke
+        // color, so a later bare `draw` (`drawtrue`) resumes the earlier color.
+        let resumed = DrawOptions::parse("[draw=red,draw=none,draw]");
+        assert_eq!(resumed.stroke_enabled(), Some(true));
+        assert_eq!(
+            resumed.color.as_deref(),
+            Some("red"),
+            "`draw=none` must not erase the color set before it"
+        );
+        assert!(
+            resumed.to_cetz_style().contains("stroke: red"),
+            "style: {}",
+            resumed.to_cetz_style()
+        );
+
+        // The color is remembered but not painted while stroking is off.
+        let disabled = DrawOptions::parse("[draw=red,draw=none]");
+        assert_eq!(disabled.stroke_enabled(), Some(false));
+        assert_eq!(disabled.color.as_deref(), Some("red"));
+        assert!(
+            disabled.to_cetz_style().contains("stroke: none"),
+            "style: {}",
+            disabled.to_cetz_style()
+        );
+
+        // A bare `draw` with no color set stays at the default stroke.
+        let plain = DrawOptions::parse("[draw=none,draw]");
+        assert_eq!(plain.stroke_enabled(), Some(true));
+        assert_eq!(plain.color, None);
+        assert!(
+            !plain.to_cetz_style().contains("stroke: none"),
+            "style: {}",
+            plain.to_cetz_style()
+        );
+    }
+
+    #[test]
+    fn test_node_resumed_draw_keeps_the_earlier_stroke_color() {
+        // End to end: the border comes back AND keeps its red stroke.
+        let tikz = r"\begin{tikzpicture}\node[draw=red,draw=none,draw,minimum width=2cm,minimum height=1cm] at (0,0) {A};\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(
+            cetz.contains("stroke: red"),
+            "the resumed border must keep the earlier color, got:\n{cetz}"
+        );
+        assert!(
+            !cetz.contains("stroke: none"),
+            "the resumed border must be visible, got:\n{cetz}"
+        );
+    }
+
+    #[test]
+    fn test_node_unrendered_styles_do_not_yield_an_unstyled_rect() {
+        // The whitelist tracks what the parser actually converts. These are
+        // legal TikZ but none survives it, so a plain rectangle would discard
+        // the requested style — degrade to content instead.
+        for option in [
+            "line width=10pt",
+            "semithick",
+            "densely dotted",
+            "dash dot",
+            "double",
+            "red!50",
+        ] {
+            let tikz = format!(
+                r"\begin{{tikzpicture}}\node[draw,rectangle,{option},minimum width=2cm,minimum height=1cm] at (0,0) {{A}};\end{{tikzpicture}}"
+            );
+            let cetz = convert_tikz_to_cetz(&tikz);
+            assert!(
+                !cetz.contains("rect("),
+                "`{option}` is not converted, so it must not produce an unstyled rect, got:\n{cetz}"
+            );
+            assert!(
+                cetz.contains("content("),
+                "`{option}` should degrade to content, got:\n{cetz}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_node_rendered_styles_are_kept_on_the_rect() {
+        // The other half of the contract: styles the parser DOES convert must
+        // reach the emitted rect, not be lost to an over-strict whitelist.
+        let tikz = r"\begin{tikzpicture}\node[draw,rectangle,very thick,dashed,minimum width=2cm,minimum height=1cm] at (0,0) {A};\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(cetz.contains("rect("), "expected a rect, got:\n{cetz}");
+        assert!(
+            cetz.contains("thickness: 1.2pt") && cetz.contains("dash: \"dashed\""),
+            "converted styles must be carried onto the rect, got:\n{cetz}"
+        );
+    }
+
+    #[test]
+    fn test_line_style_uses_the_last_declaration() {
+        // TikZ options are applied left to right. These state transitions must
+        // agree with the final CeTZ dash value instead of accumulating every
+        // style token the list contained.
+        let solid = DrawOptions::parse("[dashed, solid]");
+        assert!(!solid.dashed && !solid.dotted);
+        assert!(
+            !solid.to_cetz_style().contains("dash:"),
+            "a later solid must clear the dash: {}",
+            solid.to_cetz_style()
+        );
+
+        let dashed = DrawOptions::parse("[dotted, dashed]");
+        assert!(dashed.dashed && !dashed.dotted);
+        assert!(
+            dashed.to_cetz_style().contains("dash: \"dashed\"")
+                && !dashed.to_cetz_style().contains("dash: \"dotted\""),
+            "a later dashed must replace dotted: {}",
+            dashed.to_cetz_style()
+        );
+
+        let dotted = DrawOptions::parse("[dashed, dotted]");
+        assert!(!dotted.dashed && dotted.dotted);
+        assert!(
+            dotted.to_cetz_style().contains("dash: \"dotted\"")
+                && !dotted.to_cetz_style().contains("dash: \"dashed\""),
+            "a later dotted must replace dashed: {}",
+            dotted.to_cetz_style()
+        );
+    }
+
+    #[test]
+    fn test_node_color_mix_is_kept_when_given_as_draw_value() {
+        // `draw=red!50` IS parsed (and `convert_color` handles the mix), unlike
+        // the bare `red!50` form — so it must keep its border and its tint.
+        let tikz = r"\begin{tikzpicture}\node[draw=red!50,rectangle,minimum width=2cm,minimum height=1cm] at (0,0) {A};\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(cetz.contains("rect("), "expected a rect, got:\n{cetz}");
+        assert!(
+            cetz.contains("lighten"),
+            "the color mix must be converted, got:\n{cetz}"
+        );
+    }
+
+    #[test]
+    fn test_node_shape_border_rotate_is_not_drawn_as_axis_aligned_rect() {
+        // An explicit `shape=rectangle` says nothing about the OTHER keys:
+        // `shape border rotate` turns the box, which an axis-aligned CeTZ
+        // `rect` cannot express, so the whole node must degrade to content.
+        let tikz = r"\begin{tikzpicture}\node[draw,shape=rectangle,shape border rotate=45,minimum width=2cm,minimum height=1cm] at (0,0) {A};\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(
+            !cetz.contains("rect("),
+            "a rotated rectangle border must not be drawn axis-aligned, got:\n{cetz}"
+        );
+        assert!(cetz.contains("content("), "expected content, got:\n{cetz}");
+    }
+
+    #[test]
+    fn test_node_inner_sep_is_not_sized_from_minimum_alone() {
+        // `inner sep` pads the node beyond its minimum size; ignoring it would
+        // emit a box of the wrong dimensions.
+        let tikz = r"\begin{tikzpicture}\node[draw,rectangle,inner sep=5mm,minimum width=2cm,minimum height=1cm] at (0,0) {A};\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(
+            !cetz.contains("rect("),
+            "padding we cannot reproduce must not yield a wrongly sized rect, got:\n{cetz}"
+        );
+        assert!(cetz.contains("content("), "expected content, got:\n{cetz}");
+    }
+
+    #[test]
+    fn test_node_anchor_is_not_drawn_as_centred_rect() {
+        // The rect path places the box around the coordinate; `anchor` moves the
+        // node relative to it, so a centred rect would sit in the wrong place.
+        let tikz = r"\begin{tikzpicture}\node[draw,rectangle,anchor=west,minimum width=2cm,minimum height=1cm] at (0,0) {A};\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(
+            !cetz.contains("rect("),
+            "an anchored node must not be drawn as a centred rect, got:\n{cetz}"
+        );
+    }
+
+    #[test]
+    fn test_node_colored_rectangle_still_drawn_as_rect() {
+        // Guard against over-conservatism: recognized non-shape style tokens
+        // (a color, a line width) must not suppress a genuine rectangle border.
+        let tikz = r"\begin{tikzpicture}\node[draw,thick,red,minimum width=2cm,minimum height=1cm] at (0,0) {F};\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(
+            cetz.contains("rect("),
+            "a styled but rectangular node should keep its border, got:\n{cetz}"
+        );
+    }
+
+    #[test]
+    fn test_node_plain_rectangle_still_drawn_as_rect() {
+        // Regression guard: a genuinely rectangular sized node keeps the border.
+        let tikz = r"\begin{tikzpicture}\node[draw,minimum width=2cm,minimum height=1cm] at (0,0) {D};\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(
+            cetz.contains("rect("),
+            "a plain sized rectangle should keep its border, got:\n{cetz}"
+        );
+    }
+
+    #[test]
+    fn test_node_explicit_shape_rectangle_drawn_as_rect() {
+        let tikz = r"\begin{tikzpicture}\node[draw,shape=rectangle,minimum width=2cm,minimum height=1cm] at (0,0) {E};\end{tikzpicture}";
+        let cetz = convert_tikz_to_cetz(tikz);
+        assert!(
+            cetz.contains("rect("),
+            "shape=rectangle should keep its border, got:\n{cetz}"
+        );
     }
 
     #[test]

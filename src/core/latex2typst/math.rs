@@ -2,7 +2,7 @@
 //!
 //! This module handles math formulas, delimiters, and math-specific constructs.
 
-use mitex_parser::syntax::{CmdItem, FormulaItem, SyntaxElement, SyntaxKind, SyntaxNode};
+use mitex_parser::syntax::{CmdItem, EnvItem, FormulaItem, SyntaxElement, SyntaxKind, SyntaxNode};
 use rowan::ast::AstNode;
 use std::fmt::Write;
 
@@ -52,7 +52,12 @@ pub fn convert_curly(conv: &mut LatexConverter, elem: SyntaxElement, output: &mu
     };
 
     if let Some(pending) = conv.state.pending_citation.take() {
-        super::markup::emit_pending_citation_from_curly(&node, pending, output);
+        super::markup::emit_pending_citation_from_curly(
+            &node,
+            pending,
+            &mut conv.citations.pending,
+            output,
+        );
         return;
     }
 
@@ -102,9 +107,12 @@ pub fn convert_curly(conv: &mut LatexConverter, elem: SyntaxElement, output: &mu
         return;
     }
 
-    // Check if it's empty
+    // Check if it's empty, then visit the group as a sequence so TeX style
+    // declarations remain scoped to the group rather than escaping it.
+    let children: Vec<_> = node.children_with_tokens().collect();
     let mut has_content = false;
-    for child in node.children_with_tokens() {
+    let mut content = Vec::new();
+    for child in children {
         match child.kind() {
             SyntaxKind::TokenWhiteSpace
             | SyntaxKind::TokenLineBreak
@@ -112,8 +120,14 @@ pub fn convert_curly(conv: &mut LatexConverter, elem: SyntaxElement, output: &mu
             | SyntaxKind::TokenRBrace => {}
             _ => has_content = true,
         }
-        conv.visit_element(child, output);
+        if !matches!(
+            child.kind(),
+            SyntaxKind::TokenLBrace | SyntaxKind::TokenRBrace
+        ) {
+            content.push(child);
+        }
     }
+    conv.visit_elements(&content, output);
     // Add zero-width space for empty groups in math mode
     if !has_content && matches!(conv.state.mode, ConversionMode::Math) {
         output.push_str("zws ");
@@ -222,6 +236,19 @@ pub fn convert_lr(conv: &mut LatexConverter, elem: SyntaxElement, output: &mut S
         // Other cases - try lr() but mark as potentially invalid
         _ => (true, true),
     };
+
+    // `\left\{ ... \right.` is LaTeX's piecewise-definition idiom. Convert a
+    // contained matrix-like environment while the AST still distinguishes
+    // columns (`&`), row breaks (`\\`), and literal commas. Reconstructing a
+    // `cases(...)` call from the rendered `mat(...)` text loses that distinction.
+    if left_delim.as_deref() == Some("{") && right_delim.as_deref() == Some(".") {
+        if let Some(cases_env) =
+            classify_lr_cases_environment(children.as_slice(), body_start, body_end)
+        {
+            super::environment::convert_cases(conv, &cases_env, output);
+            return;
+        }
+    }
 
     // Check for matrix-like bodies first so determinant-style expressions with
     // vertical bars do not get collapsed into abs()/norm().
@@ -400,6 +427,42 @@ struct LrMatrixBody {
     env_name: String,
     node: SyntaxNode,
     kind: LrMatrixKind,
+}
+
+/// Return a standalone environment that represents the body of a piecewise
+/// expression. These environments use the same row/cell grammar as `cases`,
+/// so they can be converted under `EnvironmentContext::Cases` directly.
+fn classify_lr_cases_environment(
+    children: &[SyntaxElement],
+    body_start: usize,
+    body_end: usize,
+) -> Option<SyntaxNode> {
+    let mut significant = Vec::new();
+
+    for child in children.iter().take(body_end).skip(body_start) {
+        match child {
+            SyntaxElement::Token(t)
+                if matches!(
+                    t.kind(),
+                    SyntaxKind::TokenWhiteSpace | SyntaxKind::TokenLineBreak
+                ) => {}
+            SyntaxElement::Token(t) if t.text() == "." => {}
+            SyntaxElement::Node(n) if n.kind() == SyntaxKind::ClauseLR => {}
+            _ => significant.push(child),
+        }
+    }
+
+    if significant.len() != 1 {
+        return None;
+    }
+
+    let node = unwrap_trivial_matrix_wrapper(significant[0].clone())?;
+    let env = EnvItem::cast(node.clone())?;
+    matches!(
+        env.name_tok()?.text(),
+        "aligned" | "array" | "matrix" | "smallmatrix"
+    )
+    .then_some(node)
 }
 
 fn classify_lr_matrix_like(
@@ -622,7 +685,12 @@ fn fold_brace_annotation(conv: &mut LatexConverter, node: &SyntaxNode) -> Option
     }
 
     let script = script?;
-    let body = conv.convert_required_arg(&cmd, 0)?;
+    // The folded body is math content (e.g. `AB` in `\underbrace{AB}_{C}`); force
+    // math rendering so it splits into atoms `A B`, matching the standalone
+    // `\underbrace` path and the annotation below. Otherwise the document/CLI
+    // path emits `underbrace(AB, C)`, which Typst rejects as `unknown variable:
+    // AB` (issue #35).
+    let body = conv.convert_required_math_arg(&cmd, 0)?;
     let previous_mode = conv.state.mode;
     conv.state.mode = ConversionMode::Math;
     let mut label = String::new();

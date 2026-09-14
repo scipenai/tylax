@@ -19,13 +19,15 @@ use mitex_spec::CommandSpecItem;
 
 use super::context::{
     ConversionMode, EnvironmentContext, LatexConverter, MacroDef, PendingCitation, PendingOperator,
-    PendingReference,
+    PendingReference, PendingSection, PendingSiunitx, SiunitxKind, SIZED_BAR_SENTINEL,
+    SIZED_DOUBLE_BAR_SENTINEL,
 };
 use super::utils::{protect_top_level_comma, sanitize_label, to_roman_numeral};
 use crate::features::images::ImageAttributes;
 use crate::features::refs::{
-    citation_mode_from_latex_command, citation_to_typst, label_to_typst, reference_to_typst,
-    reference_type_from_latex_command, Citation, CitationMode, CiteGroup, Reference, ReferenceType,
+    citation_mode_from_latex_command, label_to_typst, reference_to_typst,
+    reference_to_typst_without_supplement, reference_type_from_latex_command, Citation,
+    CitationMode, CiteGroup, Reference, ReferenceType,
 };
 
 fn has_split_optional_citation_start(cmd: &CmdItem) -> bool {
@@ -165,6 +167,7 @@ fn emit_citation_group(
     mode: CitationMode,
     prefix: Option<String>,
     suffix: Option<String>,
+    pending_cites: &mut Vec<CiteGroup>,
     output: &mut String,
 ) {
     let mut group = CiteGroup::new();
@@ -177,18 +180,24 @@ fn emit_citation_group(
         }
     }
     if !group.citations.is_empty() {
-        output.push_str(&citation_to_typst(&group));
+        // The bibliography backend is only known after the whole walk, so emit
+        // an inert marker and resolve it in `resolve_citations`. The
+        // `X\u{E011}` terminator keeps `Cite1` from prefixing `Cite11`.
+        let idx = pending_cites.len();
+        pending_cites.push(group);
+        let _ = write!(output, "\u{E010}TylaxCite{}X\u{E011}", idx);
     }
 }
 
 pub fn emit_pending_citation_from_curly(
     node: &mitex_parser::syntax::SyntaxNode,
     pending: PendingCitation,
+    pending_cites: &mut Vec<CiteGroup>,
     output: &mut String,
 ) {
     let keys = crate::core::latex2typst::utils::extract_curly_inner_content(node);
     let (prefix, suffix) = optional_args_to_prefix_suffix(&pending.optional_args);
-    emit_citation_group(&keys, pending.mode, prefix, suffix, output);
+    emit_citation_group(&keys, pending.mode, prefix, suffix, pending_cites, output);
 }
 
 pub fn emit_pending_reference_from_curly(
@@ -381,8 +390,14 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
     if conv.state.in_preamble {
         match base_name {
             "documentclass" => {
-                if let Some(class) = conv.get_required_arg(&cmd, 0) {
-                    conv.state.document_class = Some(class);
+                // `\documentclass` is not in the spec with an arg pattern, so mitex
+                // leaves `{article}` as a following `ItemCurly` sibling rather than a
+                // required-argument clause. Read it from there.
+                let class = conv
+                    .get_required_arg(&cmd, 0)
+                    .or_else(|| next_curly_sibling_content(cmd.syntax()));
+                if let Some(class) = class {
+                    conv.state.document_class = Some(class.trim().to_string());
                 }
                 return;
             }
@@ -414,9 +429,16 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 handle_newglossaryentry(conv, &cmd);
                 return;
             }
+            // Record the external backend (so citations keep `#cite`), then
+            // drop the command. `\bibliographystyle`/`\nocite` are excluded:
+            // they coexist with a manual `thebibliography`.
+            "bibliography" | "addbibresource" | "bibdata" | "printbibliography" => {
+                conv.citations.saw_external_bib = true;
+                return;
+            }
             // Preamble/setup commands to ignore
             "usepackage" | "RequirePackage" | "input" | "include" | "includeonly"
-            | "bibliography" | "bibliographystyle" | "maketitle" | "pagestyle" 
+            | "bibliographystyle" | "maketitle" | "pagestyle"
             | "thispagestyle" | "pagenumbering" | "setcounter" | "addtocounter" 
             | "setlength" | "addtolength" | "newtheorem" | "theoremstyle" 
             | "allowdisplaybreaks" | "numberwithin" | "DeclareMathOperator"
@@ -480,6 +502,12 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
     match base_name {
         // Section commands - Part gets special formatting with Roman numerals
         "part" => {
+            // `\part*` keeps the part layout but drops the number entirely, so
+            // it must not consume a part counter either.
+            if takes_section_star(conv, &cmd) {
+                conv.pending_section = Some(PendingSection::Part);
+                return;
+            }
             let title = conv
                 .convert_required_arg(&cmd, 0)
                 .or_else(|| conv.get_required_arg(&cmd, 0));
@@ -496,47 +524,38 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             output.push_str("#v(2em)\n\n");
         }
         "chapter" => {
+            if takes_section_star(conv, &cmd) {
+                conv.pending_section = Some(PendingSection::Heading { level: 0 });
+                return;
+            }
             let title = conv.get_required_arg(&cmd, 0).unwrap_or_default();
             output.push('\n');
             output.push_str("= ");
             output.push_str(&title);
             output.push('\n');
         }
-        // Sectioning - adjust level based on documentclass
+        // Sectioning - depth relative to the document class (see section_base_level)
         "section" => {
-            // article: section = level 1 (=), report/book: section = level 2 (==)
-            let base_level = if conv.state.document_class.as_deref() == Some("article") {
-                0
-            } else {
-                1
-            };
-            convert_section(conv, &cmd, base_level, output);
+            let base = section_base_level(conv.state.document_class.as_deref());
+            convert_section(conv, &cmd, base, output);
         }
         "subsection" => {
-            let base_level = if conv.state.document_class.as_deref() == Some("article") {
-                1
-            } else {
-                2
-            };
-            convert_section(conv, &cmd, base_level, output);
+            let base = section_base_level(conv.state.document_class.as_deref());
+            convert_section(conv, &cmd, base + 1, output);
         }
         "subsubsection" => {
-            let base_level = if conv.state.document_class.as_deref() == Some("article") {
-                2
-            } else {
-                3
-            };
-            convert_section(conv, &cmd, base_level, output);
+            let base = section_base_level(conv.state.document_class.as_deref());
+            convert_section(conv, &cmd, base + 2, output);
         }
         "paragraph" => {
-            let base_level = if conv.state.document_class.as_deref() == Some("article") {
-                3
-            } else {
-                4
-            };
-            convert_section(conv, &cmd, base_level, output);
+            let base = section_base_level(conv.state.document_class.as_deref());
+            convert_section(conv, &cmd, base + 3, output);
         }
         "subparagraph" => {
+            if takes_section_star(conv, &cmd) {
+                conv.pending_section = Some(PendingSection::Subparagraph);
+                return;
+            }
             let title = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
             let _ = write!(output, "\n_{}_\n", title);
         }
@@ -583,14 +602,17 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
 
         // Labels and references
         "label" => {
+            let label = conv.get_required_arg(&cmd, 0).unwrap_or_default();
+            let clean_label = sanitize_label(&label);
+            // Inside math, a label attaches to its line via `#<..>`; keeping it
+            // inline preserves per-row labels in align (issue #43).
             if conv.state.is_inside(&EnvironmentContext::Equation)
                 || conv.state.is_inside(&EnvironmentContext::Align)
             {
-                return;
+                let _ = write!(output, "#<{}> ", clean_label);
+            } else {
+                output.push_str(&label_to_typst(&clean_label));
             }
-            let label = conv.get_required_arg(&cmd, 0).unwrap_or_default();
-            let clean_label = sanitize_label(&label);
-            output.push_str(&label_to_typst(&clean_label));
         }
         "ref" | "autoref" | "cref" | "Cref" | "eqref" | "pageref" | "nameref" => {
             let ref_type = reference_type_from_latex_command(base_name).unwrap_or(ReferenceType::Basic);
@@ -600,7 +622,25 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                     target: clean_label,
                     ref_type,
                 };
-                output.push_str(&reference_to_typst(&reference));
+                // Typst's `@ref` re-inserts a capitalized supplement ("Section 1"),
+                // so drop a matching word the author already wrote (issue #43).
+                match ref_type {
+                    // `\eqref` renders "(2)", so the word before it is the
+                    // author's prose: keep it and suppress Typst's supplement.
+                    // The parentheses must be literal — a supplement-less
+                    // `#ref` gives the bare number even under `"(1)"`.
+                    ReferenceType::Equation => {
+                        output.push('(');
+                        output.push_str(&reference_to_typst_without_supplement(&reference));
+                        output.push(')');
+                    }
+                    // A page reference renders as a bare number either way.
+                    ReferenceType::Page => output.push_str(&reference_to_typst(&reference)),
+                    _ => {
+                        strip_trailing_ref_supplement(output);
+                        output.push_str(&reference_to_typst(&reference));
+                    }
+                }
             } else {
                 conv.state.pending_reference = Some(PendingReference { ref_type });
             }
@@ -622,7 +662,14 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 .collect::<Vec<_>>();
             if let Some(keys) = conv.get_required_arg(&cmd, 0) {
                 let (prefix, suffix) = optional_args_to_prefix_suffix(&optional_args);
-                emit_citation_group(&keys, mode, prefix, suffix, output);
+                emit_citation_group(
+                    &keys,
+                    mode,
+                    prefix,
+                    suffix,
+                    &mut conv.citations.pending,
+                    output,
+                );
             } else {
                 conv.state.pending_citation = Some(PendingCitation {
                     mode,
@@ -711,22 +758,32 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             }
             match conv.state.current_env() {
                 EnvironmentContext::Enumerate => {
-                    // Check for optional label
-                    if let Some(label) = conv.get_optional_arg(&cmd, 0) {
-                        let _ = write!(output, "+ [{}] ", label);
+                    // Keep the `+` marker; render a custom `\item[..]` label in
+                    // the body.
+                    if let Some(label) = conv.convert_optional_arg(&cmd, 0) {
+                        let _ = write!(output, "+ {} ", label);
                     } else {
                         output.push_str("+ ");
                     }
+                    conv.state.suppress_next_space = true;
                 }
                 EnvironmentContext::Description => {
-                    if let Some(term) = conv.get_optional_arg(&cmd, 0) {
+                    // Typst term list: `/ term: desc`. A bare `\item` needs an
+                    // empty term (`/ :`) to still parse as a term list (#32).
+                    if let Some(term) = conv.convert_optional_arg(&cmd, 0) {
                         let _ = write!(output, "/ {}: ", term);
                     } else {
-                        output.push_str("/ ");
+                        output.push_str("/ : ");
                     }
+                    conv.state.suppress_next_space = true;
                 }
                 _ => {
-                    output.push_str("- ");
+                    if let Some(label) = conv.convert_optional_arg(&cmd, 0) {
+                        let _ = write!(output, "- {} ", label);
+                    } else {
+                        output.push_str("- ");
+                    }
+                    conv.state.suppress_next_space = true;
                 }
             }
         }
@@ -766,10 +823,12 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             }
         }
 
-        // Math fractions
+        // Math fractions. Numerator/denominator are math content, so render them
+        // by the math rule even on the document/CLI path (issue #35): otherwise
+        // `\frac{AB}{CD}` leaks `AB/CD` (uncompilable `unknown variable: AB`).
         "frac" => {
-            let num = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            let den = conv.convert_required_arg(&cmd, 1).unwrap_or_default();
+            let num = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
+            let den = conv.convert_required_math_arg(&cmd, 1).unwrap_or_default();
 
             // Check if we can use slash notation
             if conv.state.options.frac_to_slash
@@ -783,14 +842,14 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "dfrac" => {
             // dfrac always uses frac() for proper display style
-            let num = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            let den = conv.convert_required_arg(&cmd, 1).unwrap_or_default();
+            let num = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
+            let den = conv.convert_required_math_arg(&cmd, 1).unwrap_or_default();
             let _ = write!(output, "display(frac({}, {}))", num.trim(), den.trim());
         }
         "tfrac" => {
             // tfrac might use slash if enabled and simple
-            let num = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            let den = conv.convert_required_arg(&cmd, 1).unwrap_or_default();
+            let num = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
+            let den = conv.convert_required_math_arg(&cmd, 1).unwrap_or_default();
 
             if conv.state.options.frac_to_slash
                 && conv.is_simple_term(&num)
@@ -802,15 +861,15 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             }
         }
         "cfrac" => {
-            let num = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            let den = conv.convert_required_arg(&cmd, 1).unwrap_or_default();
+            let num = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
+            let den = conv.convert_required_math_arg(&cmd, 1).unwrap_or_default();
             let _ = write!(output, "frac({}, {})", num.trim(), den.trim());
         }
 
         // Math roots
         "sqrt" => {
             let opt = conv.get_optional_arg(&cmd, 0);
-            let content = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let content = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             let protected = protect_top_level_comma(&content);
             if let Some(n) = opt {
                 let _ = write!(output, "root({}, {})", n, protected);
@@ -819,67 +878,81 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             }
         }
 
-        // Math accents and decorations (with argument)
+        // Math-only commands: their argument must render by the math rule even
+        // on the markup path, or `\vec{PC}` leaks `arrow(PC)` (issue #35).
         "hat" | "widehat" => {
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "hat({}) ", arg);
             }
         }
         "tilde" | "widetilde" => {
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "tilde({}) ", arg);
             }
         }
         "bar" | "overline" => {
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "overline({}) ", arg);
             }
         }
-        "vec" => {
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+        // Typst has no `overrightarrow`/`overleftarrow` accents; map to the
+        // directional `arrow` variants (issue #35).
+        "vec" | "overrightarrow" => {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "arrow({}) ", arg);
             }
         }
+        "overleftarrow" => {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
+                let _ = write!(output, "arrow.l({}) ", arg);
+            }
+        }
+        "overleftrightarrow" => {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
+                let _ = write!(output, "arrow.l.r({}) ", arg);
+            }
+        }
         "dot" => {
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "dot({}) ", arg);
             }
         }
         "overbrace" => {
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "overbrace({}) ", arg);
             }
         }
         "underbrace" => {
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "underbrace({}) ", arg);
             }
         }
         "ddot" => {
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "dot.double({}) ", arg);
             }
         }
         "mathbf" => {
-            // \mathbf{x} -> upright(bold(x)) for proper bold upright
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            // \mathbf{x} -> upright(bold(x)) for proper bold upright. Argument is
+            // math content, so render it by the math rule on every path (issue #35).
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "upright(bold({})) ", content);
             }
         }
-        "boldsymbol" | "bm" => {
-            // \boldsymbol and \bm just use bold()
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+        "boldsymbol" | "bm" | "pmb" => {
+            // \boldsymbol, \bm and \pmb (poor man's bold) all use bold()
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "bold({}) ", content);
             }
         }
         "mathit" => {
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "italic({}) ", content);
             }
         }
         "mathrm" => {
             // Check for special case: \mathrm{d} -> dif (differential)
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 if content.trim() == "d" || content.trim() == "dif" {
                     output.push_str("dif ");
                 } else {
@@ -894,6 +967,32 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             }
             // If no argument, just skip
         }
+        // `\displaystyle`/`\textstyle` are scoped by `visit_elements`; these
+        // two script-size switches have no Typst equivalent, so just keep
+        // their contents rather than leaking an unknown identifier.
+        "scriptstyle" | "scriptscriptstyle" => {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    output.push_str(trimmed);
+                    output.push(' ');
+                }
+            }
+        }
+        // Typst spells the circled OPERATORS with a `.o` suffix, the same forms
+        // `\odot`/`\oplus`/... already map to, so `\textcircled{\cdot}` is
+        // `dot.o` rather than a bare `dot`. There is no general circled-anything
+        // construction, so any other content keeps the fallback: the inner
+        // content alone, which at least stays faithful to what it wraps.
+        "textcircled" => {
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    output.push_str(circled_operator(trimmed).unwrap_or(trimmed));
+                    output.push(' ');
+                }
+            }
+        }
         "mathbb" => {
             if let Some(content) = conv.get_required_arg(&cmd, 0) {
                 let content = content.trim();
@@ -907,32 +1006,32 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             }
         }
         "mathcal" => {
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "cal({}) ", content);
             }
         }
         "mathfrak" => {
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "frak({}) ", content);
             }
         }
         "mathsf" => {
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "sans({}) ", content);
             }
         }
         "mathtt" => {
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "mono({}) ", content);
             }
         }
         "mathscr" => {
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "scr({}) ", content);
             }
         }
         "cancel" => {
-            let content = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let content = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             let _ = write!(output, "cancel({})", content.trim());
         }
         // Boxed content - handle differently in math vs text mode
@@ -965,40 +1064,17 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             }
         }
 
-        // siunitx commands
-        "SI" | "si" => {
-            let value = conv.get_required_arg(&cmd, 0);
-            let unit = conv.get_required_arg(&cmd, 1);
-            match (value, unit) {
-                (Some(v), Some(u)) => {
-                    let unit_str = conv.process_si_unit(&u);
-                    let _ = write!(output, "${} space {}$", v, unit_str);
-                }
-                (None, Some(u)) => {
-                    let unit_str = conv.process_si_unit(&u);
-                    let _ = write!(output, "${}$", unit_str);
-                }
-                _ => {}
-            }
-        }
-        "qty" => {
-            let value = conv.get_required_arg(&cmd, 0).unwrap_or_default();
-            let unit = conv.get_required_arg(&cmd, 1).unwrap_or_default();
-            let unit_str = conv.process_si_unit(&unit);
-            let _ = write!(output, "${} space {}$", value, unit_str);
-        }
-        "num" => {
-            let value = conv.get_required_arg(&cmd, 0).unwrap_or_default();
-            let _ = write!(output, "${}$", value);
-        }
-        "unit" => {
-            let unit = conv.get_required_arg(&cmd, 0).unwrap_or_default();
-            let unit_str = conv.process_si_unit(&unit);
-            let _ = write!(output, "${}$", unit_str);
-        }
-        "ang" => {
-            let angle = conv.get_required_arg(&cmd, 0).unwrap_or_default();
-            let _ = write!(output, "${}°$", angle);
+        // With no argument pattern in mitex, siunitx's braced groups arrive as
+        // following siblings (issue #40), so collect them for `emit_siunitx`.
+        "SI" | "si" | "qty" | "num" | "unit" | "ang" => {
+            let (kind, needed) = match base_name {
+                "SI" | "qty" => (SiunitxKind::NumberUnit, 2),
+                "num" => (SiunitxKind::NumberOnly, 1),
+                "ang" => (SiunitxKind::Angle, 1),
+                // "si" | "unit"
+                _ => (SiunitxKind::UnitOnly, 1),
+            };
+            begin_siunitx(conv, &cmd, kind, needed, output);
         }
 
         // =====================================================================
@@ -1008,84 +1084,84 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         // --- Automatic bracing ---
         "pqty" => {
             // \pqty{x} → lr((x))  -- auto-sized parentheses
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "lr(({}))", content.trim());
             }
         }
         "bqty" => {
             // \bqty{x} → lr([x])  -- auto-sized brackets
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "lr([{}])", content.trim());
             }
         }
         "Bqty" => {
             // \Bqty{x} → lr({x})  -- auto-sized braces
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "lr({{ {} }})", content.trim());
             }
         }
         "vqty" => {
             // \vqty{x} → abs(x)  -- auto-sized vertical bars
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "abs({})", content.trim());
             }
         }
         "abs" | "absolutevalue" | "abs*" => {
             // \abs{x} → abs(x)   \abs*{x} → abs(x)  (star = no auto-resize, ignored in Typst)
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "abs({})", content.trim());
             }
         }
         "norm" | "norm*" => {
             // \norm{x} → norm(x)
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "norm({})", content.trim());
             }
         }
         "eval" | "evaluated" | "eval*" => {
             // \eval{x}_a^b → lr(x |)_a^b
             // Simplified: output the content with a right vertical bar
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "lr(. {} bar.v)", content.trim());
             }
         }
         "order" => {
             // \order{x^2} → cal(O)(x^2)
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "cal(O) lr(({})) ", content.trim());
             }
         }
         "comm" | "commutator" | "comm*" => {
             // \comm{A}{B} → [A, B]
-            let a = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            let b = conv.convert_required_arg(&cmd, 1).unwrap_or_default();
+            let a = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
+            let b = conv.convert_required_math_arg(&cmd, 1).unwrap_or_default();
             let _ = write!(output, "lr([{}, {}])", a.trim(), b.trim());
         }
         "acomm" | "acommutator" | "anticommutator" | "acomm*"
         | "pb" | "poissonbracket" | "pb*" => {
             // \acomm{A}{B} → {A, B}
-            let a = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            let b = conv.convert_required_arg(&cmd, 1).unwrap_or_default();
+            let a = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
+            let b = conv.convert_required_math_arg(&cmd, 1).unwrap_or_default();
             let _ = write!(output, "lr({{ {}, {} }})", a.trim(), b.trim());
         }
 
         // --- Vector notation ---
         "vb" | "vectorbold" => {
             // \vb{a} → bold(a)   \vb*{a} → bold(italic(a))
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "bold({})", content.trim());
             }
         }
         "va" | "vectorarrow" => {
             // \va{a} → accent(bold(a), arrow.r)
             // Use arrow.r to match T2L's accent() recognition (arrow.r → \overrightarrow)
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "accent(bold({}), arrow.r)", content.trim());
             }
         }
         "vu" | "vectorunit" => {
             // \vu{a} → accent(bold(a), hat)
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "accent(bold({}), hat)", content.trim());
             }
         }
@@ -1093,7 +1169,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         // --- Vector calculus operators (with optional argument) ---
         "grad" | "gradient" => {
             // \grad → nabla    \grad{Ψ} → nabla Ψ
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let c = content.trim();
                 if c.is_empty() {
                     output.push_str("nabla ");
@@ -1106,7 +1182,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "divergence" => {
             // \divergence → nabla dot.op   \divergence{A} → nabla dot.op A
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let c = content.trim();
                 if c.is_empty() {
                     output.push_str("nabla dot.op ");
@@ -1119,7 +1195,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "curl" => {
             // \curl → nabla times   \curl{A} → nabla times A
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let c = content.trim();
                 if c.is_empty() {
                     output.push_str("nabla times ");
@@ -1132,7 +1208,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "laplacian" => {
             // \laplacian → nabla^2   \laplacian{Ψ} → nabla^2 Ψ
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let c = content.trim();
                 if c.is_empty() {
                     output.push_str("nabla^2 ");
@@ -1147,8 +1223,8 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         // --- Inline fraction ---
         "flatfrac" => {
             // \flatfrac{a}{b} → a / b (inline form)
-            let a = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            let b = conv.convert_required_arg(&cmd, 1).unwrap_or_default();
+            let a = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
+            let b = conv.convert_required_math_arg(&cmd, 1).unwrap_or_default();
             let _ = write!(output, "{} / {} ", a.trim(), b.trim());
         }
 
@@ -1158,7 +1234,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             // \dd{x} → dif x  (with argument)
             // \dd[n]{x} → dif^n x
             let opt_n = conv.get_optional_arg(&cmd, 0);
-            let arg = conv.convert_required_arg(&cmd, 0);
+            let arg = conv.convert_required_math_arg(&cmd, 0);
             match (opt_n, arg) {
                 (Some(n), Some(x)) => {
                     let _ = write!(output, "dif^{} {} ", n.trim(), x.trim());
@@ -1176,8 +1252,8 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             // \dv*{f}{x} → dif f slash dif x  (inline form)
             let is_starred = base_name.ends_with('*');
             let opt_n = conv.get_optional_arg(&cmd, 0);
-            let arg1 = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            let arg2 = conv.convert_required_arg(&cmd, 1);
+            let arg1 = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
+            let arg2 = conv.convert_required_math_arg(&cmd, 1);
             if is_starred {
                 // Inline form: \dv*{f}{x} → dif f slash dif x
                 if let Some(n) = opt_n {
@@ -1241,9 +1317,9 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "pdv" | "pderivative" | "partialderivative" | "pdv*" => {
             let is_starred = base_name.ends_with('*');
             let opt_n = conv.get_optional_arg(&cmd, 0);
-            let arg1 = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            let arg2 = conv.convert_required_arg(&cmd, 1);
-            let arg3 = conv.convert_required_arg(&cmd, 2);
+            let arg1 = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
+            let arg2 = conv.convert_required_math_arg(&cmd, 1);
+            let arg3 = conv.convert_required_math_arg(&cmd, 2);
             if is_starred {
                 // Inline form: \pdv*{f}{x} → diff f slash diff x
                 match (opt_n, arg2, arg3) {
@@ -1326,8 +1402,8 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "fdv" | "fderivative" | "functionalderivative" | "fdv*" => {
             let is_starred = base_name.ends_with('*');
             let opt_n = conv.get_optional_arg(&cmd, 0);
-            let arg1 = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            let arg2 = conv.convert_required_arg(&cmd, 1);
+            let arg1 = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
+            let arg2 = conv.convert_required_math_arg(&cmd, 1);
             if is_starred {
                 if let Some(n) = opt_n {
                     match arg2 {
@@ -1401,7 +1477,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "var" | "variation" => {
             // \var{F[g]} → delta F[g]
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "delta {} ", content.trim());
             } else {
                 output.push_str("delta ");
@@ -1411,22 +1487,22 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         // --- Dirac bra-ket notation ---
         "ket" | "ket*" => {
             // \ket{ψ} → lr(| ψ ⟩)
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "lr(| {} chevron.r)", content.trim());
             }
         }
         "bra" | "bra*" => {
             // \bra{ψ} → lr(⟨ ψ |)
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "lr(chevron.l {} |)", content.trim());
             }
         }
         "braket" | "innerproduct" | "ip" | "braket*" => {
             // \braket{a}{b} → lr(⟨ a | b ⟩)
             // \braket{a} → lr(⟨ a | a ⟩)
-            let a = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let a = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             let b = conv
-                .convert_required_arg(&cmd, 1)
+                .convert_required_math_arg(&cmd, 1)
                 .filter(|value| !value.trim().is_empty());
             match b {
                 Some(b) => {
@@ -1449,8 +1525,8 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "dyad" | "outerproduct" | "ketbra" | "op" | "dyad*" => {
             // \dyad{a}{b} → lr(| a ⟩) lr(⟨ b |)
             // \dyad{a} → lr(| a ⟩) lr(⟨ a |)
-            let a = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            let b = conv.convert_required_arg(&cmd, 1);
+            let a = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
+            let b = conv.convert_required_math_arg(&cmd, 1);
             let b_val = b.as_deref().unwrap_or(a.trim());
             let _ = write!(
                 output,
@@ -1461,8 +1537,8 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "expval" | "expectationvalue" | "ev" | "expval*" | "ev*" => {
             // \expval{A} → lr(⟨ A ⟩)
             // \expval{A}{Ψ} → lr(⟨ Ψ | A | Ψ ⟩)
-            let op = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            let state = conv.convert_required_arg(&cmd, 1);
+            let op = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
+            let state = conv.convert_required_math_arg(&cmd, 1);
             match state {
                 Some(psi) => {
                     let _ = write!(
@@ -1482,7 +1558,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "vev" => {
             // \vev{A} → lr(⟨ 0 | A | 0 ⟩)
-            if let Some(op) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(op) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(
                     output,
                     "lr(chevron.l 0 | {} | 0 chevron.r)",
@@ -1492,9 +1568,9 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "mel" | "matrixelement" | "matrixel" | "mel*" => {
             // \mel{n}{A}{m} → lr(⟨ n | A | m ⟩)
-            let n = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            let a = conv.convert_required_arg(&cmd, 1).unwrap_or_default();
-            let m = conv.convert_required_arg(&cmd, 2).unwrap_or_default();
+            let n = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
+            let a = conv.convert_required_math_arg(&cmd, 1).unwrap_or_default();
+            let m = conv.convert_required_math_arg(&cmd, 2).unwrap_or_default();
             let _ = write!(
                 output,
                 "lr(chevron.l {} | {} | {} chevron.r)",
@@ -1682,21 +1758,21 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         // --- Physics operators with braces ---
         "Res" | "Residue" => {
             // \Res{f} → op("Res") f   or standalone
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "op(\"Res\") {} ", content.trim());
             } else {
                 output.push_str("op(\"Res\") ");
             }
         }
         "pv" | "principalvalue" => {
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "cal(P) {} ", content.trim());
             } else {
                 output.push_str("cal(P) ");
             }
         }
         "PV" => {
-            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "op(\"P.V.\") {} ", content.trim());
             } else {
                 output.push_str("op(\"P.V.\") ");
@@ -2042,7 +2118,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "iiint" => output.push_str("integral.triple "),
         "oint" => output.push_str("integral.cont "),
         "bigcup" => output.push_str("union.big "),
-        "bigcap" => output.push_str("sect.big "),
+        "bigcap" => output.push_str("inter.big "),
         "bigoplus" => output.push_str("plus.o.big "),
         "bigotimes" => output.push_str("times.o.big "),
         "bigsqcup" => output.push_str("union.sq.big "),
@@ -2087,8 +2163,8 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "overset" => {
             // \overset{top}{base} -> limits(base)^(top)
             // Special optimization: \overset{\text{def}}{=} -> eq.def
-            let top = conv.convert_required_term_arg(&cmd, 0).unwrap_or_default();
-            let base = conv.convert_required_term_arg(&cmd, 1).unwrap_or_default();
+            let top = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
+            let base = conv.convert_required_math_arg(&cmd, 1).unwrap_or_default();
             let top_trimmed = top.trim().replace("\"", "");
             if (top_trimmed == "def" || top_trimmed.contains("def"))
                 && (base.trim() == "=" || base.trim() == "eq")
@@ -2100,19 +2176,19 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "underset" => {
             // \underset{bottom}{base} -> limits(base)_(bottom)
-            let bottom = conv.convert_required_term_arg(&cmd, 0).unwrap_or_default();
-            let base = conv.convert_required_term_arg(&cmd, 1).unwrap_or_default();
+            let bottom = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
+            let base = conv.convert_required_math_arg(&cmd, 1).unwrap_or_default();
             let _ = write!(output, "limits({})_({}) ", base, bottom);
         }
         "stackrel" => {
             // \stackrel{top}{relation} -> limits(relation)^(top)
-            let top = conv.convert_required_term_arg(&cmd, 0).unwrap_or_default();
-            let base = conv.convert_required_term_arg(&cmd, 1).unwrap_or_default();
+            let top = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
+            let base = conv.convert_required_math_arg(&cmd, 1).unwrap_or_default();
             let _ = write!(output, "limits({})^({}) ", base, top);
         }
         "substack" => {
             // \substack{a \\ b} -> directly output content
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 output.push_str(&arg);
             }
         }
@@ -2144,8 +2220,10 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "hline" | "toprule" | "midrule" | "bottomrule" => {
             output.push_str("|||HLINE|||");
         }
+        // A partial rule needs its own marker so the parser knows what follows
+        // is a column RANGE, not a cell that merely reads `3-4` (issue #43).
         "cline" | "cmidrule" => {
-            output.push_str("|||HLINE|||");
+            output.push_str("|||CHLINE|||");
         }
         "multicolumn" => {
             let ncols = conv.get_required_arg(&cmd, 0).unwrap_or("1".to_string());
@@ -2163,7 +2241,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         // Extensible arrows with text above/below
         "xleftarrow" => {
             let below = conv.get_optional_arg(&cmd, 0);
-            let above = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let above = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             if let Some(b) = below {
                 let _ = write!(output, "limits(arrow.l.long)^({})_({}) ", above, b);
             } else {
@@ -2172,7 +2250,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "xrightarrow" => {
             let below = conv.get_optional_arg(&cmd, 0);
-            let above = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let above = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             if let Some(b) = below {
                 let _ = write!(output, "limits(arrow.r.long)^({})_({}) ", above, b);
             } else {
@@ -2181,7 +2259,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "xmapsto" => {
             let below = conv.get_optional_arg(&cmd, 0);
-            let above = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let above = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             if let Some(b) = below {
                 let _ = write!(output, "limits(arrow.r.long.bar)^({})_({}) ", above, b);
             } else {
@@ -2190,7 +2268,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "xleftrightarrow" => {
             let below = conv.get_optional_arg(&cmd, 0);
-            let above = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let above = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             if let Some(b) = below {
                 let _ = write!(output, "limits(arrow.l.r.long)^({})_({}) ", above, b);
             } else {
@@ -2199,7 +2277,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "xLeftarrow" => {
             let below = conv.get_optional_arg(&cmd, 0);
-            let above = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let above = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             if let Some(b) = below {
                 let _ = write!(output, "limits(arrow.l.double.long)^({})_({}) ", above, b);
             } else {
@@ -2208,7 +2286,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "xRightarrow" => {
             let below = conv.get_optional_arg(&cmd, 0);
-            let above = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let above = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             if let Some(b) = below {
                 let _ = write!(output, "limits(arrow.r.double.long)^({})_({}) ", above, b);
             } else {
@@ -2217,7 +2295,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "xLeftrightarrow" => {
             let below = conv.get_optional_arg(&cmd, 0);
-            let above = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let above = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             if let Some(b) = below {
                 let _ = write!(output, "limits(arrow.l.r.double.long)^({})_({}) ", above, b);
             } else {
@@ -2226,7 +2304,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "xhookleftarrow" => {
             let below = conv.get_optional_arg(&cmd, 0);
-            let above = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let above = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             if let Some(b) = below {
                 let _ = write!(output, "limits(arrow.l.hook)^({})_({}) ", above, b);
             } else {
@@ -2235,7 +2313,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "xhookrightarrow" => {
             let below = conv.get_optional_arg(&cmd, 0);
-            let above = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let above = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             if let Some(b) = below {
                 let _ = write!(output, "limits(arrow.r.hook)^({})_({}) ", above, b);
             } else {
@@ -2244,7 +2322,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "xtwoheadleftarrow" => {
             let below = conv.get_optional_arg(&cmd, 0);
-            let above = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let above = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             if let Some(b) = below {
                 let _ = write!(output, "limits(arrow.l.twohead)^({})_({}) ", above, b);
             } else {
@@ -2253,7 +2331,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "xtwoheadrightarrow" => {
             let below = conv.get_optional_arg(&cmd, 0);
-            let above = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let above = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             if let Some(b) = below {
                 let _ = write!(output, "limits(arrow.r.twohead)^({})_({}) ", above, b);
             } else {
@@ -2262,7 +2340,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "xleftharpoonup" => {
             let below = conv.get_optional_arg(&cmd, 0);
-            let above = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let above = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             if let Some(b) = below {
                 let _ = write!(output, "limits(harpoon.lt)^({})_({}) ", above, b);
             } else {
@@ -2271,7 +2349,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "xrightharpoonup" => {
             let below = conv.get_optional_arg(&cmd, 0);
-            let above = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let above = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             if let Some(b) = below {
                 let _ = write!(output, "limits(harpoon.rt)^({})_({}) ", above, b);
             } else {
@@ -2280,7 +2358,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "xleftharpoondown" => {
             let below = conv.get_optional_arg(&cmd, 0);
-            let above = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let above = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             if let Some(b) = below {
                 let _ = write!(output, "limits(harpoon.lb)^({})_({}) ", above, b);
             } else {
@@ -2289,7 +2367,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "xrightharpoondown" => {
             let below = conv.get_optional_arg(&cmd, 0);
-            let above = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let above = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             if let Some(b) = below {
                 let _ = write!(output, "limits(harpoon.rb)^({})_({}) ", above, b);
             } else {
@@ -2298,7 +2376,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "xleftrightharpoons" => {
             let below = conv.get_optional_arg(&cmd, 0);
-            let above = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let above = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             if let Some(b) = below {
                 let _ = write!(output, "limits(harpoons.ltrb)^({})_({}) ", above, b);
             } else {
@@ -2307,7 +2385,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "xrightleftharpoons" => {
             let below = conv.get_optional_arg(&cmd, 0);
-            let above = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let above = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             if let Some(b) = below {
                 let _ = write!(output, "limits(harpoons.rtlb)^({})_({}) ", above, b);
             } else {
@@ -2316,7 +2394,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "xtofrom" => {
             let below = conv.get_optional_arg(&cmd, 0);
-            let above = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let above = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             if let Some(b) = below {
                 let _ = write!(output, "limits(arrows.rl)^({})_({}) ", above, b);
             } else {
@@ -2325,7 +2403,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "xlongequal" => {
             let below = conv.get_optional_arg(&cmd, 0);
-            let above = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            let above = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             if let Some(b) = below {
                 let _ = write!(output, "limits(eq.triple)^({})_({}) ", above, b);
             } else {
@@ -2336,30 +2414,30 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         // Modular arithmetic
         "bmod" => output.push_str("mod "),
         "pmod" => {
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "(mod {}) ", arg);
             }
         }
         "pod" => {
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "({}) ", arg);
             }
         }
 
         // Math class commands (spacing/classification)
         "mathrel" => {
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "class(\"relation\", {}) ", arg);
             }
         }
         "mathbin" => {
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "class(\"binary\", {}) ", arg);
             }
         }
         "mathop" => {
             let raw_arg = conv.get_required_arg_with_braces(&cmd, 0);
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 if let Some(op_name) = raw_arg
                     .as_deref()
                     .and_then(|raw| extract_operator_like_name(raw, &arg))
@@ -2371,27 +2449,27 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             }
         }
         "mathord" => {
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "class(\"normal\", {}) ", arg);
             }
         }
         "mathopen" => {
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "class(\"opening\", {}) ", arg);
             }
         }
         "mathclose" => {
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "class(\"closing\", {}) ", arg);
             }
         }
         "mathpunct" => {
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "class(\"punctuation\", {}) ", arg);
             }
         }
         "mathinner" => {
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 output.push_str(&arg);
                 output.push(' ');
             }
@@ -2399,14 +2477,14 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
 
         // Displaylines
         "displaylines" => {
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 output.push_str(&arg);
             }
         }
 
         // Set notation (braket package)
         "set" | "Set" => {
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "{{ {} }} ", arg);
             }
         }
@@ -2476,7 +2554,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "supset" => output.push_str("supset "),
         "supseteq" => output.push_str("supset.eq "),
         "cup" => output.push_str("union "),
-        "cap" => output.push_str("sect "),
+        "cap" => output.push_str("inter "),
         "emptyset" | "varnothing" => output.push_str("emptyset "),
 
         // Logic
@@ -2545,9 +2623,17 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         _ if crate::data::symbols::is_big_delimiter_command(base_name) => {
             if let Some(delim) = conv.get_required_arg(&cmd, 0) {
                 if let Some(typst_delim) = crate::data::symbols::convert_delimiter(delim.trim()) {
-                    if !typst_delim.is_empty() {
-                        output.push_str(typst_delim);
-                        output.push(' ');
+                    match typst_delim {
+                        // Keep size-command bars distinct until the pairing
+                        // pass runs; an unmatched sentinel falls back to a
+                        // plain bar. Plain `|`/`\vert` never come here.
+                        "bar.v" => output.push_str(SIZED_BAR_SENTINEL),
+                        "bar.v.double" => output.push_str(SIZED_DOUBLE_BAR_SENTINEL),
+                        _ if !typst_delim.is_empty() => {
+                            output.push_str(typst_delim);
+                            output.push(' ');
+                        }
+                        _ => {}
                     }
                 } else {
                     output.push_str(delim.trim());
@@ -2719,6 +2805,12 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             let _ = write!(output, "/* \\color{{{}}} -> {} */", color_name, typst_color);
         }
 
+        // Same in the document body. `\bibstyle`/`\nocite` are excluded: they
+        // accompany a manual `thebibliography` and must not force `Mixed`.
+        "bibliography" | "addbibresource" | "bibdata" | "printbibliography" => {
+            conv.citations.saw_external_bib = true;
+        }
+
         // Ignored commands - alignment and layout
         "centering" | "raggedright" | "raggedleft" | "noindent" | "indent"
         | "pagebreak" | "nopagebreak" | "enlargethispage"
@@ -2726,7 +2818,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         | "nonfrenchspacing" | "normalfont" | "rmfamily" | "sffamily" | "ttfamily" | "bfseries"
         | "mdseries" | "itshape" | "scshape" | "upshape" | "slshape" | "normalsize" | "tiny"
         | "scriptsize" | "footnotesize" | "small" | "large" | "Large" | "LARGE" | "huge"
-        | "Huge" | "nocite" | "printbibliography" | "printglossary" | "printacronyms"
+        | "Huge" | "nocite" | "printglossary" | "printacronyms"
         | "glsresetall" | "tableofcontents" | "listoffigures" | "listoftables"
         | "frontmatter" | "mainmatter" | "backmatter"
         // IEEE and conference specific
@@ -2744,9 +2836,9 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         | "marginpar" | "marginparpush" | "reversemarginpar" | "normalmarginpar"
         // Misc invisible commands (excluding already handled: protect)
         | "expandafter" | "global" | "long" | "outer" | "inner"
-        | "noexpand" | "csname" | "endcsname" | "string" | "number" 
-        // More bibliography
-        | "addbibresource" | "bibdata" | "bibstyle" 
+        | "noexpand" | "csname" | "endcsname" | "string" | "number"
+        // Bibliography style-only command (not a backend signal on its own)
+        | "bibstyle"
         // Index
         | "makeindex" | "printindex" | "index" | "glossary" => {
             // Ignore these
@@ -3129,15 +3221,221 @@ fn apply_cedilla(content: &str) -> String {
     }
 }
 
+/// The `.o` Typst symbol for an operator drawn inside a circle, given the
+/// operator's ALREADY CONVERTED form. Matched against both spellings a source
+/// may use, `\textcircled{\cdot}` and `\textcircled{.}`, so only the converted
+/// text has to be inspected. Returns `None` for anything Typst has no circled
+/// form of, leaving the caller's fallback in charge.
+fn circled_operator(converted: &str) -> Option<&'static str> {
+    Some(match converted {
+        "dot" | "dot.op" | "." | "·" => "dot.o",
+        "plus" | "+" => "plus.o",
+        "minus" | "-" | "−" => "minus.o",
+        "times" | "*" | "×" => "times.o",
+        "slash" | "/" => "slash.o",
+        _ => return None,
+    })
+}
+
+/// Inner content of the next `ItemCurly` sibling, skipping whitespace.
+///
+/// `\documentclass{..}` / `\usepackage{..}` have no arg pattern in the spec, so
+/// mitex leaves their brace group as a following sibling instead of an argument
+/// clause; this reads it back.
+fn next_curly_sibling_content(node: &mitex_parser::syntax::SyntaxNode) -> Option<String> {
+    use mitex_parser::syntax::{SyntaxElement, SyntaxKind};
+    let mut sib = node.next_sibling_or_token();
+    // A leading optional argument like the `[12pt]` in `\documentclass[12pt]{book}`
+    // is emitted by MiTeX as a flat token span (`TokenLBracket … TokenRBracket`),
+    // not a single node, so skip the balanced bracket run before reading the class
+    // from the following `{book}`. TeX comments between the arguments
+    // (`\documentclass[12pt]% note\n{book}`) are ignorable separators, exactly like
+    // whitespace, so they must not terminate the scan either.
+    let mut bracket_depth = 0usize;
+    while let Some(s) = sib {
+        match s.kind() {
+            SyntaxKind::TokenWhiteSpace
+            | SyntaxKind::TokenLineBreak
+            | SyntaxKind::TokenComment
+            | SyntaxKind::ItemBlockComment => {}
+            SyntaxKind::TokenLBracket => bracket_depth += 1,
+            SyntaxKind::TokenRBracket if bracket_depth > 0 => bracket_depth -= 1,
+            _ if bracket_depth > 0 => {}
+            SyntaxKind::ItemCurly => {
+                if let SyntaxElement::Node(n) = s {
+                    let text = n.text().to_string();
+                    return Some(text.trim_matches(|c| c == '{' || c == '}').to_string());
+                }
+                return None;
+            }
+            _ => return None,
+        }
+        sib = s.next_sibling_or_token();
+    }
+    None
+}
+
+/// Start collecting a siunitx command's braced arguments. If mitex happened to
+/// attach them as child clauses we can format immediately; otherwise we arm the
+/// pending-sibling collector, which drains the following curly groups.
+fn begin_siunitx(
+    conv: &mut LatexConverter,
+    cmd: &CmdItem,
+    kind: SiunitxKind,
+    needed: usize,
+    output: &mut String,
+) {
+    let mut args = Vec::with_capacity(needed);
+    for index in 0..needed {
+        match conv.get_required_arg(cmd, index) {
+            Some(arg) => args.push(arg),
+            None => break,
+        }
+    }
+    if args.len() == needed {
+        let pending = PendingSiunitx {
+            kind,
+            needed,
+            args,
+            optional_bracket_depth: 0,
+        };
+        emit_siunitx(conv, &pending, output);
+    } else {
+        // Arguments are following siblings; collect them as we walk forward.
+        conv.siunitx_arg_collector = Some(PendingSiunitx {
+            kind,
+            needed,
+            args,
+            optional_bracket_depth: 0,
+        });
+    }
+}
+
+/// Format a fully-collected siunitx command. Units are mapped through
+/// [`LatexConverter::process_si_unit`] and wrapped in quotes so Typst renders
+/// them upright (a unit is not a math variable).
+pub(super) fn emit_siunitx(conv: &LatexConverter, pending: &PendingSiunitx, output: &mut String) {
+    let arg = |i: usize| pending.args.get(i).map(String::as_str).unwrap_or("").trim();
+    let (math_open, math_close) = if matches!(conv.state.mode, ConversionMode::Math) {
+        ("", "")
+    } else {
+        ("$", "$")
+    };
+    match pending.kind {
+        SiunitxKind::NumberUnit => {
+            let unit = conv.process_si_unit(arg(1));
+            let _ = write!(
+                output,
+                "{}{} space \"{}\"{}",
+                math_open,
+                arg(0),
+                unit,
+                math_close
+            );
+        }
+        SiunitxKind::UnitOnly => {
+            let unit = conv.process_si_unit(arg(0));
+            let _ = write!(output, "{}\"{}\"{}", math_open, unit, math_close);
+        }
+        SiunitxKind::NumberOnly => {
+            let _ = write!(output, "{}{}{}", math_open, arg(0), math_close);
+        }
+        SiunitxKind::Angle => {
+            let _ = write!(output, "{}{}°{}", math_open, arg(0), math_close);
+        }
+    }
+}
+
+/// Drop a capitalized supplement word (e.g. `Section `/`Table~`) sitting at the
+/// end of `output`, so a `@ref` that re-inserts it does not double it (issue #43).
+fn strip_trailing_ref_supplement(output: &mut String) {
+    const SUPPLEMENTS: &[&str] = &[
+        "Section",
+        "Subsection",
+        "Subsubsection",
+        "Chapter",
+        "Table",
+        "Figure",
+        "Appendix",
+        "Part",
+    ];
+    let trimmed = output.trim_end_matches([' ', '\t', '~']);
+    for word in SUPPLEMENTS {
+        if let Some(prefix) = trimmed.strip_suffix(word) {
+            let boundary = prefix.is_empty()
+                || prefix.ends_with(|c: char| c.is_whitespace() || "~([{".contains(c));
+            if boundary {
+                output.truncate(prefix.len());
+                return;
+            }
+        }
+    }
+}
+
+/// `\section`'s Typst heading depth for a document class. report/book/memoir put
+/// `\chapter` at depth 1, so their `\section` is depth 2 (`==`); everything else
+/// (article, or an undetected class) treats `\section` as depth 1 (`=`).
+pub(super) fn section_base_level(class: Option<&str>) -> u8 {
+    u8::from(matches!(
+        class,
+        Some("report") | Some("book") | Some("memoir")
+    ))
+}
+
+/// Render the title of a starred sectioning command.
+///
+/// The starred forms suppress numbering, which Typst's `=` shorthand cannot
+/// express, so a heading goes through the explicit `#heading` element. The
+/// other forms keep the layout their unstarred counterpart uses, minus the
+/// number.
+pub(super) fn emit_starred_section(pending: PendingSection, title: &str, output: &mut String) {
+    match pending {
+        PendingSection::Heading { level } => {
+            let _ = write!(
+                output,
+                "\n#heading(level: {}, numbering: none)[{}]\n",
+                level + 1,
+                title
+            );
+        }
+        PendingSection::Part => {
+            output.push_str("\n#v(2em)\n");
+            output.push_str("#align(center)[\n");
+            let _ = writeln!(output, "  #text(2em, weight: \"bold\")[{}]", title);
+            output.push_str("]\n");
+            output.push_str("#v(2em)\n\n");
+        }
+        PendingSection::Subparagraph => {
+            let _ = write!(output, "\n_{}_\n", title);
+        }
+    }
+}
+
+/// Whether this sectioning command carries the `*` modifier.
+///
+/// `\section*{T}` binds the `*` as the command's single term argument, because
+/// mitex's argument grammar knows only term/bracket/paren kinds and so has no
+/// way to describe a star. Recognising it here and taking the real title from
+/// the group that follows is what keeps the heading from being named `*` with
+/// its title demoted to body text (issue #45).
+fn takes_section_star(conv: &LatexConverter, cmd: &CmdItem) -> bool {
+    conv.get_required_arg(cmd, 0).as_deref().map(str::trim) == Some("*")
+}
+
 /// Convert section heading with proper level
 fn convert_section(conv: &mut LatexConverter, cmd: &CmdItem, level: u8, output: &mut String) {
-    if let Some(title) = conv.get_required_arg(cmd, 0) {
+    if takes_section_star(conv, cmd) {
+        conv.pending_section = Some(PendingSection::Heading { level });
+        return;
+    }
+
+    if let Some(title) = conv.convert_required_arg(cmd, 0) {
         output.push('\n');
         for _ in 0..=level {
             output.push('=');
         }
         output.push(' ');
-        output.push_str(&title);
+        output.push_str(title.trim());
         output.push('\n');
     }
 }

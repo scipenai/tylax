@@ -41,6 +41,8 @@ pub struct TableGridParser {
     pub default_alignments: Vec<CellAlign>,
     /// Pending hlines to attach to the next row
     pending_hlines: Vec<HLine>,
+    /// Column boundaries carrying a vertical rule, from the `|` separators in the spec.
+    vlines: Vec<usize>,
 }
 
 impl TableGridParser {
@@ -51,7 +53,13 @@ impl TableGridParser {
             rows: Vec::new(),
             default_alignments: alignments,
             pending_hlines: Vec::new(),
+            vlines: Vec::new(),
         }
+    }
+
+    /// Record the vertical rules declared by the column specification.
+    pub fn set_vlines(&mut self, vlines: &[usize]) {
+        self.vlines = vlines.to_vec();
     }
 
     /// Add a full horizontal line
@@ -139,6 +147,13 @@ impl TableGridParser {
         }
     }
 
+    /// Whether the source declared any rule of its own, horizontal or vertical.
+    fn declares_rules(&self) -> bool {
+        !self.vlines.is_empty()
+            || !self.pending_hlines.is_empty()
+            || self.rows.iter().any(|row| !row.hlines_before.is_empty())
+    }
+
     /// Generate Typst table code
     pub fn generate_typst(&self, col_count: usize) -> String {
         use std::fmt::Write;
@@ -148,6 +163,17 @@ impl TableGridParser {
         let col_tuple: Vec<&str> = vec!["auto"; col_count.max(1)];
         let _ = writeln!(output, "#table(");
         let _ = writeln!(output, "    columns: ({}),", col_tuple.join(", "));
+
+        // LaTeX draws no rules unless asked and `#table` defaults to a full
+        // grid, so a source declaring its own must switch the grid off
+        // (issue #43). Tables declaring none keep the default.
+        if self.declares_rules() {
+            let _ = writeln!(output, "    stroke: none,");
+            // With the grid off, only these draw the column `|` separators.
+            for at in &self.vlines {
+                let _ = writeln!(output, "    table.vline(x: {}),", at);
+            }
+        }
 
         // Generate alignment spec
         if !self.default_alignments.is_empty() {
@@ -183,10 +209,63 @@ impl TableGridParser {
     }
 }
 
-/// Parse table content using the state-aware TableGridParser
-pub fn parse_with_grid_parser(content: &str, alignments: Vec<CellAlign>) -> String {
+/// Marker emitted for a full-width rule (`\hline`, `\toprule`, …).
+pub(crate) const FULL_RULE_MARKER: &str = "|||HLINE|||";
+/// Marker for a partial rule (`\cline`, `\cmidrule`); its range follows in the stream.
+pub(crate) const PARTIAL_RULE_MARKER: &str = "|||CHLINE|||";
+
+/// Register every rule in `row_str` in source order, returning the row with the
+/// markers — and only a partial rule's own range — removed. A row may carry
+/// several rules, and stripping ranges row-wide would eat a cell like `3-4`.
+fn collect_rules_and_clean(row_str: &str, parser: &mut TableGridParser) -> String {
+    let mut cleaned = String::with_capacity(row_str.len());
+    let mut rest = row_str.to_string();
+
+    loop {
+        let full_at = rest.find(FULL_RULE_MARKER);
+        let partial_at = rest.find(PARTIAL_RULE_MARKER);
+        let take_partial = match (full_at, partial_at) {
+            (None, None) => break,
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            (Some(full), Some(partial)) => partial < full,
+        };
+
+        if take_partial {
+            let at = partial_at.expect("partial marker present");
+            cleaned.push_str(&rest[..at]);
+            let after = rest[at + PARTIAL_RULE_MARKER.len()..].to_string();
+            match extract_hline_range(&after) {
+                Some((start, end)) => parser.add_partial_hline(start, end),
+                // A rule whose range we cannot read is still a rule; fall back to full width.
+                None => parser.add_hline(),
+            }
+            // Drop exactly the `(lr)`/`n-m` argument this rule consumed.
+            rest = clean_hline_args(&after);
+        } else {
+            let at = full_at.expect("full marker present");
+            cleaned.push_str(&rest[..at]);
+            parser.add_hline();
+            rest = rest[at + FULL_RULE_MARKER.len()..].to_string();
+        }
+    }
+
+    cleaned.push_str(&rest);
+    cleaned
+}
+
+/// Parse table content using the state-aware TableGridParser.
+///
+/// `vlines` are the column boundaries the `\begin{tabular}{...}` specification
+/// marked with `|`; they are drawn explicitly once the default grid is off.
+pub fn parse_with_grid_parser(
+    content: &str,
+    alignments: Vec<CellAlign>,
+    vlines: &[usize],
+) -> String {
     let col_count = alignments.len().max(1);
     let mut parser = TableGridParser::new(alignments);
+    parser.set_vlines(vlines);
 
     for row_str in content.split("|||ROW|||") {
         let row_str = row_str.trim();
@@ -194,18 +273,8 @@ pub fn parse_with_grid_parser(content: &str, alignments: Vec<CellAlign>) -> Stri
             continue;
         }
 
-        // Check for HLINE markers and extract partial line info
-        if row_str.contains("|||HLINE|||") {
-            let hline_info = extract_hline_range(row_str);
-            match hline_info {
-                Some((start, end)) => parser.add_partial_hline(start, end),
-                None => parser.add_hline(),
-            }
-        }
-
-        // Remove HLINE marker to process content
-        let clean_row = row_str.replace("|||HLINE|||", "");
-        let clean_row = clean_hline_args(&clean_row);
+        // Collect every preceding rule in source order, stripping markers and ranges.
+        let clean_row = collect_rules_and_clean(row_str, &mut parser);
 
         if clean_row.trim().is_empty() {
             continue;
@@ -222,7 +291,9 @@ pub fn parse_with_grid_parser(content: &str, alignments: Vec<CellAlign>) -> Stri
 
     // Handle single row without ROW markers (edge case)
     if parser.rows.is_empty() && content.contains("|||CELL|||") {
-        let clean_content = content.replace("|||HLINE|||", "");
+        let clean_content = content
+            .replace(PARTIAL_RULE_MARKER, "")
+            .replace(FULL_RULE_MARKER, "");
         let raw_cells: Vec<String> = clean_content
             .split("|||CELL|||")
             .map(clean_cell_content)

@@ -11,10 +11,12 @@ use tylax::{
     batch::{convert_batch, BatchDirection, BatchFileStatus, BatchOptions},
     convert_auto, convert_auto_document, detect_format,
     diagnostics::{check_latex, format_diagnostics},
-    latex_document_to_typst, latex_to_typst, latex_to_typst_with_diagnostics_options,
+    latex_document_to_typst, latex_math_to_typst_with_diagnostics, latex_to_typst,
+    latex_to_typst_with_diagnostics_options,
     tikz::{convert_cetz_to_tikz, convert_tikz_to_cetz, is_cetz_code},
-    typst_document_to_latex, typst_to_latex, typst_to_latex_with_diagnostics, CliDiagnostic,
-    DocumentWrapperMode, L2TOptions, PreambleMode, T2LOptions,
+    typst_document_to_latex, typst_file_to_latex_with_diagnostics,
+    typst_file_to_latex_with_options, typst_to_latex, typst_to_latex_with_diagnostics,
+    CliDiagnostic, DocumentWrapperMode, L2TOptions, PreambleMode, T2LOptions,
 };
 
 #[cfg(feature = "cli")]
@@ -42,6 +44,21 @@ struct Cli {
     /// Full document mode (convert entire document, not just math)
     #[arg(short = 'f', long)]
     full_document: bool,
+
+    /// Math-only mode for LaTeX -> Typst: treat the input as a bare math
+    /// fragment. Rejected in the other direction.
+    ///
+    /// Document mode emits words as written, because in prose `AB` is the text
+    /// "AB". Math mode splits a run into atoms (`A B`) and separates a symbol
+    /// from what precedes it (`x\ln` -> `x ln`), which is what Typst math
+    /// requires. The two cannot be decided from the input alone, so this is an
+    /// explicit choice rather than a guess.
+    #[arg(
+        long = "math",
+        visible_alias = "math-only",
+        conflicts_with = "full_document"
+    )]
+    math_only: bool,
 
     /// Pretty print the output
     #[arg(short, long)]
@@ -264,6 +281,19 @@ fn main() -> io::Result<()> {
         d => d,
     };
 
+    // `--math` selects the LaTeX math pipeline; T2L has no counterpart, and
+    // silently ignoring it would hide that the requested mode did not apply.
+    // The check is here rather than on the flag because `--direction auto` only
+    // resolves now.
+    if cli.math_only && !matches!(direction, Direction::L2t) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--math applies to LaTeX -> Typst conversion only; \
+             the input was converted in the Typst -> LaTeX direction. \
+             Pass -d l2t if the input is LaTeX, or drop --math.",
+        ));
+    }
+
     // Determine if this is a full document based on content or flag
     let is_full_document = cli.full_document || is_latex_document(&input);
 
@@ -274,11 +304,17 @@ fn main() -> io::Result<()> {
     // Convert with diagnostics - collect warnings as unified CliDiagnostic
     let (result, diagnostics): (String, Vec<CliDiagnostic>) = match direction {
         Direction::L2t => {
-            let l2t_options = L2TOptions {
-                preamble: preamble_mode,
-                ..Default::default()
+            // `--math` splits letter runs into atoms; the document converter
+            // must not, since in prose `AB` is the text "AB".
+            let conv_result = if cli.math_only {
+                latex_math_to_typst_with_diagnostics(&input)
+            } else {
+                let l2t_options = L2TOptions {
+                    preamble: preamble_mode,
+                    ..Default::default()
+                };
+                latex_to_typst_with_diagnostics_options(&input, l2t_options)
             };
-            let conv_result = latex_to_typst_with_diagnostics_options(&input, l2t_options);
             let diags = conv_result
                 .warnings
                 .into_iter()
@@ -293,7 +329,14 @@ fn main() -> io::Result<()> {
                 ..Default::default()
             };
             if !cli.no_eval {
-                let conv_result = typst_to_latex_with_diagnostics(&input, &options);
+                let conv_result = match filename.as_deref() {
+                    Some(path) => typst_file_to_latex_with_diagnostics(
+                        &input,
+                        std::path::Path::new(path),
+                        &options,
+                    ),
+                    None => typst_to_latex_with_diagnostics(&input, &options),
+                };
                 let diags = conv_result
                     .warnings
                     .into_iter()
@@ -302,9 +345,23 @@ fn main() -> io::Result<()> {
                 (conv_result.output, diags)
             } else {
                 let output = if is_full_document {
-                    typst_document_to_latex(&input)
+                    match filename.as_deref() {
+                        Some(path) => typst_file_to_latex_with_options(
+                            &input,
+                            std::path::Path::new(path),
+                            &T2LOptions::full_document(),
+                        ),
+                        None => typst_document_to_latex(&input),
+                    }
                 } else {
-                    typst_to_latex(&input)
+                    match filename.as_deref() {
+                        Some(path) => typst_file_to_latex_with_options(
+                            &input,
+                            std::path::Path::new(path),
+                            &T2LOptions::default(),
+                        ),
+                        None => typst_to_latex(&input),
+                    }
                 };
                 (output, Vec::new())
             }
@@ -437,13 +494,29 @@ fn handle_subcommand(cmd: Commands) -> io::Result<()> {
             let result = if full_document {
                 match direction {
                     Direction::L2t => latex_document_to_typst(&content),
-                    Direction::T2l => typst_document_to_latex(&content),
+                    Direction::T2l => match filename.as_deref() {
+                        Some(path) => typst_file_to_latex_with_options(
+                            &content,
+                            std::path::Path::new(path),
+                            &T2LOptions::full_document(),
+                        ),
+                        // Standard input has no file-relative bibliography path.
+                        None => typst_document_to_latex(&content),
+                    },
                     Direction::Auto => convert_auto_document(&content).0,
                 }
             } else {
                 match direction {
                     Direction::L2t => latex_to_typst(&content),
-                    Direction::T2l => typst_to_latex(&content),
+                    Direction::T2l => match filename.as_deref() {
+                        Some(path) => typst_file_to_latex_with_options(
+                            &content,
+                            std::path::Path::new(path),
+                            &T2LOptions::default(),
+                        ),
+                        // Standard input has no file-relative bibliography path.
+                        None => typst_to_latex(&content),
+                    },
                     Direction::Auto => convert_auto(&content).0,
                 }
             };
@@ -605,11 +678,19 @@ fn pretty_print(input: &str) -> String {
             indent_level = indent_level.saturating_sub(1);
         }
 
-        // Add indentation
-        for _ in 0..indent_level {
-            result.push_str("  ");
+        // Indentation is SEMANTIC in Typst: it nests sublists and keeps raw
+        // block bodies intact, so re-flowing from brace depth flattened them
+        // (issue #43). Deliberate indentation comes in units of two spaces and
+        // is preserved; a lone leading space is incidental.
+        let own_indent = line.len() - line.trim_start().len();
+        if own_indent >= 2 {
+            result.push_str(line.trim_end());
+        } else {
+            for _ in 0..indent_level {
+                result.push_str("  ");
+            }
+            result.push_str(trimmed);
         }
-        result.push_str(trimmed);
         result.push('\n');
 
         // Increase indent after opening braces/brackets

@@ -670,6 +670,144 @@ fn extract_params_from_node(params_node: &SyntaxNode, params: &mut Vec<String>) 
     }
 }
 
+/// A `//! tylax:` preprocessing directive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TylaxDirective {
+    /// Drop the next non-blank source line from conversion.
+    IgnoreNextLine,
+    /// Start of a block whose lines are dropped from conversion.
+    BlockBegin,
+    /// End of an ignore block.
+    BlockEnd,
+}
+
+/// Parse a single line as a `//! tylax:` directive, if it is one.
+///
+/// Leading whitespace and whitespace around the `//!` / `tylax:` markers is
+/// tolerated so the directive can be indented to match surrounding code.
+fn parse_tylax_directive(line: &str) -> Option<TylaxDirective> {
+    let rest = line.trim_start().strip_prefix("//!")?.trim_start();
+    let rest = rest.strip_prefix("tylax:")?;
+    match rest.trim() {
+        "ignore-next-line" => Some(TylaxDirective::IgnoreNextLine),
+        "ignore-begin" => Some(TylaxDirective::BlockBegin),
+        "ignore-end" => Some(TylaxDirective::BlockEnd),
+        _ => None,
+    }
+}
+
+/// Collect the byte ranges of every genuine Typst line comment in `input`.
+///
+/// Only spans that Typst itself parses as a `LineComment` node qualify. A `//!`
+/// sequence that appears inside a fenced raw block, a string literal, or any
+/// other node is *not* a comment and therefore never yields a range here — which
+/// is exactly what lets [`strip_tylax_ignores`] tell a real directive apart from
+/// literal text that merely looks like one.
+fn line_comment_ranges(input: &str) -> Vec<std::ops::Range<usize>> {
+    let root = parse(input);
+    let mut ranges = Vec::new();
+    collect_line_comment_ranges(&typst_syntax::LinkedNode::new(&root), &mut ranges);
+    ranges
+}
+
+fn collect_line_comment_ranges(
+    node: &typst_syntax::LinkedNode,
+    out: &mut Vec<std::ops::Range<usize>>,
+) {
+    if node.kind() == SyntaxKind::LineComment {
+        out.push(node.range());
+    }
+    for child in node.children() {
+        collect_line_comment_ranges(&child, out);
+    }
+}
+
+/// Strip content marked for exclusion via `//! tylax:` directives.
+///
+/// Supported directives (whitespace around the markers is ignored):
+/// - `//! tylax: ignore-next-line` — drop the next non-blank line.
+/// - `//! tylax: ignore-begin` … `//! tylax: ignore-end` — drop the enclosed block.
+///
+/// Directive lines are always removed. Because they are ordinary Typst line
+/// comments, sources using them stay valid Typst — the directives only guide
+/// Tylax, they do not affect Typst compilation. Any other `//! tylax:` payload
+/// (for example the `begin`/`mode`/`template` figure hints) is left untouched
+/// here; being a comment, it is dropped by the normal converter anyway.
+///
+/// A `//! tylax:` sequence only counts as a directive when Typst actually parses
+/// it as a line comment. The same bytes sitting inside a fenced raw block or a
+/// string literal are literal content and must survive verbatim, so they are
+/// matched against [`line_comment_ranges`] before being honored.
+pub fn strip_tylax_ignores(input: &str) -> String {
+    // Fast path: no directives possible.
+    if !input.contains("tylax:") {
+        return input.to_string();
+    }
+
+    // Byte ranges of the source that Typst treats as real line comments.
+    let comment_ranges = line_comment_ranges(input);
+    let is_real_comment = |marker_pos: usize| {
+        comment_ranges
+            .iter()
+            .any(|r| r.start <= marker_pos && marker_pos < r.end)
+    };
+
+    let mut out = String::with_capacity(input.len());
+    let mut ignore_depth = 0usize;
+    let mut skip_next_non_blank = false;
+    let mut offset = 0usize;
+
+    // Iterate with byte offsets preserved (mirroring `str::lines`, which drops
+    // a trailing newline) so each `//!` marker can be checked against
+    // `comment_ranges`.
+    for raw in input.split_inclusive('\n') {
+        let line_start = offset;
+        offset += raw.len();
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+
+        // A directive only counts when the `//!` is a genuine Typst line comment.
+        let directive = parse_tylax_directive(line).filter(|_| {
+            line.find("//!")
+                .map(|col| is_real_comment(line_start + col))
+                .unwrap_or(false)
+        });
+
+        if let Some(directive) = directive {
+            match directive {
+                TylaxDirective::BlockBegin => ignore_depth += 1,
+                TylaxDirective::BlockEnd => ignore_depth = ignore_depth.saturating_sub(1),
+                TylaxDirective::IgnoreNextLine if ignore_depth == 0 => {
+                    // Directives are control lines, not user content, so they
+                    // never become the target to skip, and an inner directive
+                    // cannot consume a block terminator.
+                    skip_next_non_blank = true;
+                }
+                TylaxDirective::IgnoreNextLine => {}
+            }
+            // Directive lines themselves are always removed.
+            continue;
+        }
+
+        if ignore_depth > 0 {
+            continue;
+        }
+
+        if skip_next_non_blank {
+            // Established behavior: blank lines between directive and target go too.
+            if !line.trim().is_empty() {
+                skip_next_non_blank = false;
+            }
+            continue;
+        }
+
+        // Keep retained slices byte-for-byte: rejoining lines would change CRLF and the tail.
+        out.push_str(raw);
+    }
+
+    out
+}
+
 /// Preprocess Typst source: extract definitions and expand using AST
 pub fn preprocess_typst(input: &str) -> String {
     // Step 1: Extract definitions
@@ -767,6 +905,86 @@ The Greek letter is #alpha"#;
         let (db, cleaned) = extract_let_definitions(input);
         assert!(db.is_defined("alpha"));
         assert!(!cleaned.contains("#let"));
+    }
+
+    #[test]
+    fn test_ignore_next_line_directive() {
+        let input = "//! tylax: ignore-next-line\n#import \"@preview/cetz:0.3.1\"\nKeep this text";
+        let result = strip_tylax_ignores(input);
+        assert!(!result.contains("cetz"), "ignored import should be dropped");
+        assert!(
+            !result.contains("tylax:"),
+            "directive line should be dropped"
+        );
+        assert!(result.contains("Keep this text"));
+    }
+
+    #[test]
+    fn test_ignore_next_line_skips_blank_lines() {
+        let input = "//! tylax: ignore-next-line\n\n#import \"helper\"\nKeep";
+        let result = strip_tylax_ignores(input);
+        assert!(
+            !result.contains("helper"),
+            "blank line should not shield the target"
+        );
+        assert!(result.contains("Keep"));
+    }
+
+    #[test]
+    fn test_ignore_block_directive() {
+        let input =
+            "Before\n//! tylax: ignore-begin\nhelper one\nhelper two\n//! tylax: ignore-end\nAfter";
+        let result = strip_tylax_ignores(input);
+        assert!(result.contains("Before"));
+        assert!(result.contains("After"));
+        assert!(!result.contains("helper one"));
+        assert!(!result.contains("helper two"));
+        assert!(!result.contains("tylax:"));
+    }
+
+    #[test]
+    fn test_ignore_directives_do_not_consume_block_terminators() {
+        // An inner directive must not swallow `ignore-end`, or every later line is dropped.
+        let input =
+            "//! tylax: ignore-begin\n//! tylax: ignore-next-line\n//! tylax: ignore-end\nAfter";
+        assert_eq!(strip_tylax_ignores(input), "After");
+    }
+
+    #[test]
+    fn test_nested_ignore_blocks_require_matching_ends() {
+        let input = "Before\n//! tylax: ignore-begin\nouter\n//! tylax: ignore-begin\ninner\n//! tylax: ignore-end\nstill outer\n//! tylax: ignore-end\nAfter";
+        let result = strip_tylax_ignores(input);
+        assert_eq!(result, "Before\nAfter");
+    }
+
+    #[test]
+    fn test_indented_directive_is_recognized() {
+        let input = "    //! tylax: ignore-next-line\n    let x = 5\nkeep";
+        let result = strip_tylax_ignores(input);
+        assert!(!result.contains("let x = 5"));
+        assert!(result.contains("keep"));
+    }
+
+    #[test]
+    fn test_non_directive_comments_are_preserved() {
+        let input = "//! tylax: figure\n//! mode = figure\nContent";
+        // Unknown `//! tylax:` payloads are left intact (dropped later as comments).
+        let result = strip_tylax_ignores(input);
+        assert!(result.contains("mode = figure"));
+        assert!(result.contains("Content"));
+    }
+
+    #[test]
+    fn test_source_without_directives_is_unchanged() {
+        let input = "#let x = 1\nsome content\n// a normal comment";
+        assert_eq!(strip_tylax_ignores(input), input);
+    }
+
+    #[test]
+    fn test_directives_preserve_retained_crlf_and_terminal_newline() {
+        let input = "before\r\n//! tylax: ignore-next-line\r\nskip\r\n```\r\n//! tylax: literal\r\n```\r\nafter\r\n";
+        let expected = "before\r\n```\r\n//! tylax: literal\r\n```\r\nafter\r\n";
+        assert_eq!(strip_tylax_ignores(input), expected);
     }
 
     #[test]

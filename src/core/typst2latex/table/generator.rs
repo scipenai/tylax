@@ -59,6 +59,10 @@ pub struct LatexTableGenerator {
     pub use_booktabs: bool,
     /// Whether the table has a header
     pub has_header: bool,
+    /// Whether to draw the default frame and row rules: Typst's `#table`
+    /// strokes and `#grid` does not, so one cell model serves both. An explicit
+    /// `hline` still draws either way.
+    pub ruled: bool,
     /// Track if we're currently processing header rows
     in_header: bool,
 }
@@ -83,8 +87,15 @@ impl LatexTableGenerator {
             pending_hlines: Vec::new(),
             use_booktabs: false,
             has_header: false,
+            ruled: true,
             in_header: false,
         }
+    }
+
+    /// Drop the default rules, for `#grid`. See [`Self::ruled`].
+    pub fn without_rules(mut self) -> Self {
+        self.ruled = false;
+        self
     }
 
     /// Start processing header rows
@@ -199,7 +210,7 @@ impl LatexTableGenerator {
         // Top line
         if self.use_booktabs {
             let _ = writeln!(output, "\\toprule");
-        } else {
+        } else if self.ruled {
             let _ = writeln!(output, "\\hline");
         }
 
@@ -255,7 +266,7 @@ impl LatexTableGenerator {
         // Bottom line
         if self.use_booktabs {
             let _ = writeln!(output, "\\bottomrule");
-        } else {
+        } else if self.ruled {
             let _ = writeln!(output, "\\hline");
         }
 
@@ -266,17 +277,18 @@ impl LatexTableGenerator {
 
     /// Build the column specification string (e.g., "|l|c|r|")
     fn build_column_spec(&self) -> String {
-        let mut spec = String::from("|");
+        let rule = if self.ruled { "|" } else { "" };
+        let mut spec = String::from(rule);
 
         for align in &self.col_aligns {
             spec.push(align.to_char());
-            spec.push('|');
+            spec.push_str(rule);
         }
 
         // If col_aligns is shorter than col_count, fill with 'c'
         for _ in self.col_aligns.len()..self.col_count {
             spec.push('c');
-            spec.push('|');
+            spec.push_str(rule);
         }
 
         spec

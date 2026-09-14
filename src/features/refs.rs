@@ -6,6 +6,22 @@
 
 use std::collections::HashMap;
 
+/// Which bibliography backend a document uses, decided from conversion events
+/// (a rendered `thebibliography` and/or external `\bibliography`-family
+/// commands) rather than by scanning the produced Typst. Governs how deferred
+/// citation markers resolve at document finalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BibBackend {
+    /// No bibliography seen at all.
+    None,
+    /// Only a manual `thebibliography` environment (renders `<key>` anchors).
+    Manual,
+    /// Only external BibTeX/biblatex (`\bibliography`, `\addbibresource`, ...).
+    External,
+    /// Both a manual and an external bibliography — ambiguous.
+    Mixed,
+}
+
 /// Citation mode (how the citation is displayed)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CitationMode {
@@ -646,21 +662,28 @@ fn is_simple_key(key: &str) -> bool {
         .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
+/// Render a reference that must show only its number, with no supplement word.
+///
+/// Typst's `@key` shorthand always inserts a supplement, so `@eq-b` renders as
+/// "Equation 2". LaTeX's `\eqref` renders "(2)" and the word in front of it
+/// ("equation~\eqref{..}") is the author's own prose, so keeping both gives
+/// "equation Equation 2" (issue #43). The explicit form suppresses the
+/// automatic supplement.
+///
+/// Note this renders the BARE number: a supplement-less `#ref` does not pick up
+/// the equation numbering pattern's parentheses, so a caller that needs
+/// `\eqref`'s "(2)" must add them itself.
+///
+/// The target is used exactly as the label sanitizer produced it: label names
+/// are author-chosen, so prefixing (`eq-`) would point at a label the document
+/// never defines (issue #43).
+pub fn reference_to_typst_without_supplement(reference: &Reference) -> String {
+    format!("#ref(<{}>, supplement: none)", reference.target)
+}
+
 /// Convert reference to Typst
 pub fn reference_to_typst(reference: &Reference) -> String {
     match reference.ref_type {
-        ReferenceType::Equation => {
-            let target = if reference.target.starts_with("eq-") {
-                reference.target.clone()
-            } else {
-                format!("eq-{}", reference.target)
-            };
-            if is_simple_key(&target) {
-                format!("@{}", target)
-            } else {
-                format!("#ref(<{}>)", target)
-            }
-        }
         ReferenceType::Page => {
             let target = if is_simple_key(&reference.target) {
                 format!("@{}", reference.target)
@@ -952,7 +975,12 @@ mod tests {
             target: "energy".to_string(),
             ref_type: ReferenceType::Equation,
         };
-        assert_eq!(reference_to_typst(&equation), "@eq-energy");
+        // The target is the label the document carries; an `eq-` prefix broke `\eqref` (issue #43).
+        assert_eq!(reference_to_typst(&equation), "@energy");
+        assert_eq!(
+            reference_to_typst_without_supplement(&equation),
+            "#ref(<energy>, supplement: none)"
+        );
 
         let page = Reference {
             target: "fig-one".to_string(),

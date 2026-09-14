@@ -6,10 +6,107 @@ use mitex_parser::syntax::{CmdItem, EnvItem, SyntaxElement, SyntaxKind, SyntaxNo
 use rowan::ast::AstNode;
 use std::fmt::Write;
 
-use super::context::{ConversionMode, EnvironmentContext, LatexConverter};
+use super::context::{env_header_args, ConversionMode, EnvironmentContext, LatexConverter};
 use super::table::{parse_with_grid_parser, CellAlign};
 use super::utils::sanitize_label;
+use super::{ConversionWarning, WarningKind};
 use crate::data::constants::{CodeBlockOptions, TheoremStyle, LANGUAGE_MAP, THEOREM_TYPES};
+
+/// Split a cleaned Typst math body into row strings.
+///
+/// Rows are separated either by a literal newline (how `align`'s `\\` currently
+/// surfaces after cleanup) or by a lone Typst line break (` \ `). Empty rows are
+/// dropped.
+fn split_math_rows(cleaned: &str) -> Vec<String> {
+    cleaned
+        .replace(" \\ ", "\n")
+        .split('\n')
+        .map(|row| row.trim().to_string())
+        .filter(|row| !row.is_empty())
+        .collect()
+}
+
+/// Split a single inline `#<label>` marker out of a math row.
+///
+/// Returns the row text with the marker removed and, if present, the label name.
+fn take_row_label(row: &str) -> (String, Option<String>) {
+    if let Some(start) = row.find("#<") {
+        if let Some(rel_end) = row[start + 2..].find('>') {
+            let end = start + 2 + rel_end;
+            let label = row[start + 2..end].to_string();
+            let mut body = String::with_capacity(row.len());
+            body.push_str(&row[..start]);
+            body.push_str(&row[end + 1..]);
+            return (body, Some(label));
+        }
+    }
+    (row.to_string(), None)
+}
+
+/// Remove every inline `#<label>` marker from a math body.
+fn strip_inline_labels(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("#<") {
+        out.push_str(&rest[..start]);
+        match rest[start + 2..].find('>') {
+            Some(rel_end) => rest = &rest[start + 2 + rel_end + 1..],
+            None => {
+                // Unterminated marker: keep the remainder verbatim.
+                out.push_str(&rest[start..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Render labelled multi-row math without leaving invalid labels inside `$...$`.
+///
+/// One label attaches to the whole block, preserving its alignment. Typst cannot
+/// give rows of one block independent labels, so that form degrades to separate
+/// equations and warns rather than silently dropping the alignment.
+fn emit_labelled_math_rows(conv: &mut LatexConverter, output: &mut String, cleaned: &str) -> bool {
+    let rows = split_math_rows(cleaned);
+    let labels: Vec<String> = rows
+        .iter()
+        .filter_map(|row| take_row_label(row).1)
+        .collect();
+    if labels.is_empty() {
+        return false;
+    }
+
+    if labels.len() == 1 {
+        output.push_str("$ ");
+        output.push_str(strip_inline_labels(cleaned).trim());
+        output.push_str(" $");
+        let _ = writeln!(output, " <{}>", sanitize_label(&labels[0]));
+        return true;
+    }
+
+    let message = "Multiple labelled rows in a LaTeX alignment are emitted as separate equations because Typst cannot attach independent labels to rows of one aligned math block.";
+    conv.state.warnings.push(message.to_string());
+    conv.state
+        .add_warning(ConversionWarning::new(WarningKind::ParseError, message));
+
+    for row in rows {
+        let (body, label) = take_row_label(&row);
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        output.push_str("$ ");
+        output.push_str(body);
+        output.push_str(" $");
+        if let Some(label) = label {
+            let _ = write!(output, " <{}>", sanitize_label(&label));
+        }
+        output.push('\n');
+    }
+
+    true
+}
 
 /// Convert a LaTeX environment
 pub fn convert_environment(conv: &mut LatexConverter, elem: SyntaxElement, output: &mut String) {
@@ -53,27 +150,16 @@ pub fn convert_environment(conv: &mut LatexConverter, elem: SyntaxElement, outpu
             convert_array(conv, &node, output);
         }
 
-        // List environments
+        // Lists rely on each `\item` starting its own line, so no leading
+        // `\n`: a nested list must stay flush under its parent (issue #43).
         "itemize" => {
-            conv.state.push_env(EnvironmentContext::Itemize);
-            output.push('\n');
-            conv.visit_env_content(&node, output);
-            conv.state.pop_env();
-            output.push('\n');
+            convert_list(conv, &node, EnvironmentContext::Itemize, output);
         }
         "enumerate" => {
-            conv.state.push_env(EnvironmentContext::Enumerate);
-            output.push('\n');
-            conv.visit_env_content(&node, output);
-            conv.state.pop_env();
-            output.push('\n');
+            convert_list(conv, &node, EnvironmentContext::Enumerate, output);
         }
         "description" => {
-            conv.state.push_env(EnvironmentContext::Description);
-            output.push('\n');
-            conv.visit_env_content(&node, output);
-            conv.state.pop_env();
-            output.push('\n');
+            convert_list(conv, &node, EnvironmentContext::Description, output);
         }
 
         // Math environments
@@ -170,6 +256,23 @@ pub fn convert_environment(conv: &mut LatexConverter, elem: SyntaxElement, outpu
             output.push_str("\n]\n");
         }
 
+        // Multi-column layout: `\begin{multicols}{2}[Header]`. The optional
+        // argument is a header spanning all columns, so it precedes them.
+        "multicols" | "multicols*" => {
+            let columns = conv
+                .get_env_required_arg(&node, 0)
+                .unwrap_or_else(|| "2".to_string());
+            if let Some(header) = conv.get_env_optional_arg(&node) {
+                let header = header.trim();
+                if !header.is_empty() {
+                    let _ = writeln!(output, "\n{}", header);
+                }
+            }
+            let _ = writeln!(output, "#columns({})[", columns.trim());
+            conv.visit_env_content(&node, output);
+            output.push_str("\n]\n");
+        }
+
         // Minipage
         "minipage" => {
             let width = conv
@@ -237,43 +340,83 @@ pub fn convert_environment(conv: &mut LatexConverter, elem: SyntaxElement, outpu
 // =============================================================================
 
 /// Convert a figure environment
+/// Number of list environments already open around this point.
+fn open_list_depth(conv: &LatexConverter) -> usize {
+    conv.state
+        .env_stack
+        .iter()
+        .filter(|env| {
+            matches!(
+                env,
+                EnvironmentContext::Itemize
+                    | EnvironmentContext::Enumerate
+                    | EnvironmentContext::Description
+            )
+        })
+        .count()
+}
+
+/// Convert a list environment. Typst nests by INDENTATION, already maintained
+/// by `push_env`/`pop_env`; what matters here is the paragraph break, since a
+/// blank line after a NESTED list would end its parent too (issue #43).
+fn convert_list(
+    conv: &mut LatexConverter,
+    node: &SyntaxNode,
+    context: EnvironmentContext,
+    output: &mut String,
+) {
+    let nested = open_list_depth(conv) > 0;
+    conv.state.push_env(context);
+    conv.visit_env_content(node, output);
+    conv.state.pop_env();
+    if !nested {
+        output.push('\n');
+    }
+}
+
 fn convert_figure(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut String) {
     conv.state.push_env(EnvironmentContext::Figure);
 
-    output.push_str("\n#figure(\n");
-
-    // Find image and caption using AST
-    let mut has_image = false;
+    // `\caption`/`\label` become `#figure(..)` arguments; EVERYTHING else is
+    // real content. Recognising only `\includegraphics` dropped tikzpictures,
+    // tabulars and prose (issue #39).
     let mut caption_cmd: Option<CmdItem> = None;
     let mut label_text = String::new();
+    let mut body_elements: Vec<SyntaxElement> = Vec::new();
 
     for child in node.children_with_tokens() {
+        if matches!(child.kind(), SyntaxKind::ItemBegin | SyntaxKind::ItemEnd) {
+            continue;
+        }
         if let SyntaxElement::Node(n) = &child {
             if let Some(cmd) = CmdItem::cast(n.clone()) {
-                if let Some(name_tok) = cmd.name_tok() {
-                    let name = name_tok.text();
-                    if name == "\\includegraphics" {
-                        has_image = true;
-                        output.push_str("  image(\"");
-                        if let Some(path) = conv.get_required_arg(&cmd, 0) {
-                            output.push_str(&path);
-                        }
-                        output.push_str("\"),\n");
-                    } else if name == "\\caption" {
-                        // Store the command for later conversion
+                match cmd.name_tok().as_ref().map(|t| t.text()) {
+                    Some("\\caption") => {
                         caption_cmd = Some(cmd.clone());
-                    } else if name == "\\label" {
+                        continue;
+                    }
+                    Some("\\label") => {
                         if let Some(lbl) = conv.get_required_arg(&cmd, 0) {
                             label_text = lbl;
                         }
+                        continue;
                     }
+                    _ => {}
                 }
             }
         }
+        body_elements.push(child);
     }
 
-    if !has_image {
-        output.push_str("  [],\n"); // Placeholder
+    let mut body = String::new();
+    conv.visit_elements(&body_elements, &mut body);
+    let body = body.trim();
+
+    output.push_str("\n#figure(\n");
+    if body.is_empty() {
+        output.push_str("  [],\n");
+    } else {
+        let _ = writeln!(output, "  [{}],", body);
     }
 
     // Convert caption content (may contain math like $\downarrow$)
@@ -300,37 +443,38 @@ fn convert_table(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut Stri
 
     let mut caption_cmd: Option<CmdItem> = None;
     let mut label_text = String::new();
-    let mut table_content = String::new();
+    let mut body_elements: Vec<SyntaxElement> = Vec::new();
 
-    // First pass: extract caption, label, and tabular content using AST
+    // `\caption`/`\label` become `#figure(..)` arguments; EVERYTHING else is
+    // real content. Recognising only the `tabular` child dropped the prose,
+    // lists and second tables a `table` float is allowed to carry.
     for child in node.children_with_tokens() {
+        if matches!(child.kind(), SyntaxKind::ItemBegin | SyntaxKind::ItemEnd) {
+            continue;
+        }
         if let SyntaxElement::Node(n) = &child {
             if let Some(cmd) = CmdItem::cast(n.clone()) {
-                if let Some(name_tok) = cmd.name_tok() {
-                    let name = name_tok.text();
-                    if name == "\\caption" {
+                match cmd.name_tok().as_ref().map(|t| t.text()) {
+                    Some("\\caption") => {
                         caption_cmd = Some(cmd.clone());
-                    } else if name == "\\label" {
+                        continue;
+                    }
+                    Some("\\label") => {
                         if let Some(lbl) = conv.get_required_arg(&cmd, 0) {
                             label_text = lbl;
                         }
+                        continue;
                     }
-                }
-            }
-            // Check for tabular environment
-            if let Some(env) = EnvItem::cast(n.clone()) {
-                if env
-                    .name_tok()
-                    .map(|t| t.text().to_string())
-                    .unwrap_or_default()
-                    .starts_with("tabular")
-                {
-                    // convert_tabular handles its own push/pop of Tabular context
-                    convert_tabular(conv, n, &mut table_content);
+                    _ => {}
                 }
             }
         }
+        body_elements.push(child);
     }
+
+    let mut table_content = String::new();
+    conv.visit_elements(&body_elements, &mut table_content);
+    let table_content = table_content.trim();
 
     // Build properly formatted figure
     output.push_str("\n#figure(");
@@ -343,7 +487,7 @@ fn convert_table(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut Stri
     }
 
     output.push_str(")[\n");
-    output.push_str(&table_content);
+    output.push_str(table_content);
     output.push_str("\n] ");
 
     if !label_text.is_empty() {
@@ -365,7 +509,8 @@ fn convert_tabular(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut St
 
     // Get column specification from the environment's first required argument
     let col_spec = get_tabular_col_spec(node).unwrap_or_default();
-    let columns = parse_column_spec(&col_spec);
+    let spec = parse_column_spec_full(&col_spec);
+    let columns = &spec.columns;
 
     // Convert column specs to CellAlign
     let alignments: Vec<CellAlign> = columns
@@ -385,8 +530,25 @@ fn convert_tabular(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut St
     // Restore previous mode
     conv.state.mode = prev_mode;
 
-    // Use the new grid parser
-    let typst_output = parse_with_grid_parser(&content, alignments);
+    // `table.vline` has no double-rule stroke, so `||` renders as one line —
+    // a reported downgrade, not a silent one (issue #43).
+    let doubled = spec.doubled_vlines();
+    if !doubled.is_empty() {
+        let message = format!(
+            "Double vertical rule (`||`) at column boundary {} drawn as a single rule: \
+             Typst's `table.vline` has no double-line stroke.",
+            doubled
+                .iter()
+                .map(|at| at.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        conv.state.warnings.push(message.clone());
+        conv.state
+            .add_warning(ConversionWarning::new(WarningKind::ParseError, message));
+    }
+
+    let typst_output = parse_with_grid_parser(&content, alignments, &spec.distinct_vlines());
     output.push_str(&typst_output);
 
     conv.state.pop_env();
@@ -426,17 +588,26 @@ fn convert_equation(
     let mut math_content = String::new();
     conv.visit_env_content(node, &mut math_content);
 
-    // Apply math cleanup
+    // The label is emitted once after the equation as a real Typst label, so
+    // strip any inline `#<..>` marker the `\label` handler left in the body
+    // (issue #43).
     let cleaned = conv.cleanup_math_spacing(&math_content);
+    // A label nested in `aligned`/`split` arrives as an inline marker but names
+    // this enclosing equation, so retain the first before removing markers.
+    if label.is_empty() {
+        label = take_row_label(&cleaned).1.unwrap_or_default();
+    }
+    let cleaned = strip_inline_labels(&cleaned);
+    let cleaned = cleaned.trim();
 
     // For starred equations (equation*), disable numbering
     if is_starred {
         output.push_str("#math.equation(block: true, numbering: none)[\n$ ");
-        output.push_str(&cleaned);
+        output.push_str(cleaned);
         output.push_str(" $\n]");
     } else {
         output.push_str("$ ");
-        output.push_str(&cleaned);
+        output.push_str(cleaned);
         output.push_str(" $");
 
         if !label.is_empty() {
@@ -467,47 +638,33 @@ fn convert_align(
     // Check if this is a starred (unnumbered) environment
     let is_starred = env_name.ends_with('*');
 
-    // Extract label first using AST (for numbered align environments)
-    let mut label = String::new();
-    for child in node.children_with_tokens() {
-        if let SyntaxElement::Node(n) = &child {
-            if let Some(cmd) = CmdItem::cast(n.clone()) {
-                if let Some(name_tok) = cmd.name_tok() {
-                    if name_tok.text() == "\\label" {
-                        if let Some(lbl) = conv.get_required_arg(&cmd, 0) {
-                            label = lbl;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Collect math content into a buffer for post-processing
+    // Collect math content into a buffer for post-processing. Per-row `\label`s
+    // are converted inline (to `#<..>`) by the command visitor (issue #43).
     let mut math_content = String::new();
     conv.visit_env_content(node, &mut math_content);
 
     // Apply math cleanup
     let cleaned = conv.cleanup_math_spacing(&math_content);
 
-    if !is_inner {
+    // A `#<..>` inside math creates no resolvable label, so an `align` with
+    // per-row labels splits into one equation per row (issue #43).
+    if is_inner {
+        // Inside an outer equation: emit the body unchanged (labels stay inline,
+        // which the enclosing block handles).
+        output.push_str(&cleaned);
+    } else if !is_starred && emit_labelled_math_rows(conv, output, &cleaned) {
+        // Labels are emitted by the shared row renderer above.
+    } else if is_starred {
         // For starred environments (align*, eqnarray*, etc.), disable numbering
-        if is_starred {
-            output.push_str("#math.equation(block: true, numbering: none)[\n$ ");
-            output.push_str(&cleaned);
-            output.push_str(" $\n]");
-        } else {
-            output.push_str("$ ");
-            output.push_str(&cleaned);
-            output.push_str(" $");
-
-            if !label.is_empty() {
-                let _ = write!(output, " <{}>", sanitize_label(&label));
-            }
-        }
+        output.push_str("#math.equation(block: true, numbering: none)[\n$ ");
+        output.push_str(&strip_inline_labels(&cleaned));
+        output.push_str(" $\n]");
         output.push('\n');
     } else {
-        output.push_str(&cleaned);
+        output.push_str("$ ");
+        output.push_str(&strip_inline_labels(&cleaned));
+        output.push_str(" $");
+        output.push('\n');
     }
 
     conv.state.mode = prev_mode;
@@ -535,6 +692,11 @@ fn convert_gather(
 
     let processed = conv.postprocess_math(content);
 
+    if !is_starred && emit_labelled_math_rows(conv, output, &processed) {
+        return;
+    }
+
+    let processed = strip_inline_labels(&processed);
     if is_starred {
         let _ = write!(
             output,
@@ -567,6 +729,11 @@ fn convert_multline(
 
     let processed = conv.postprocess_math(content);
 
+    if !is_starred && emit_labelled_math_rows(conv, output, &processed) {
+        return;
+    }
+
+    let processed = strip_inline_labels(&processed);
     if is_starred {
         let _ = write!(
             output,
@@ -678,7 +845,7 @@ pub(crate) fn convert_array_with_delim(
 }
 
 /// Convert a cases environment
-fn convert_cases(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut String) {
+pub(crate) fn convert_cases(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut String) {
     conv.state.push_env(EnvironmentContext::Cases);
     let prev_mode = conv.state.mode;
     conv.state.mode = ConversionMode::Math;
@@ -880,10 +1047,22 @@ fn convert_theorem(
 
 /// Convert a bibliography environment
 fn convert_bibliography(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut String) {
+    // Record the manual-bibliography event so `resolve_citations` rewrites
+    // `\cite{k}` to `@k`, matching the `<key>` anchors emitted below, instead
+    // of an uncompilable `#cite(<k>)` with no `#bibliography()`.
+    conv.citations.saw_manual_bib = true;
     conv.state.push_env(EnvironmentContext::Bibliography);
 
     output.push_str("\n= References\n\n");
-    output.push_str("#show figure.where(kind: \"bib\"): it => block[#it.caption #it.body]\n");
+    // Entries stay `#figure`s so `@key` has something numbered to resolve
+    // against, but a figure centres its caption on its own line. Lay each out as
+    // a left-aligned hanging-indent row; `it.caption.body` is the bare number,
+    // without the caption's own styling.
+    output.push_str(
+        "#show figure.where(kind: \"bib\"): it => block(width: 100%, above: 0.65em, below: 0.65em)[\n  \
+         #grid(columns: (auto, 1fr), column-gutter: 0.65em, align: (right + top, left + top),\n    \
+         it.caption.body, it.body)\n]\n",
+    );
 
     // Process bibitem commands using the dedicated function
     convert_thebibliography_content(conv, node, output);
@@ -1018,60 +1197,12 @@ fn convert_algorithm(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut 
 /// Get the column specification from a tabular environment
 /// The col spec is in the first curly arg after the env name: \begin{tabular}{lccc}
 fn get_tabular_col_spec(node: &SyntaxNode) -> Option<String> {
-    // Look for ItemBegin, then find the column specification argument
-    for child in node.children() {
-        if child.kind() == SyntaxKind::ItemBegin {
-            // In ItemBegin, look for ClauseArgument with curly braces
-            for begin_child in child.children() {
-                if begin_child.kind() == SyntaxKind::ClauseArgument {
-                    // Check if it's a curly (required) argument
-                    let has_curly = begin_child
-                        .children()
-                        .any(|c| c.kind() == SyntaxKind::ItemCurly);
-                    if has_curly {
-                        // Extract the content
-                        let mut content = String::new();
-                        for arg_child in begin_child.children_with_tokens() {
-                            match arg_child.kind() {
-                                SyntaxKind::TokenLBrace
-                                | SyntaxKind::TokenRBrace
-                                | SyntaxKind::TokenLBracket
-                                | SyntaxKind::TokenRBracket => continue,
-                                SyntaxKind::ItemCurly => {
-                                    // Extract inner content
-                                    if let SyntaxElement::Node(n) = arg_child {
-                                        for inner in n.children_with_tokens() {
-                                            match inner.kind() {
-                                                SyntaxKind::TokenLBrace
-                                                | SyntaxKind::TokenRBrace => continue,
-                                                _ => {
-                                                    if let SyntaxElement::Token(t) = inner {
-                                                        content.push_str(t.text());
-                                                    } else if let SyntaxElement::Node(n) = inner {
-                                                        content.push_str(&n.text().to_string());
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    if let SyntaxElement::Token(t) = arg_child {
-                                        content.push_str(t.text());
-                                    }
-                                }
-                            }
-                        }
-                        let trimmed = content.trim().to_string();
-                        if !trimmed.is_empty() {
-                            return Some(trimmed);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
+    // The column spec is the LAST required slot for every shape in the family:
+    // `tabular[pos]{cols}` as well as `tabular*{width}[pos]{cols}`.
+    env_header_args(node)
+        .into_iter()
+        .rfind(|arg| !arg.optional)
+        .map(|arg| arg.content)
 }
 
 /// Skip over a braced group {...} if present.
@@ -1123,9 +1254,46 @@ fn extract_braced_group(chars: &mut std::iter::Peekable<std::str::Chars>) -> Opt
     Some(content)
 }
 
-/// Parse column specification from LaTeX format (e.g., "l|ccc" -> ["l", "c", "c", "c"])
-fn parse_column_spec(spec: &str) -> Vec<String> {
+/// A parsed `\begin{tabular}{...}` column specification.
+struct ColumnSpec {
+    /// One alignment letter per column.
+    columns: Vec<String>,
+    /// One entry per `|`, sorted: `0` is left of the first column. Repeats are
+    /// KEPT, since `||` is a legal double rule; the renderer decides what it
+    /// can draw.
+    vlines: Vec<usize>,
+}
+
+impl ColumnSpec {
+    /// The distinct boundaries carrying at least one rule.
+    fn distinct_vlines(&self) -> Vec<usize> {
+        let mut distinct = self.vlines.clone();
+        distinct.dedup();
+        distinct
+    }
+
+    /// Boundaries the source drew more than once (`||`, `|||`, …).
+    fn doubled_vlines(&self) -> Vec<usize> {
+        let mut doubled = Vec::new();
+        for at in self.distinct_vlines() {
+            if self.vlines.iter().filter(|other| **other == at).count() > 1
+                && !doubled.contains(&at)
+            {
+                doubled.push(at);
+            }
+        }
+        doubled
+    }
+}
+
+/// Parse a column specification, keeping the vertical rules.
+///
+/// The `|` separators are real table borders, not decoration, so they have to
+/// survive as structured information: once a table switches Typst's default
+/// grid off, nothing else would draw them (issue #43).
+fn parse_column_spec_full(spec: &str) -> ColumnSpec {
     let mut columns = Vec::new();
+    let mut vlines = Vec::new();
     let mut chars = spec.chars().peekable();
 
     while let Some(c) = chars.next() {
@@ -1140,14 +1308,17 @@ fn parse_column_spec(spec: &str) -> Vec<String> {
                 if let Some(count_str) = extract_braced_group(&mut chars) {
                     let count: usize = count_str.parse().unwrap_or(1);
                     if let Some(spec_str) = extract_braced_group(&mut chars) {
-                        let inner_cols = parse_column_spec(&spec_str);
+                        let inner = parse_column_spec_full(&spec_str);
                         for _ in 0..count {
-                            columns.extend(inner_cols.clone());
+                            let base = columns.len();
+                            vlines.extend(inner.vlines.iter().map(|at| base + at));
+                            columns.extend(inner.columns.iter().cloned());
                         }
                     }
                 }
             }
-            '|' => {}                                   // Skip vertical separators
+            // A vertical rule sits at the boundary before the next column.
+            '|' => vlines.push(columns.len()),
             '@' | '!' => skip_braced_group(&mut chars), // Skip @{} and !{} expressions
             '>' | '<' => skip_braced_group(&mut chars), // Skip column modifiers
             _ => {}
@@ -1158,7 +1329,11 @@ fn parse_column_spec(spec: &str) -> Vec<String> {
         columns.push("l".to_string());
     }
 
-    columns
+    // Sorted but NOT deduplicated: `||` must stay visible as two rules.
+    vlines.retain(|at| *at <= columns.len());
+    vlines.sort_unstable();
+
+    ColumnSpec { columns, vlines }
 }
 
 /// Convert a LaTeX dimension to Typst

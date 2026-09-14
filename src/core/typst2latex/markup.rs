@@ -5,12 +5,13 @@
 use super::context::{ConvertContext, EnvironmentContext, T2LOptions, TokenType};
 use super::engine::{render_math_segments_to_typst_source, ContentNode};
 use super::math::convert_math_node;
+use super::supplement::{mark_at_reference, mark_reference};
 use super::table::{LatexCell, LatexCellAlign, LatexHLine, LatexTableGenerator};
 use super::utils::{
     count_heading_markers, escape_latex_text, extract_length_value, format_latex_color_command,
     get_raw_text_with_lang, get_simple_text, get_string_content, is_display_math,
     is_string_or_content, normalize_typst_color_expr, parse_angle_value, parse_spacing_spec,
-    FuncArgs, SpacingSpec,
+    ref_supplement_markup, FuncArgs, SpacingSpec,
 };
 use crate::data::typst_compat::{
     get_heading_command, is_math_func_in_markup, MarkupHandler, TYPST_MARKUP_HANDLERS,
@@ -192,10 +193,10 @@ pub fn convert_content_nodes_to_latex(nodes: &[ContentNode], ctx: &mut ConvertCo
             }
             ContentNode::Reference { target, ref_type } => {
                 flush_typst_chunk(&mut buffer, ctx);
-                ctx.push(&reference_to_latex(&Reference {
+                ctx.push(&mark_reference(&reference_to_latex(&Reference {
                     target: target.clone(),
                     ref_type: *ref_type,
-                }));
+                })));
                 ctx.last_token = TokenType::Command;
             }
             ContentNode::LabelDef(label) => {
@@ -245,7 +246,9 @@ fn convert_math_source_to_latex(
     let mut math_ctx = ConvertContext::new();
     math_ctx.options = options.clone();
     math_ctx.in_math = true;
-    math_ctx.linebreak_as_row = linebreak_as_row;
+    if linebreak_as_row {
+        math_ctx.push_env(EnvironmentContext::Align);
+    }
     convert_first_math_child(&root, &mut math_ctx);
     math_ctx.finalize().trim().to_string()
 }
@@ -270,7 +273,9 @@ fn convert_equation_math_to_latex(
     let mut math_ctx = ConvertContext::new();
     math_ctx.options = options.clone();
     math_ctx.in_math = true;
-    math_ctx.linebreak_as_row = linebreak_as_row;
+    if linebreak_as_row {
+        math_ctx.push_env(EnvironmentContext::Align);
+    }
     for child in node.children() {
         if child.kind() == SyntaxKind::Math {
             convert_math_node(child, &mut math_ctx);
@@ -349,6 +354,18 @@ fn has_unescaped_alignment(content: &str) -> bool {
 }
 
 /// Convert a markup node to LaTeX
+/// Convert an explicit `@target[supplement]` body to LaTeX, if it was written.
+///
+/// A supplement is CONTENT, not a string: `@sec-one[*Custom*]` renders bold, so
+/// it goes through the normal markup conversion rather than being flattened to
+/// its source text. See [`ref_supplement_markup`] for why `Some("")` matters.
+pub fn convert_ref_supplement(node: &SyntaxNode) -> Option<String> {
+    let markup = ref_supplement_markup(node)?;
+    let mut inner = ConvertContext::new();
+    convert_markup_node(&markup, &mut inner);
+    Some(inner.finalize().trim().to_string())
+}
+
 pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
     match node.kind() {
         SyntaxKind::Markup => {
@@ -701,12 +718,21 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
             }
         }
 
-        // References: @label -> \ref{label}
+        // Bare `@target` is ambiguous until the whole document is known: label or bib entry.
         SyntaxKind::Ref => {
-            let text = get_simple_text(node);
-            let label = text.trim_start_matches('@').trim();
+            // The target is the `RefMarker` alone: reading the node's whole text
+            // swallowed a `[supplement]` body into the label.
+            let target = node
+                .children()
+                .find(|c| c.kind() == SyntaxKind::RefMarker)
+                .map(|marker| marker.text().to_string())
+                .unwrap_or_else(|| get_simple_text(node));
+            let label = target.trim_start_matches('@').trim();
+
+            let supplement = convert_ref_supplement(node);
+
             if !label.is_empty() {
-                ctx.push(&reference_to_latex(&Reference::new(label.to_string())));
+                ctx.push(&mark_at_reference(label, supplement.as_deref()));
                 ctx.last_token = TokenType::Command;
             }
         }
@@ -766,6 +792,33 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
             // None value - don't output anything
         }
 
+        // `#include "sections/child.typ"` -> `\subimport{sections/}{child}`.
+        //
+        // This preserves the multi-file structure of a project instead of
+        // inlining the included content, which matters for batch/directory
+        // conversion where each `.typ` becomes a sibling `.tex`.
+        //
+        // `\subimport{dir/}{file}` (from the `import` package) is used rather
+        // than `\input` because Typst resolves `#include` paths relative to the
+        // *current* file, whereas LaTeX `\input` resolves relative to the main
+        // document. `\subimport` maintains a per-file directory stack, so a
+        // nested include inside `child` that references its own siblings still
+        // resolves correctly. The `.typ` extension is dropped (LaTeX appends
+        // `.tex`); a same-directory include uses `./` as its base.
+        SyntaxKind::ModuleInclude => {
+            if let Some(path) = module_include_path(node) {
+                let stem = path.strip_suffix(".typ").unwrap_or(&path);
+                if !stem.is_empty() {
+                    let (dir, file) = match stem.rfind('/') {
+                        Some(i) => (&stem[..=i], &stem[i + 1..]),
+                        None => ("./", stem),
+                    };
+                    ctx.push(&format!("\\subimport{{{}}}{{{}}}", dir, file));
+                    ctx.last_token = TokenType::Command;
+                }
+            }
+        }
+
         _ => {
             // Recursively process children
             let child_count = node.children().count();
@@ -775,6 +828,28 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
                 }
             }
         }
+    }
+}
+
+/// Literal path of a `#include "..."` (`ModuleInclude`). `None` for a
+/// non-literal target (e.g. a variable), which is skipped rather than emitted
+/// as garbage text.
+fn module_include_path(node: &SyntaxNode) -> Option<String> {
+    let raw = node
+        .children()
+        .find(|c| c.kind() == SyntaxKind::Str)?
+        .text()
+        .to_string();
+    let path = raw
+        .trim_start_matches('"')
+        .trim_end_matches('"')
+        .trim_start_matches('\'')
+        .trim_end_matches('\'')
+        .trim();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
     }
 }
 
@@ -838,7 +913,13 @@ fn handle_special_markup_func(func_name: &str, children: &[&SyntaxNode], ctx: &m
         }
 
         "table" => {
-            convert_table_to_latex(children, ctx);
+            convert_table_to_latex(children, ctx, true);
+        }
+
+        // `#grid` is the same cell model as `#table`, only unstroked. Treating
+        // it as flowing content concatenated the cells into one blob.
+        "grid" => {
+            convert_table_to_latex(children, ctx, false);
         }
 
         "figure" => {
@@ -975,9 +1056,9 @@ fn handle_special_markup_func(func_name: &str, children: &[&SyntaxNode], ctx: &m
             convert_rect_func(children, ctx);
         }
 
-        // Columns
-        "columns" | "grid" => {
-            convert_grid_to_latex(children, ctx);
+        // `#columns(n)[..]` is a multi-column page layout, not a cell grid.
+        "columns" => {
+            convert_columns_to_latex(children, ctx);
         }
 
         // CeTZ graphics (canvas)
@@ -1329,7 +1410,7 @@ fn get_func_call_name(node: &SyntaxNode) -> String {
 }
 
 /// Convert a Typst table to LaTeX using the state-aware table generator
-fn convert_table_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
+fn convert_table_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, ruled: bool) {
     let args = FuncArgs::from_func_call(children);
     let mut columns: usize = 0;
     let mut col_aligns: Vec<LatexCellAlign> = Vec::new();
@@ -1362,16 +1443,16 @@ fn convert_table_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
                         }
                     }
                 }
+                // Each occupies one positional cell even when empty (`[]`);
+                // dropping one shifts every later cell left.
                 SyntaxKind::ContentBlock | SyntaxKind::Markup | SyntaxKind::Equation => {
                     let mut cell_ctx = ConvertContext::new();
                     cell_ctx.push_env(EnvironmentContext::Table);
                     convert_markup_node(child, &mut cell_ctx);
                     let content = cell_ctx.finalize();
-                    if !content.is_empty() {
-                        let mut cell = LatexCell::new(content);
-                        cell.is_header = in_header;
-                        cells.push(cell);
-                    }
+                    let mut cell = LatexCell::new(content);
+                    cell.is_header = in_header;
+                    cells.push(cell);
                 }
                 SyntaxKind::FuncCall => {
                     let func_children: Vec<_> = child.children().collect();
@@ -1391,11 +1472,9 @@ fn convert_table_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
                                             cell_ctx.push_env(EnvironmentContext::Table);
                                             convert_markup_node(header_child, &mut cell_ctx);
                                             let content = cell_ctx.finalize();
-                                            if !content.is_empty() {
-                                                let mut cell = LatexCell::new(content);
-                                                cell.is_header = true;
-                                                cells.push(cell);
-                                            }
+                                            let mut cell = LatexCell::new(content);
+                                            cell.is_header = true;
+                                            cells.push(cell);
                                         }
                                         SyntaxKind::FuncCall => {
                                             // table.cell(...) inside header
@@ -1532,6 +1611,9 @@ fn convert_table_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
 
     // Create the table generator
     let mut generator = LatexTableGenerator::new(columns, col_aligns);
+    if !ruled {
+        generator = generator.without_rules();
+    }
 
     // Process cells row by row
     let mut current_row: Vec<LatexCell> = Vec::new();
@@ -1895,7 +1977,9 @@ fn convert_ref_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
     let args = FuncArgs::from_func_call(children);
     if let Some(node) = args.first_node() {
         if let Some(target) = extract_label_like_from_node(node) {
-            ctx.push(&reference_to_latex(&Reference::new(target)));
+            ctx.push(&mark_reference(&reference_to_latex(&Reference::new(
+                target,
+            ))));
         }
     }
 }
@@ -1950,7 +2034,7 @@ fn convert_theorem_to_latex(env_name: &str, children: &[&SyntaxNode], ctx: &mut 
 // Grid/Columns Conversion
 // ============================================================================
 
-fn convert_grid_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
+fn convert_columns_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
     let args = FuncArgs::from_func_call(children);
     let num_cols = args
         .named_text("columns")
