@@ -216,6 +216,14 @@ OPTIONAL_ARG_COMMANDS = [
 
 # Commands whose glob shape is neither a fixed arity nor `{,b}t`:
 # `\cmd[opt]{a}{b}` and `\cmd[opt]{a}{b}{c}`.
+# Glob patterns that `maps.rs` has a local closure for. Anything outside this
+# table is still emitted, just spelled out in full.
+GLOB_CLOSURES = {
+    "{,b}t": "cmd1_opt",
+    "{,b}tt": "cmd2_opt",
+    "{,b}ttt": "cmd3_opt",
+}
+
 GLOB_ARG_COMMANDS = {
     "derivative": "{,b}tt",
     "dv": "{,b}tt",
@@ -988,12 +996,12 @@ def generate_rust_code():
     """
     lines = [
         "// Static symbol mappings derived from tex2typst and project-specific additions.",
-        "// tools/gen_maps.py refuses lossy overwrites; update both sources when it becomes",
-        "// complete enough to regenerate this file.",
+        "// Regenerate with `python tools/gen_maps.py`, which refuses an overwrite that",
+        "// would drop or alter any mapping. Keep edits here and in the generator in step.",
         "",
-        "use mitex_spec::{CommandSpec, CommandSpecItem, CmdShape, ArgShape, ArgPattern, GlobStr};",
         "use fxhash::FxHashMap;",
         "use lazy_static::lazy_static;",
+        "use mitex_spec::{ArgPattern, ArgShape, CmdShape, CommandSpec, CommandSpecItem, GlobStr};",
         "use phf::phf_map;",
         "",
         "// =============================================================================",
@@ -1006,6 +1014,46 @@ def generate_rust_code():
         "    pub static ref TEX_COMMAND_SPEC: CommandSpec = {",
         "        let mut m = FxHashMap::default();",
     ]
+    lines.append('        // Helper closures for conciseness: these shapes repeat')
+    lines.append('        // hundreds of times, and the guards in tests/integration_tests.rs')
+    lines.append('        // expand their names when comparing this file with the generator.')
+    lines.append('        let cmd1 = || CommandSpecItem::Cmd(CmdShape {')
+    lines.append('            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },')
+    lines.append('            alias: None,')
+    lines.append('        });')
+    lines.append('        let cmd2 = || CommandSpecItem::Cmd(CmdShape {')
+    lines.append('            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },')
+    lines.append('            alias: None,')
+    lines.append('        });')
+    lines.append('        let cmd3 = || CommandSpecItem::Cmd(CmdShape {')
+    lines.append('            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 3 } },')
+    lines.append('            alias: None,')
+    lines.append('        });')
+    lines.append('        let cmd1_opt = || CommandSpecItem::Cmd(CmdShape {')
+    lines.append('            args: ArgShape::Right {')
+    lines.append('                pattern: ArgPattern::Glob {')
+    lines.append('                    pattern: GlobStr::from("{,b}t"),')
+    lines.append('                },')
+    lines.append('            },')
+    lines.append('            alias: None,')
+    lines.append('        });')
+    lines.append('        let cmd2_opt = || CommandSpecItem::Cmd(CmdShape {')
+    lines.append('            args: ArgShape::Right {')
+    lines.append('                pattern: ArgPattern::Glob {')
+    lines.append('                    pattern: GlobStr::from("{,b}tt"),')
+    lines.append('                },')
+    lines.append('            },')
+    lines.append('            alias: None,')
+    lines.append('        });')
+    lines.append('        let cmd3_opt = || CommandSpecItem::Cmd(CmdShape {')
+    lines.append('            args: ArgShape::Right {')
+    lines.append('                pattern: ArgPattern::Glob {')
+    lines.append('                    pattern: GlobStr::from("{,b}ttt"),')
+    lines.append('                },')
+    lines.append('            },')
+    lines.append('            alias: None,')
+    lines.append('        });')
+    lines.append('')
     
     # Generate CommandSpec entries for symbols (no args)
     for cmd, alias in sorted(SYMBOL_MAP.items()):
@@ -1039,18 +1087,7 @@ def generate_rust_code():
     # arity would leave the `[..]` unconsumed: the parser then binds no argument
     # at all and the whole construct degrades to body text.
     for cmd in OPTIONAL_ARG_COMMANDS:
-        lines.append(f'        m.insert("{cmd}".to_string(), CommandSpecItem::Cmd(CmdShape {{')
-        lines.append('            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },')
-        lines.append('            alias: None,')
-        lines.append('        }));')
-
-    # Commands with an optional argument followed by more than one required one
-    for cmd, pattern in sorted(GLOB_ARG_COMMANDS.items()):
-        cmd_esc = escape_rust_string(cmd)
-        lines.append(f'        m.insert("{cmd_esc}".to_string(), CommandSpecItem::Cmd(CmdShape {{')
-        lines.append(f'            args: ArgShape::Right {{ pattern: ArgPattern::Glob {{ pattern: GlobStr::from("{pattern}") }} }},')
-        lines.append('            alias: None,')
-        lines.append('        }));')
+        lines.append(f'        m.insert("{cmd}".to_string(), cmd1_opt());')
 
     # Zero-argument commands the parser must know but that have no alias
     for cmd in sorted(BARE_COMMANDS):
@@ -1078,14 +1115,32 @@ def generate_rust_code():
     
     lines.append('')
     lines.append('        // Commands with required arguments')
-    
+
     # Generate CommandSpec entries for commands with args
     for cmd, num_args in sorted(COMMANDS_WITH_ARGS.items()):
         if cmd == "typstcite":  # Already handled above with alias
             continue
         cmd_esc = escape_rust_string(cmd)
+        if num_args in (1, 2, 3):
+            lines.append(f'        m.insert("{cmd_esc}".to_string(), cmd{num_args}());')
+            continue
         lines.append(f'        m.insert("{cmd_esc}".to_string(), CommandSpecItem::Cmd(CmdShape {{')
         lines.append(f'            args: ArgShape::Right {{ pattern: ArgPattern::FixedLenTerm {{ len: {num_args} }} }},')
+        lines.append('            alias: None,')
+        lines.append('        }));')
+
+    # Globs matching a closure use it, so every closure above is used. Any OTHER
+    # pattern is written out in full rather than skipped: silently dropping a
+    # command the table declares would leave the generator exiting 0 while the
+    # map lost an entry.
+    for cmd, pattern in sorted(GLOB_ARG_COMMANDS.items()):
+        cmd_esc = escape_rust_string(cmd)
+        shorthand = GLOB_CLOSURES.get(pattern)
+        if shorthand:
+            lines.append(f'        m.insert("{cmd_esc}".to_string(), {shorthand}());')
+            continue
+        lines.append(f'        m.insert("{cmd_esc}".to_string(), CommandSpecItem::Cmd(CmdShape {{')
+        lines.append(f'            args: ArgShape::Right {{ pattern: ArgPattern::Glob {{ pattern: GlobStr::from("{pattern}") }} }},')
         lines.append('            alias: None,')
         lines.append('        }));')
     
@@ -1135,7 +1190,9 @@ def generate_rust_code():
         "};",
     ])
 
-    return "\n".join(lines)
+    # Trailing newline: rustfmt wants one, and the generated file has to pass
+    # the same gate as the checked-in one.
+    return "\n".join(lines) + "\n"
 
 def parse_map_ts(filepath):
     """Parse map.ts file if provided (optional, for updating mappings)"""
@@ -1163,38 +1220,121 @@ def extract_public_map_names(rust_code):
     return set(re.findall(r"pub static(?: ref)? ([A-Z][A-Z0-9_]*):", rust_code))
 
 
-def extract_mapping_keys(rust_code):
-    """Return command and PHF keys from the generated Rust source.
+RUST_STR = r'"((?:[^"\\]|\\.)*)"'
 
-    This intentionally uses the output's simple generated forms. It is a
-    safety check, not a Rust parser: a false positive merely stops a lossy
-    overwrite, which is safer than silently deleting a conversion mapping.
-    """
-    command_keys = set(re.findall(r'm\.insert\("([^"]+)"\.to_string\(\)', rust_code))
-    phf_keys = set(re.findall(r'^\s*"([^"]+)"\s*=>', rust_code, re.MULTILINE))
-    return command_keys | phf_keys
+# `maps.rs` declares most command shapes through local closures. Comparing the
+# generated verbose form against them needs the same expansion the closures do.
+COMMAND_SHORTHANDS = {
+    "cmd1()": ("FixedLenTerm:1", None),
+    "cmd2()": ("FixedLenTerm:2", None),
+    "cmd3()": ("FixedLenTerm:3", None),
+    "cmd1_opt()": ("Glob:{,b}t", None),
+    "cmd2_opt()": ("Glob:{,b}tt", None),
+    "cmd3_opt()": ("Glob:{,b}ttt", None),
+}
+
+
+def extract_command_entries(rust_code):
+    """Return {name: (pattern, alias)} for every command spec entry."""
+    entries = {}
+    for chunk in rust_code.split('m.insert("')[1:]:
+        if '".to_string(), ' not in chunk:
+            continue
+        name, rest = chunk.split('".to_string(), ', 1)
+        head = rest[:300]
+
+        shorthand = next((v for k, v in COMMAND_SHORTHANDS.items() if head.startswith(k)), None)
+        if shorthand:
+            entries[name] = shorthand
+            continue
+        m = re.match(r"cmd0\(Some\(" + RUST_STR + r"(?:\.to_string\(\))?\)\)", head)
+        if m:
+            entries[name] = ("None", m.group(1))
+            continue
+        if head.startswith("cmd0(None)"):
+            entries[name] = ("None", None)
+            continue
+
+        # `maps.rs` writes `Some("x".to_string())`, the generated form
+        # `Some("x".to_string())` too, and the `cmd0` closure `Some("x")`.
+        alias = re.search(r"alias: Some\(" + RUST_STR + r"(?:\.to_string\(\))?\)", head)
+        alias = alias.group(1) if alias else None
+        glob = re.search(r'GlobStr::from\("([^"]*)"\)', head)
+        if "CommandSpecItem::Env(" in head:
+            entries[name] = ("Env:" + (glob.group(1) if glob else "None"), None)
+        elif "ArgPattern::None" in head:
+            entries[name] = ("None", alias)
+        elif "FixedLenTerm" in head:
+            entries[name] = ("FixedLenTerm:" + re.search(r"len: (\d+)", head).group(1), alias)
+        elif glob:
+            entries[name] = ("Glob:" + glob.group(1), alias)
+        else:
+            entries[name] = ("?" + head[:40], alias)
+    return entries
+
+
+def extract_phf_entries(rust_code):
+    """Return {(table, key): value} for every `phf_map!` table."""
+    entries = {}
+    pattern = r"pub static ([A-Z][A-Z0-9_]*): phf::Map<[^>]*> = phf_map! \{(.*?)\n\};"
+    for name, body in re.findall(pattern, rust_code, re.S):
+        for key, value in re.findall(RUST_STR + r"\s*=>\s*" + RUST_STR + ",", body):
+            entries[(name, key)] = value
+    return entries
+
+
+def describe_drift(kind, existing, generated):
+    """Lines describing entries the regeneration would lose or change."""
+    lost = sorted(set(existing) - set(generated))
+    changed = sorted(k for k in set(existing) & set(generated) if existing[k] != generated[k])
+    details = []
+    if lost:
+        details.append(f"{len(lost)} {kind} (for example: {', '.join(map(str, lost[:8]))})")
+    if changed:
+        sample = ", ".join(f"{k}: {existing[k]!r} -> {generated[k]!r}" for k in changed[:5])
+        details.append(f"{len(changed)} changed {kind} ({sample})")
+    return details
 
 
 def ensure_lossless_regeneration(output_path, rust_code):
-    """Reject a generated file that would discard checked-in map coverage."""
+    """Reject a generated file that would discard or alter checked-in coverage.
+
+    Values are compared, not only names: an entry whose alias or mapping has
+    drifted is as much a regression as a missing one, and a name-only check
+    cannot see it. `maps.rs`'s local `cmdN()` shorthands are expanded first, so
+    the two spellings of the same spec compare equal.
+    """
     if not output_path.exists():
         return
 
     existing = output_path.read_text(encoding="utf-8")
-    missing_maps = extract_public_map_names(existing) - extract_public_map_names(rust_code)
-    missing_keys = extract_mapping_keys(existing) - extract_mapping_keys(rust_code)
-    if not missing_maps and not missing_keys:
-        return
-
     details = []
+
+    # Every insert must name its command literally, or the comparison below
+    # reads past it in silence. A runtime `for` loop over a name list hid 11
+    # entries from this guard for exactly that reason.
+    opaque = existing.count("m.insert(") - existing.count('m.insert("')
+    if opaque:
+        details.append(
+            f"{opaque} insert(s) that do not name their command literally, "
+            "which this guard cannot compare"
+        )
+
+    missing_maps = extract_public_map_names(existing) - extract_public_map_names(rust_code)
     if missing_maps:
         details.append("public maps: " + ", ".join(sorted(missing_maps)))
-    if missing_keys:
-        sample = ", ".join(sorted(missing_keys)[:10])
-        details.append(f"{len(missing_keys)} mapping keys (for example: {sample})")
+
+    details += describe_drift(
+        "commands", extract_command_entries(existing), extract_command_entries(rust_code))
+    details += describe_drift(
+        "mappings", extract_phf_entries(existing), extract_phf_entries(rust_code))
+
+    if not details:
+        return
+
     raise RuntimeError(
         "refusing a lossy maps.rs overwrite; synchronize tools/gen_maps.py "
-        "with src/data/maps.rs first (missing " + "; ".join(details) + ")"
+        "with src/data/maps.rs first (" + "; ".join(details) + ")"
     )
 
 def main():

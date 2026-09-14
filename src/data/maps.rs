@@ -1,6 +1,6 @@
 // Static symbol mappings derived from tex2typst and project-specific additions.
-// tools/gen_maps.py refuses lossy overwrites; update both sources when it becomes
-// complete enough to regenerate this file.
+// Regenerate with `python tools/gen_maps.py`, which refuses an overwrite that
+// would drop or alter any mapping. Keep edits here and in the generator in step.
 
 use fxhash::FxHashMap;
 use lazy_static::lazy_static;
@@ -16,6 +16,46 @@ lazy_static! {
     /// LaTeX command specification for Mitex
     pub static ref TEX_COMMAND_SPEC: CommandSpec = {
         let mut m = FxHashMap::default();
+        // Helper closures for conciseness: these shapes repeat
+        // hundreds of times, and the guards in tests/integration_tests.rs
+        // expand their names when comparing this file with the generator.
+        let cmd1 = || CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
+            alias: None,
+        });
+        let cmd2 = || CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
+            alias: None,
+        });
+        let cmd3 = || CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 3 } },
+            alias: None,
+        });
+        let cmd1_opt = || CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right {
+                pattern: ArgPattern::Glob {
+                    pattern: GlobStr::from("{,b}t"),
+                },
+            },
+            alias: None,
+        });
+        let cmd2_opt = || CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right {
+                pattern: ArgPattern::Glob {
+                    pattern: GlobStr::from("{,b}tt"),
+                },
+            },
+            alias: None,
+        });
+        let cmd3_opt = || CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right {
+                pattern: ArgPattern::Glob {
+                    pattern: GlobStr::from("{,b}ttt"),
+                },
+            },
+            alias: None,
+        });
+
         m.insert(" ".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("med".to_string()),
@@ -40,52 +80,10 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("Delta".to_string()),
         }));
-        // Slanted capital Greek (\varGamma ... \varOmega from newtxmath/txfonts).
-        // Typst has no separate slanted capitals, so alias to the plain capital
-        // instead of leaking an invalid `varDelta` identifier.
-        for (name, upper) in [
-            ("varGamma", "Gamma"),
-            ("varDelta", "Delta"),
-            ("varTheta", "Theta"),
-            ("varLambda", "Lambda"),
-            ("varXi", "Xi"),
-            ("varPi", "Pi"),
-            ("varSigma", "Sigma"),
-            ("varUpsilon", "Upsilon"),
-            ("varPhi", "Phi"),
-            ("varPsi", "Psi"),
-            ("varOmega", "Omega"),
-        ] {
-            m.insert(
-                name.to_string(),
-                CommandSpecItem::Cmd(CmdShape {
-                    args: ArgShape::Right {
-                        pattern: ArgPattern::None,
-                    },
-                    alias: Some(upper.to_string()),
-                }),
-            );
-        }
         m.insert("Downarrow".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("arrow.b.double".to_string()),
         }));
-        m.insert("bibitem".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("multicolumn".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 3 } },
-            alias: None,
-        }));
-        m.insert("multirow".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 3 } },
-            alias: None,
-        }));
-        // Note: Do NOT define zero-argument commands like \today, \LaTeX, \TeX here!
-        // MiTeX's parser extracts commands from argument blocks, causing them to be
-        // lost. Instead, they are left as raw text and converted in convert_caption_text()
-        // and the metadata extraction functions.
         m.insert("Gamma".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("Gamma".to_string()),
@@ -290,20 +288,13 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("bullet".to_string()),
         }));
-        m.insert("cap".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("inter".to_string()),
-        }));
         m.insert("cal".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("cal".to_string()),
         }));
-        // Without a pattern here mitex leaves `{..}` as a following sibling
-        // instead of binding it, so the converter never sees the content it
-        // wraps and cannot map `\textcircled{\cdot}` to the circled operator.
-        m.insert("textcircled".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
+        m.insert("cap".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("inter".to_string()),
         }));
         m.insert("cdot".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -517,25 +508,17 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("arrow.r.hook".to_string()),
         }));
-        m.insert("hspace".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("hspace*".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
         m.insert("iff".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("arrow.l.r.double.long".to_string()),
         }));
-        m.insert("iiint".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("integral.triple".to_string()),
-        }));
         m.insert("iiiint".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("integral.quad".to_string()),
+        }));
+        m.insert("iiint".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("integral.triple".to_string()),
         }));
         m.insert("iint".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -653,22 +636,6 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("limsup".to_string()),
         }));
-        m.insert("injlim".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: None,  // Handled specially in converter
-        }));
-        m.insert("projlim".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: None,  // Handled specially in converter
-        }));
-        m.insert("varinjlim".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: None,  // Handled specially in converter
-        }));
-        m.insert("varprojlim".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: None,  // Handled specially in converter
-        }));
         m.insert("ll".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("lt.double".to_string()),
@@ -785,17 +752,17 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("dot.o".to_string()),
         }));
-        m.insert("oint".to_string(), CommandSpecItem::Cmd(CmdShape {
+        m.insert("oiiint".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("integral.cont".to_string()),
+            alias: Some("integral.vol".to_string()),
         }));
         m.insert("oiint".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("integral.surf".to_string()),
         }));
-        m.insert("oiiint".to_string(), CommandSpecItem::Cmd(CmdShape {
+        m.insert("oint".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("integral.vol".to_string()),
+            alias: Some("integral.cont".to_string()),
         }));
         m.insert("omega".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -1089,6 +1056,50 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("upsilon".to_string()),
         }));
+        m.insert("varDelta".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("Delta".to_string()),
+        }));
+        m.insert("varGamma".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("Gamma".to_string()),
+        }));
+        m.insert("varLambda".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("Lambda".to_string()),
+        }));
+        m.insert("varOmega".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("Omega".to_string()),
+        }));
+        m.insert("varPhi".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("Phi".to_string()),
+        }));
+        m.insert("varPi".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("Pi".to_string()),
+        }));
+        m.insert("varPsi".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("Psi".to_string()),
+        }));
+        m.insert("varSigma".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("Sigma".to_string()),
+        }));
+        m.insert("varTheta".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("Theta".to_string()),
+        }));
+        m.insert("varUpsilon".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("Upsilon".to_string()),
+        }));
+        m.insert("varXi".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("Xi".to_string()),
+        }));
         m.insert("varepsilon".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("epsilon".to_string()),
@@ -1096,14 +1107,6 @@ lazy_static! {
         m.insert("varnothing".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("nothing".to_string()),
-        }));
-        m.insert("vspace".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("vspace*".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
         }));
         m.insert("varphi".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -1169,35 +1172,152 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
             alias: Some("__typstcite__".to_string()),
         }));
-        // `\item[term]` takes an optional bracket label. The `{,b}` glob makes
-        // mitex capture the `[...]` as an argument clause so the converter can
-        // read the term; otherwise it leaks into the body (issue #32).
         m.insert("item".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}") } },
             alias: None,
         }));
+        m.insert("part".to_string(), cmd1_opt());
+        m.insert("chapter".to_string(), cmd1_opt());
+        m.insert("section".to_string(), cmd1_opt());
+        m.insert("subsection".to_string(), cmd1_opt());
+        m.insert("subsubsection".to_string(), cmd1_opt());
+        m.insert("paragraph".to_string(), cmd1_opt());
+        m.insert("subparagraph".to_string(), cmd1_opt());
+        m.insert("caption".to_string(), cmd1_opt());
+        m.insert("sqrt".to_string(), cmd1_opt());
+        m.insert("dd".to_string(), cmd1_opt());
+        m.insert("differential".to_string(), cmd1_opt());
+        m.insert("hyperref".to_string(), cmd1_opt());
+        m.insert("cp".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("cross".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("crossproduct".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("divisionsymbol".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("dotproduct".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("injlim".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("projlim".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qall".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qand".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qas".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qassume".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qc".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qcc".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qcomma".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qelse".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qeven".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qfor".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qgiven".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qif".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qin".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qinteger".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qlet".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qodd".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qor".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qotherwise".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qsince".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qthen".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qunless".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("qusing".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("varinjlim".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("varprojlim".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
+        m.insert("vdot".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: None,
+        }));
         m.insert("aligned".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
             args: ArgPattern::None,
-            ctx_feature: mitex_spec::ContextFeature::None,
-            alias: None,
-        }));
-        m.insert("minipage".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
-            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}{,b}{,b}t") },
-            ctx_feature: mitex_spec::ContextFeature::None,
-            alias: None,
-        }));
-        m.insert("multicols".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
-            args: ArgPattern::Glob { pattern: GlobStr::from("t{,b}") },
-            ctx_feature: mitex_spec::ContextFeature::None,
-            alias: None,
-        }));
-        m.insert("multicols*".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
-            args: ArgPattern::Glob { pattern: GlobStr::from("t{,b}") },
-            ctx_feature: mitex_spec::ContextFeature::None,
-            alias: None,
-        }));
-        m.insert("lstlisting".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
-            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}") },
             ctx_feature: mitex_spec::ContextFeature::None,
             alias: None,
         }));
@@ -1266,6 +1386,26 @@ lazy_static! {
             ctx_feature: mitex_spec::ContextFeature::None,
             alias: None,
         }));
+        m.insert("lstlisting".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("minipage".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("{,b}{,b}{,b}t") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("multicols".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("t{,b}") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
+        m.insert("multicols*".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
+            args: ArgPattern::Glob { pattern: GlobStr::from("t{,b}") },
+            ctx_feature: mitex_spec::ContextFeature::None,
+            alias: None,
+        }));
         m.insert("tabular".to_string(), CommandSpecItem::Env(mitex_spec::EnvShape {
             args: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") },
             ctx_feature: mitex_spec::ContextFeature::None,
@@ -1298,749 +1438,244 @@ lazy_static! {
         }));
 
         // Commands with required arguments
-        m.insert("Acf".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("Acl".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("Acs".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("Cref".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("DeclareMathOperator".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
-            alias: None,
-        }));
-        m.insert("Gls".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("Set".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("ac".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("acrfull".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("acrlong".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("acrshort".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("acute".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("author".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("autocite".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("autoref".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("bar".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("bcancel".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("binom".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
-            alias: None,
-        }));
-        m.insert("bm".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("boldsymbol".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("boxed".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("breve".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("cancel".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("caption".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },
-            alias: None,
-        }));
-        m.insert("cfrac".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
-            alias: None,
-        }));
-        m.insert("chapter".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },
-            alias: None,
-        }));
-        m.insert("check".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("cite".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("citep".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("citet".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("color".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("colorbox".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
-            alias: None,
-        }));
-        m.insert("fcolorbox".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 3 } },
-            alias: None,
-        }));
-        m.insert("hl".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("highlight".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("cref".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("date".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("ddot".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("dfrac".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
-            alias: None,
-        }));
-        m.insert("displaylines".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("dot".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("emph".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("eqref".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("fbox".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("footcite".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("footnote".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("frac".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
-            alias: None,
-        }));
-        m.insert("gls".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("grave".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("hat".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("href".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
-            alias: None,
-        }));
-        m.insert("hyperref".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },
-            alias: None,
-        }));
-        m.insert("label".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("mathbb".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("mathbf".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("mathbin".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("mathcal".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("mathclose".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("mathfrak".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("mathinner".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("mathit".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("mathop".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("mathopen".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("mathord".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("mathpunct".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("mathrel".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("mathrm".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("mathsf".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("mathtt".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("newacronym".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 3 } },
-            alias: None,
-        }));
-        m.insert("newcommand".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
-            alias: None,
-        }));
-        m.insert("newglossaryentry".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
-            alias: None,
-        }));
-        m.insert("not".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("overbrace".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("overline".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("overleftarrow".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("overleftrightarrow".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("overrightarrow".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("overset".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
-            alias: None,
-        }));
-        m.insert("pageref".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("paragraph".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },
-            alias: None,
-        }));
-        m.insert("parencite".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("part".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },
-            alias: None,
-        }));
-        m.insert("phantom".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("pmod".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("pod".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("providecommand".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
-            alias: None,
-        }));
-        m.insert("ref".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("renewcommand".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
-            alias: None,
-        }));
-        m.insert("section".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },
-            alias: None,
-        }));
-        m.insert("set".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("sqrt".to_string(), CommandSpecItem::Cmd(CmdShape {
-            // {,b}t = optional bracket argument, then one term argument
-            // This allows \sqrt{x} and \sqrt[n]{x}
-            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },
-            alias: None,
-        }));
-        m.insert("stackrel".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
-            alias: None,
-        }));
-        m.insert("subparagraph".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },
-            alias: None,
-        }));
-        m.insert("subsection".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },
-            alias: None,
-        }));
-        m.insert("subsubsection".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },
-            alias: None,
-        }));
-        m.insert("text".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("textbf".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("textcite".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("textcolor".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
-            alias: None,
-        }));
-        m.insert("textit".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("textrm".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("textsc".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("texttt".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("tfrac".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
-            alias: None,
-        }));
-        m.insert("tilde".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("title".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("underbrace".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("underline".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("underset".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
-            alias: None,
-        }));
-        m.insert("url".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("vec".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("widehat".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("widetilde".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("xleftarrow".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("xleftrightarrow".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("xmapsto".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("xrightarrow".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        // Extended arrow commands from mitex/tex2typst
-        m.insert("xLeftarrow".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("xRightarrow".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("xLeftrightarrow".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("xhookleftarrow".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("xhookrightarrow".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("xtwoheadleftarrow".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("xtwoheadrightarrow".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("xleftharpoonup".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("xrightharpoonup".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("xleftharpoondown".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("xrightharpoondown".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("xleftrightharpoons".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("xrightleftharpoons".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("xtofrom".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-        m.insert("xlongequal".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        }));
-
-        // =====================================================================
-        // physics package commands
-        // =====================================================================
-
-        // Helper closures for conciseness
-        let cmd0 = |alias: Option<&str>| CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: alias.map(|s| s.to_string()),
-        });
-        let cmd1 = || CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 1 } },
-            alias: None,
-        });
-        let cmd2 = || CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 2 } },
-            alias: None,
-        });
-        let cmd3 = || CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::FixedLenTerm { len: 3 } },
-            alias: None,
-        });
-        let cmd1_opt = || CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right {
-                pattern: ArgPattern::Glob {
-                    pattern: GlobStr::from("{,b}t"),
-                },
-            },
-            alias: None,
-        });
-        let cmd2_opt = || CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right {
-                pattern: ArgPattern::Glob {
-                    pattern: GlobStr::from("{,b}tt"),
-                },
-            },
-            alias: None,
-        });
-        let cmd3_opt = || CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right {
-                pattern: ArgPattern::Glob {
-                    pattern: GlobStr::from("{,b}ttt"),
-                },
-            },
-            alias: None,
-        });
-
-        // -- Automatic bracing (1 arg) + star variants --
-        m.insert("pqty".to_string(), cmd1());
-        m.insert("bqty".to_string(), cmd1());
+        m.insert("Acf".to_string(), cmd1());
+        m.insert("Acl".to_string(), cmd1());
+        m.insert("Acs".to_string(), cmd1());
         m.insert("Bqty".to_string(), cmd1());
-        m.insert("vqty".to_string(), cmd1());
+        m.insert("Cref".to_string(), cmd1());
+        m.insert("DeclareMathOperator".to_string(), cmd2());
+        m.insert("Gls".to_string(), cmd1());
+        m.insert("PV".to_string(), cmd1());
+        m.insert("Pmqty".to_string(), cmd1());
+        m.insert("Res".to_string(), cmd1());
+        m.insert("Residue".to_string(), cmd1());
+        m.insert("Set".to_string(), cmd1());
         m.insert("abs".to_string(), cmd1());
         m.insert("abs*".to_string(), cmd1());
         m.insert("absolutevalue".to_string(), cmd1());
-        m.insert("norm".to_string(), cmd1());
-        m.insert("norm*".to_string(), cmd1());
-        m.insert("eval".to_string(), cmd1());
-        m.insert("eval*".to_string(), cmd1());
-        m.insert("evaluated".to_string(), cmd1());
-        m.insert("order".to_string(), cmd1());
-        m.insert("order*".to_string(), cmd1());
-
-        // -- Commutators (2 args) + star variants --
-        m.insert("comm".to_string(), cmd2());
-        m.insert("comm*".to_string(), cmd2());
-        m.insert("commutator".to_string(), cmd2());
+        m.insert("ac".to_string(), cmd1());
         m.insert("acomm".to_string(), cmd2());
         m.insert("acomm*".to_string(), cmd2());
         m.insert("acommutator".to_string(), cmd2());
+        m.insert("acrfull".to_string(), cmd1());
+        m.insert("acrlong".to_string(), cmd1());
+        m.insert("acrshort".to_string(), cmd1());
+        m.insert("acute".to_string(), cmd1());
+        m.insert("admat".to_string(), cmd1());
         m.insert("anticommutator".to_string(), cmd2());
-        m.insert("pb".to_string(), cmd2());
-        m.insert("pb*".to_string(), cmd2());
-        m.insert("poissonbracket".to_string(), cmd2());
-
-        // -- Vector notation (1 arg) --
-        m.insert("vb".to_string(), cmd1());
-        m.insert("vectorbold".to_string(), cmd1());
-        m.insert("va".to_string(), cmd1());
-        m.insert("vectorarrow".to_string(), cmd1());
-        m.insert("vu".to_string(), cmd1());
-        m.insert("vectorunit".to_string(), cmd1());
-
-        // -- Derivatives + star variants --
-        m.insert("dd".to_string(), cmd1_opt());
-        m.insert("differential".to_string(), cmd1_opt());
-        m.insert("dv".to_string(), cmd2_opt());
-        m.insert("dv*".to_string(), cmd2_opt());
-        m.insert("derivative".to_string(), cmd2_opt());
-        m.insert("pdv".to_string(), cmd3_opt());
-        m.insert("pdv*".to_string(), cmd3_opt());
-        m.insert("pderivative".to_string(), cmd3_opt());
-        m.insert("partialderivative".to_string(), cmd3_opt());
-        m.insert("fdv".to_string(), cmd2_opt());
-        m.insert("fdv*".to_string(), cmd2_opt());
-        m.insert("fderivative".to_string(), cmd2_opt());
-        m.insert("functionalderivative".to_string(), cmd2_opt());
-        m.insert("var".to_string(), cmd1());
-        m.insert("variation".to_string(), cmd1());
-
-        // -- Dirac notation + star variants --
-        m.insert("ket".to_string(), cmd1());
-        m.insert("ket*".to_string(), cmd1());
+        m.insert("antidiagonalmatrix".to_string(), cmd1());
+        m.insert("author".to_string(), cmd1());
+        m.insert("autocite".to_string(), cmd1());
+        m.insert("autoref".to_string(), cmd1());
+        m.insert("bar".to_string(), cmd1());
+        m.insert("bcancel".to_string(), cmd1());
+        m.insert("bibitem".to_string(), cmd1());
+        m.insert("binom".to_string(), cmd2());
+        m.insert("bm".to_string(), cmd1());
+        m.insert("bmqty".to_string(), cmd1());
+        m.insert("boldsymbol".to_string(), cmd1());
+        m.insert("boxed".to_string(), cmd1());
+        m.insert("bqty".to_string(), cmd1());
         m.insert("bra".to_string(), cmd1());
         m.insert("bra*".to_string(), cmd1());
         m.insert("braket".to_string(), cmd2());
         m.insert("braket*".to_string(), cmd2());
-        m.insert("innerproduct".to_string(), cmd2());
-        m.insert("ip".to_string(), cmd2());
+        m.insert("breve".to_string(), cmd1());
+        m.insert("cancel".to_string(), cmd1());
+        m.insert("cfrac".to_string(), cmd2());
+        m.insert("check".to_string(), cmd1());
+        m.insert("cite".to_string(), cmd1());
+        m.insert("citep".to_string(), cmd1());
+        m.insert("citet".to_string(), cmd1());
+        m.insert("color".to_string(), cmd1());
+        m.insert("colorbox".to_string(), cmd2());
+        m.insert("comm".to_string(), cmd2());
+        m.insert("comm*".to_string(), cmd2());
+        m.insert("commutator".to_string(), cmd2());
+        m.insert("cref".to_string(), cmd1());
+        m.insert("curl".to_string(), cmd1());
+        m.insert("date".to_string(), cmd1());
+        m.insert("ddot".to_string(), cmd1());
+        m.insert("dfrac".to_string(), cmd2());
+        m.insert("diagonalmatrix".to_string(), cmd1());
+        m.insert("displaylines".to_string(), cmd1());
+        m.insert("divergence".to_string(), cmd1());
+        m.insert("dmat".to_string(), cmd1());
+        m.insert("dot".to_string(), cmd1());
         m.insert("dyad".to_string(), cmd2());
         m.insert("dyad*".to_string(), cmd2());
-        m.insert("outerproduct".to_string(), cmd2());
-        m.insert("ketbra".to_string(), cmd2());
-        m.insert("op".to_string(), cmd2());
-        m.insert("expval".to_string(), cmd2());
-        m.insert("expval*".to_string(), cmd2());
-        m.insert("expectationvalue".to_string(), cmd2());
+        m.insert("emph".to_string(), cmd1());
+        m.insert("eqref".to_string(), cmd1());
         m.insert("ev".to_string(), cmd2());
         m.insert("ev*".to_string(), cmd2());
-        m.insert("vev".to_string(), cmd1());
-        m.insert("mel".to_string(), cmd3());
-        m.insert("mel*".to_string(), cmd3());
-        m.insert("matrixelement".to_string(), cmd3());
-        m.insert("matrixel".to_string(), cmd3());
-
-        // -- Quick quad text --
-        m.insert("qq".to_string(), cmd1());
-        m.insert("qqtext".to_string(), cmd1());
-        // Zero-arg qq variants
-        m.insert("qc".to_string(), cmd0(None));
-        m.insert("qcomma".to_string(), cmd0(None));
-        m.insert("qcc".to_string(), cmd0(None));
-        m.insert("qif".to_string(), cmd0(None));
-        m.insert("qthen".to_string(), cmd0(None));
-        m.insert("qelse".to_string(), cmd0(None));
-        m.insert("qotherwise".to_string(), cmd0(None));
-        m.insert("qunless".to_string(), cmd0(None));
-        m.insert("qgiven".to_string(), cmd0(None));
-        m.insert("qusing".to_string(), cmd0(None));
-        m.insert("qassume".to_string(), cmd0(None));
-        m.insert("qsince".to_string(), cmd0(None));
-        m.insert("qlet".to_string(), cmd0(None));
-        m.insert("qfor".to_string(), cmd0(None));
-        m.insert("qall".to_string(), cmd0(None));
-        m.insert("qeven".to_string(), cmd0(None));
-        m.insert("qodd".to_string(), cmd0(None));
-        m.insert("qinteger".to_string(), cmd0(None));
-        m.insert("qand".to_string(), cmd0(None));
-        m.insert("qor".to_string(), cmd0(None));
-        m.insert("qas".to_string(), cmd0(None));
-        m.insert("qin".to_string(), cmd0(None));
-
-        // -- Matrix macros (1 arg) --
-        m.insert("mqty".to_string(), cmd1());
-        m.insert("matrixquantity".to_string(), cmd1());
-        m.insert("pmqty".to_string(), cmd1());
-        m.insert("bmqty".to_string(), cmd1());
-        m.insert("vmqty".to_string(), cmd1());
-        m.insert("Pmqty".to_string(), cmd1());
-        m.insert("smqty".to_string(), cmd1());
-        m.insert("smallmatrixquantity".to_string(), cmd1());
-        m.insert("spmqty".to_string(), cmd1());
-        m.insert("sPmqty".to_string(), cmd1());
-        m.insert("sbmqty".to_string(), cmd1());
-        m.insert("svmqty".to_string(), cmd1());
-        m.insert("mdet".to_string(), cmd1());
-        m.insert("matrixdeterminant".to_string(), cmd1());
-        m.insert("smdet".to_string(), cmd1());
-        m.insert("smallmatrixdeterminant".to_string(), cmd1());
-
-        // -- Matrix generators --
-        m.insert("imat".to_string(), cmd1());          // \imat{n} → n×n identity
-        m.insert("identitymatrix".to_string(), cmd1());
-        m.insert("xmat".to_string(), cmd3());          // \xmat{x}{n}{m}
-        m.insert("xmatrix".to_string(), cmd3());
-        m.insert("zmat".to_string(), cmd2());          // \zmat{n}{m}
-        m.insert("zeromatrix".to_string(), cmd2());
-        m.insert("pmat".to_string(), cmd1());          // \pmat{n} → Pauli matrix
-        m.insert("paulimatrix".to_string(), cmd1());
-        m.insert("dmat".to_string(), cmd1());          // \dmat{a,b,c} → diagonal
-        m.insert("diagonalmatrix".to_string(), cmd1());
-        m.insert("admat".to_string(), cmd1());         // \admat{a,b,c} → anti-diagonal
-        m.insert("antidiagonalmatrix".to_string(), cmd1());
-
-        // -- Operators with optional bracing (1 arg) --
-        m.insert("Res".to_string(), cmd1());
-        m.insert("Residue".to_string(), cmd1());
-        m.insert("pv".to_string(), cmd1());
-        m.insert("principalvalue".to_string(), cmd1());
-        m.insert("PV".to_string(), cmd1());
-
-        // -- Vector calculus operators (0 or 1 arg, handled in markup.rs) --
+        m.insert("eval".to_string(), cmd1());
+        m.insert("eval*".to_string(), cmd1());
+        m.insert("evaluated".to_string(), cmd1());
+        m.insert("expectationvalue".to_string(), cmd2());
+        m.insert("expval".to_string(), cmd2());
+        m.insert("expval*".to_string(), cmd2());
+        m.insert("fbox".to_string(), cmd1());
+        m.insert("fcolorbox".to_string(), cmd3());
+        m.insert("flatfrac".to_string(), cmd2());
+        m.insert("footcite".to_string(), cmd1());
+        m.insert("footnote".to_string(), cmd1());
+        m.insert("frac".to_string(), cmd2());
+        m.insert("gls".to_string(), cmd1());
         m.insert("grad".to_string(), cmd1());
         m.insert("gradient".to_string(), cmd1());
-        m.insert("divergence".to_string(), cmd1());
-        m.insert("curl".to_string(), cmd1());
+        m.insert("grave".to_string(), cmd1());
+        m.insert("hat".to_string(), cmd1());
+        m.insert("highlight".to_string(), cmd1());
+        m.insert("hl".to_string(), cmd1());
+        m.insert("href".to_string(), cmd2());
+        m.insert("hspace".to_string(), cmd1());
+        m.insert("hspace*".to_string(), cmd1());
+        m.insert("identitymatrix".to_string(), cmd1());
+        m.insert("imat".to_string(), cmd1());
+        m.insert("innerproduct".to_string(), cmd2());
+        m.insert("ip".to_string(), cmd2());
+        m.insert("ket".to_string(), cmd1());
+        m.insert("ket*".to_string(), cmd1());
+        m.insert("ketbra".to_string(), cmd2());
+        m.insert("label".to_string(), cmd1());
         m.insert("laplacian".to_string(), cmd1());
-
-        // -- Zero-arg symbols (handled via extended_symbols.rs) --
-        m.insert("dotproduct".to_string(), cmd0(None));
-        m.insert("vdot".to_string(), cmd0(None));
-        m.insert("crossproduct".to_string(), cmd0(None));
-        m.insert("cross".to_string(), cmd0(None));
-        m.insert("cp".to_string(), cmd0(None));
-        m.insert("divisionsymbol".to_string(), cmd0(None));
-
-        // -- flatfrac (2 args) --
-        m.insert("flatfrac".to_string(), cmd2());
+        m.insert("mathbb".to_string(), cmd1());
+        m.insert("mathbf".to_string(), cmd1());
+        m.insert("mathbin".to_string(), cmd1());
+        m.insert("mathcal".to_string(), cmd1());
+        m.insert("mathclose".to_string(), cmd1());
+        m.insert("mathfrak".to_string(), cmd1());
+        m.insert("mathinner".to_string(), cmd1());
+        m.insert("mathit".to_string(), cmd1());
+        m.insert("mathop".to_string(), cmd1());
+        m.insert("mathopen".to_string(), cmd1());
+        m.insert("mathord".to_string(), cmd1());
+        m.insert("mathpunct".to_string(), cmd1());
+        m.insert("mathrel".to_string(), cmd1());
+        m.insert("mathrm".to_string(), cmd1());
+        m.insert("mathsf".to_string(), cmd1());
+        m.insert("mathtt".to_string(), cmd1());
+        m.insert("matrixdeterminant".to_string(), cmd1());
+        m.insert("matrixel".to_string(), cmd3());
+        m.insert("matrixelement".to_string(), cmd3());
+        m.insert("matrixquantity".to_string(), cmd1());
+        m.insert("mdet".to_string(), cmd1());
+        m.insert("mel".to_string(), cmd3());
+        m.insert("mel*".to_string(), cmd3());
+        m.insert("mqty".to_string(), cmd1());
+        m.insert("multicolumn".to_string(), cmd3());
+        m.insert("multirow".to_string(), cmd3());
+        m.insert("newacronym".to_string(), cmd3());
+        m.insert("newcommand".to_string(), cmd2());
+        m.insert("newglossaryentry".to_string(), cmd2());
+        m.insert("norm".to_string(), cmd1());
+        m.insert("norm*".to_string(), cmd1());
+        m.insert("not".to_string(), cmd1());
+        m.insert("op".to_string(), cmd2());
+        m.insert("order".to_string(), cmd1());
+        m.insert("order*".to_string(), cmd1());
+        m.insert("outerproduct".to_string(), cmd2());
+        m.insert("overbrace".to_string(), cmd1());
+        m.insert("overleftarrow".to_string(), cmd1());
+        m.insert("overleftrightarrow".to_string(), cmd1());
+        m.insert("overline".to_string(), cmd1());
+        m.insert("overrightarrow".to_string(), cmd1());
+        m.insert("overset".to_string(), cmd2());
+        m.insert("pageref".to_string(), cmd1());
+        m.insert("parencite".to_string(), cmd1());
+        m.insert("paulimatrix".to_string(), cmd1());
+        m.insert("pb".to_string(), cmd2());
+        m.insert("pb*".to_string(), cmd2());
+        m.insert("phantom".to_string(), cmd1());
+        m.insert("pmat".to_string(), cmd1());
+        m.insert("pmod".to_string(), cmd1());
+        m.insert("pmqty".to_string(), cmd1());
+        m.insert("pod".to_string(), cmd1());
+        m.insert("poissonbracket".to_string(), cmd2());
+        m.insert("pqty".to_string(), cmd1());
+        m.insert("principalvalue".to_string(), cmd1());
+        m.insert("providecommand".to_string(), cmd2());
+        m.insert("pv".to_string(), cmd1());
+        m.insert("qq".to_string(), cmd1());
+        m.insert("qqtext".to_string(), cmd1());
+        m.insert("ref".to_string(), cmd1());
+        m.insert("renewcommand".to_string(), cmd2());
+        m.insert("sPmqty".to_string(), cmd1());
+        m.insert("sbmqty".to_string(), cmd1());
+        m.insert("set".to_string(), cmd1());
+        m.insert("smallmatrixdeterminant".to_string(), cmd1());
+        m.insert("smallmatrixquantity".to_string(), cmd1());
+        m.insert("smdet".to_string(), cmd1());
+        m.insert("smqty".to_string(), cmd1());
+        m.insert("spmqty".to_string(), cmd1());
+        m.insert("stackrel".to_string(), cmd2());
+        m.insert("svmqty".to_string(), cmd1());
+        m.insert("text".to_string(), cmd1());
+        m.insert("textbf".to_string(), cmd1());
+        m.insert("textcircled".to_string(), cmd1());
+        m.insert("textcite".to_string(), cmd1());
+        m.insert("textcolor".to_string(), cmd2());
+        m.insert("textit".to_string(), cmd1());
+        m.insert("textrm".to_string(), cmd1());
+        m.insert("textsc".to_string(), cmd1());
+        m.insert("texttt".to_string(), cmd1());
+        m.insert("tfrac".to_string(), cmd2());
+        m.insert("tilde".to_string(), cmd1());
+        m.insert("title".to_string(), cmd1());
+        m.insert("underbrace".to_string(), cmd1());
+        m.insert("underline".to_string(), cmd1());
+        m.insert("underset".to_string(), cmd2());
+        m.insert("url".to_string(), cmd1());
+        m.insert("va".to_string(), cmd1());
+        m.insert("var".to_string(), cmd1());
+        m.insert("variation".to_string(), cmd1());
+        m.insert("vb".to_string(), cmd1());
+        m.insert("vec".to_string(), cmd1());
+        m.insert("vectorarrow".to_string(), cmd1());
+        m.insert("vectorbold".to_string(), cmd1());
+        m.insert("vectorunit".to_string(), cmd1());
+        m.insert("vev".to_string(), cmd1());
+        m.insert("vmqty".to_string(), cmd1());
+        m.insert("vqty".to_string(), cmd1());
+        m.insert("vspace".to_string(), cmd1());
+        m.insert("vspace*".to_string(), cmd1());
+        m.insert("vu".to_string(), cmd1());
+        m.insert("widehat".to_string(), cmd1());
+        m.insert("widetilde".to_string(), cmd1());
+        m.insert("xLeftarrow".to_string(), cmd1());
+        m.insert("xLeftrightarrow".to_string(), cmd1());
+        m.insert("xRightarrow".to_string(), cmd1());
+        m.insert("xhookleftarrow".to_string(), cmd1());
+        m.insert("xhookrightarrow".to_string(), cmd1());
+        m.insert("xleftarrow".to_string(), cmd1());
+        m.insert("xleftharpoondown".to_string(), cmd1());
+        m.insert("xleftharpoonup".to_string(), cmd1());
+        m.insert("xleftrightarrow".to_string(), cmd1());
+        m.insert("xleftrightharpoons".to_string(), cmd1());
+        m.insert("xlongequal".to_string(), cmd1());
+        m.insert("xmapsto".to_string(), cmd1());
+        m.insert("xmat".to_string(), cmd3());
+        m.insert("xmatrix".to_string(), cmd3());
+        m.insert("xrightarrow".to_string(), cmd1());
+        m.insert("xrightharpoondown".to_string(), cmd1());
+        m.insert("xrightharpoonup".to_string(), cmd1());
+        m.insert("xrightleftharpoons".to_string(), cmd1());
+        m.insert("xtofrom".to_string(), cmd1());
+        m.insert("xtwoheadleftarrow".to_string(), cmd1());
+        m.insert("xtwoheadrightarrow".to_string(), cmd1());
+        m.insert("zeromatrix".to_string(), cmd2());
+        m.insert("zmat".to_string(), cmd2());
+        m.insert("derivative".to_string(), cmd2_opt());
+        m.insert("dv".to_string(), cmd2_opt());
+        m.insert("dv*".to_string(), cmd2_opt());
+        m.insert("fderivative".to_string(), cmd2_opt());
+        m.insert("fdv".to_string(), cmd2_opt());
+        m.insert("fdv*".to_string(), cmd2_opt());
+        m.insert("functionalderivative".to_string(), cmd2_opt());
+        m.insert("partialderivative".to_string(), cmd3_opt());
+        m.insert("pderivative".to_string(), cmd3_opt());
+        m.insert("pdv".to_string(), cmd3_opt());
+        m.insert("pdv*".to_string(), cmd3_opt());
 
         CommandSpec::new(m)
     };
@@ -2052,648 +1687,539 @@ lazy_static! {
 // =============================================================================
 
 /// Typst to LaTeX symbol mapping (compile-time perfect hash)
-/// Extended mapping for comprehensive bidirectional conversion
 pub static TYPST_TO_TEX: phf::Map<&'static str, &'static str> = phf_map! {
-    // =========================================================================
-    // Greek Letters (uppercase)
-    // =========================================================================
+    "!=" => "neq",
+    "-->" => "longrightarrow",
+    "->" => "rightarrow",
+    "->>" => "twoheadrightarrow",
+    "..." => "ldots",
+    "::=" => "Coloneqq",
+    ":=" => "coloneqq",
+    "<-" => "leftarrow",
+    "<--" => "longleftarrow",
+    "<-->" => "longleftrightarrow",
+    "<-<" => "leftarrowtail",
+    "<->" => "leftrightarrow",
+    "<<" => "ll",
+    "<<-" => "twoheadleftarrow",
+    "<<<" => "lll",
+    "<=" => "leq",
+    "<==" => "Longleftarrow",
+    "<==>" => "Longleftrightarrow",
+    "<=>" => "Leftrightarrow",
+    "<~" => "leftsquigarrow",
+    "=:" => "eqqcolon",
+    "==>" => "Longrightarrow",
+    "=>" => "Rightarrow",
+    ">->" => "rightarrowtail",
+    ">=" => "geq",
+    ">>" => "gg",
+    ">>>" => "ggg",
+    "AA" => "forall",
+    "Alpha" => "A",
+    "BB" => "\\mathbb{B}",
+    "Beta" => "B",
+    "CC" => "mathbb{C}",
+    "Chi" => "X",
+    "DD" => "\\mathbb{D}",
     "Delta" => "Delta",
+    "Digamma" => "\\Digamma",
+    "EE" => "exists",
+    "Epsilon" => "E",
+    "Eta" => "H",
+    "FF" => "\\mathbb{F}",
+    "GG" => "\\mathbb{G}",
     "Gamma" => "Gamma",
+    "HH" => "\\mathbb{H}",
+    "II" => "\\mathbb{I}",
+    "Im" => "Im",
+    "Iota" => "I",
+    "JJ" => "\\mathbb{J}",
+    "KK" => "\\mathbb{K}",
+    "Kappa" => "K",
+    "LL" => "\\mathbb{L}",
     "Lambda" => "Lambda",
+    "MM" => "\\mathbb{M}",
+    "Mu" => "M",
+    "NN" => "mathbb{N}",
+    "Nu" => "N",
+    "OO" => "\\mathbb{O}",
     "Omega" => "Omega",
+    "Omicron" => "O",
+    "PP" => "\\mathbb{P}",
     "Phi" => "Phi",
     "Pi" => "Pi",
+    "Pr" => "Pr",
     "Psi" => "Psi",
+    "QQ" => "mathbb{Q}",
+    "RR" => "mathbb{R}",
+    "Re" => "Re",
+    "Rho" => "P",
+    "SS" => "\\mathbb{S}",
     "Sigma" => "Sigma",
+    "TT" => "\\mathbb{T}",
+    "Tau" => "T",
     "Theta" => "Theta",
+    "UU" => "\\mathbb{U}",
     "Upsilon" => "Upsilon",
+    "VV" => "\\mathbb{V}",
+    "WW" => "\\mathbb{W}",
+    "XX" => "\\mathbb{X}",
     "Xi" => "Xi",
-
-    // =========================================================================
-    // Greek Letters (lowercase)
-    // =========================================================================
+    "YY" => "\\mathbb{Y}",
+    "ZZ" => "mathbb{Z}",
+    "Zeta" => "Z",
+    "acute" => "acute",
+    "aleph" => "aleph",
     "alpha" => "alpha",
-    "beta" => "beta",
-    "gamma" => "gamma",
-    "delta" => "delta",
-    "epsilon" => "varepsilon",
-    "epsilon.alt" => "epsilon",
-    "zeta" => "zeta",
-    "eta" => "eta",
-    "theta" => "theta",
-    "theta.alt" => "vartheta",
-    "iota" => "iota",
-    "kappa" => "kappa",
-    "kappa.alt" => "varkappa",
-    "lambda" => "lambda",
-    "mu" => "mu",
-    "nu" => "nu",
-    "xi" => "xi",
-    "pi" => "pi",
-    "pi.alt" => "varpi",
-    "rho" => "rho",
-    "rho.alt" => "varrho",
-    "sigma" => "sigma",
-    "sigma.alt" => "varsigma",
-    "tau" => "tau",
-    "upsilon" => "upsilon",
-    "phi" => "varphi",
-    "phi.alt" => "phi",
-    "chi" => "chi",
-    "psi" => "psi",
-    "omega" => "omega",
-
-    // =========================================================================
-    // Arrows
-    // =========================================================================
-    "arrow.r" => "rightarrow",
-    "arrow.l" => "leftarrow",
-    "arrow.t" => "uparrow",
+    "amalg" => "amalg",
+    "and" => "wedge",
+    "and.big" => "bigwedge",
+    "angle" => "angle",
+    "angle.arc" => "measuredangle",
+    "angle.l" => "langle",
+    "angle.l.double" => "\\lAngle",
+    "angle.r" => "rangle",
+    "angle.r.double" => "\\rAngle",
+    "angle.spheric" => "sphericalangle",
+    "approx" => "approx",
+    "approx.eq" => "\\approxeq",
+    "approx.not" => "napprox",
+    "arccos" => "arccos",
+    "arcsin" => "arcsin",
+    "arctan" => "arctan",
+    "arg" => "arg",
+    "argmax" => "argmax",
+    "argmin" => "argmin",
     "arrow.b" => "downarrow",
-    "arrow.l.r" => "leftrightarrow",
-    "arrow.t.b" => "updownarrow",
-    "arrow.r.double" => "Rightarrow",
-    "arrow.l.double" => "Leftarrow",
-    "arrow.t.double" => "Uparrow",
     "arrow.b.double" => "Downarrow",
-    "arrow.l.r.double" => "Leftrightarrow",
-    "arrow.t.b.double" => "Updownarrow",
-    "arrow.r.long" => "longrightarrow",
-    "arrow.l.long" => "longleftarrow",
-    "arrow.l.r.long" => "longleftrightarrow",
-    "arrow.r.double.long" => "Longrightarrow",
-    "arrow.l.double.long" => "Longleftarrow",
-    "arrow.l.r.double.long" => "Longleftrightarrow",
-    "arrow.r.tail" => "rightarrowtail",
-    "arrow.l.tail" => "leftarrowtail",
-    "arrow.r.hook" => "hookrightarrow",
-    "arrow.l.hook" => "hookleftarrow",
-    "arrow.r.squiggly" => "rightsquigarrow",
-    "arrow.l.squiggly" => "leftsquigarrow",
-    "arrow.r.twohead" => "twoheadrightarrow",
-    "arrow.l.twohead" => "twoheadleftarrow",
-    "arrow.r.bar" => "mapsto",
+    "arrow.ccw" => "\\curvearrowleft",
+    "arrow.cw" => "\\curvearrowright",
+    "arrow.l" => "leftarrow",
     "arrow.l.bar" => "mapsfrom",
+    "arrow.l.double" => "Leftarrow",
+    "arrow.l.double.long" => "Longleftarrow",
+    "arrow.l.double.not" => "\\nLeftarrow",
+    "arrow.l.hook" => "hookleftarrow",
+    "arrow.l.long" => "longleftarrow",
+    "arrow.l.not" => "\\nleftarrow",
+    "arrow.l.r" => "leftrightarrow",
+    "arrow.l.r.double" => "Leftrightarrow",
+    "arrow.l.r.double.long" => "Longleftrightarrow",
+    "arrow.l.r.double.not" => "\\nLeftrightarrow",
+    "arrow.l.r.long" => "longleftrightarrow",
+    "arrow.l.r.not" => "\\nleftrightarrow",
+    "arrow.l.r.wave" => "\\leftrightsquigarrow",
+    "arrow.l.squiggly" => "leftsquigarrow",
+    "arrow.l.tail" => "leftarrowtail",
+    "arrow.l.twohead" => "twoheadleftarrow",
+    "arrow.ne" => "nearrow",
+    "arrow.nw" => "nwarrow",
+    "arrow.r" => "rightarrow",
+    "arrow.r.bar" => "mapsto",
+    "arrow.r.double" => "Rightarrow",
+    "arrow.r.double.long" => "Longrightarrow",
+    "arrow.r.double.not" => "\\nRightarrow",
+    "arrow.r.hook" => "hookrightarrow",
+    "arrow.r.long" => "longrightarrow",
     "arrow.r.long.bar" => "longmapsto",
-    "harpoon.rt" => "rightharpoonup",
-    "harpoon.rb" => "rightharpoondown",
-    "harpoon.lt" => "leftharpoonup",
-    "harpoon.lb" => "leftharpoondown",
-    "harpoons.ltrb" => "leftrightharpoons",
-    "harpoons.rtlb" => "rightleftharpoons",
-    "arrows.rr" => "rightrightarrows",
+    "arrow.r.not" => "\\nrightarrow",
+    "arrow.r.squiggly" => "rightsquigarrow",
+    "arrow.r.tail" => "rightarrowtail",
+    "arrow.r.twohead" => "twoheadrightarrow",
+    "arrow.se" => "searrow",
+    "arrow.sw" => "swarrow",
+    "arrow.t" => "uparrow",
+    "arrow.t.b" => "updownarrow",
+    "arrow.t.b.double" => "Updownarrow",
+    "arrow.t.double" => "Uparrow",
     "arrows.ll" => "leftleftarrows",
     "arrows.lr" => "leftrightarrows",
     "arrows.rl" => "rightleftarrows",
-    "arrow.ne" => "nearrow",
-    "arrow.se" => "searrow",
-    "arrow.sw" => "swarrow",
-    "arrow.nw" => "nwarrow",
-
-    // =========================================================================
-    // Binary Operations
-    // =========================================================================
-    "plus.minus" => "pm",
-    "minus.plus" => "mp",
-    "times" => "times",
-    "div" => "div",
+    "arrows.rr" => "rightrightarrows",
     "ast" => "ast",
-    "star" => "star",
-    "circle.small" => "circ",
+    "ast.op" => "\\ast",
+    "asymp" => "asymp",
+    "ballot" => "times",
+    "bar.v" => "|",
+    "bar.v.double" => "\\|",
+    "because" => "because",
+    "beta" => "beta",
+    "beth" => "beth",
+    "bowtie" => "bowtie",
+    "brace.l" => "\\{",
+    "brace.r" => "\\}",
+    "bracket.l" => "[",
+    "bracket.r" => "]",
+    "breve" => "breve",
     "bullet" => "bullet",
-    "dot.op" => "cdot",
-    "dot.c" => "cdot",
-    "circle.plus" => "oplus",
-    "circle.minus" => "ominus",
-    "circle.times" => "otimes",
+    "caron" => "check",
+    "ceil.l" => "lceil",
+    "ceil.r" => "rceil",
+    "checkmark" => "checkmark",
+    "chevron.l" => "langle",
+    "chevron.r" => "rangle",
+    "chi" => "chi",
+    "circle" => "circ",
     "circle.div" => "oslash",
     "circle.dot" => "odot",
-    "square.plus" => "boxplus",
-    "square.minus" => "boxminus",
-    "square.times" => "boxtimes",
-    "square.dot" => "boxdot",
-    "wreath" => "wr",
-    "diamond.op" => "diamond",
-    "triangle.t" => "bigtriangleup",
-    "triangle.b" => "bigtriangledown",
-    "triangle.l" => "triangleleft",
-    "triangle.r" => "triangleright",
+    "circle.minus" => "ominus",
+    "circle.plus" => "oplus",
+    "circle.small" => "circ",
+    "circle.stroked" => "\\circ",
+    "circle.stroked.small" => "\\circ",
+    "circle.stroked.tiny" => "mathring",
+    "circle.times" => "otimes",
+    "colon" => "colon",
+    "coloneq" => "coloneqq",
+    "comma" => ",",
+    "complement" => "complement",
+    "coproduct" => "coprod",
+    "copyright" => "copyright",
+    "cos" => "cos",
+    "cosh" => "cosh",
+    "cot" => "cot",
+    "coth" => "coth",
+    "csc" => "csc",
     "dagger" => "dagger",
     "dagger.double" => "ddagger",
-    "amalg" => "amalg",
-    "sect" => "cap",
-    "union" => "cup",
-    "sect.sq" => "sqcap",
-    "union.sq" => "sqcup",
-    "sect.big" => "bigcap",
-    "union.big" => "bigcup",
-    "union.sq.big" => "bigsqcup",
-    "sect.sq.big" => "bigsqcap",
-    "and" => "wedge",
-    "or" => "vee",
-    "and.big" => "bigwedge",
-    "or.big" => "bigvee",
-    "plus.circle" => "oplus",
-    "plus.circle.big" => "bigoplus",
-    "times.circle" => "otimes",
-    "times.circle.big" => "bigotimes",
+    "daleth" => "daleth",
+    "deg" => "deg",
+    "degree" => "degree",
+    "delta" => "delta",
+    "det" => "det",
+    "diaer" => "ddot",
+    "diameter" => "diameter",
+    "diamond.op" => "diamond",
+    "diamond.stroked" => "\\diamond",
+    "diamond.stroked.small" => "\\diamond",
+    "dif" => "mathrm{d}",
+    "diff" => "partial",
+    "digamma" => "\\digamma",
+    "dim" => "dim",
+    "div" => "div",
+    "divides" => "mid",
+    "divides.not" => "nmid",
+    "dollar" => "\\$",
+    "dot" => "cdot",
+    "dot.c" => "cdot",
+    "dot.circle" => "\\odot",
     "dot.circle.big" => "bigodot",
-    // Current Typst circled-operator spelling (`.o`); `.circle` above is the
-    // pre-0.12 deprecated form kept for backward compatibility.
-    "plus.o" => "\\oplus",
-    "plus.o.big" => "\\bigoplus",
-    "minus.o" => "\\ominus",
-    "times.o" => "\\otimes",
-    "times.o.big" => "\\bigotimes",
     "dot.o" => "\\odot",
     "dot.o.big" => "\\bigodot",
-    "slash.o" => "\\oslash",
-
-    // =========================================================================
-    // Relations
-    // =========================================================================
-    "lt" => "lt",
-    "gt" => "gt",
-    "lt.eq" => "leq",
-    "gt.eq" => "geq",
-    "lt.eq.slant" => "leqslant",
-    "gt.eq.slant" => "geqslant",
-    "lt.double" => "ll",
-    "gt.double" => "gg",
-    "lt.triple" => "lll",
-    "gt.triple" => "ggg",
-    "lt.not" => "nless",
-    "gt.not" => "ngtr",
-    "lt.eq.not" => "nleq",
-    "gt.eq.not" => "ngeq",
+    "dot.op" => "cdot",
+    "doteq" => "doteq",
+    "dotless.i" => "\\imath",
+    "dotless.j" => "\\jmath",
+    "dots" => "ldots",
+    "dots.c" => "cdots",
+    "dots.down" => "ddots",
+    "dots.h" => "ldots",
+    "dots.h.c" => "\\cdots",
+    "dots.up" => "iddots",
+    "dots.v" => "vdots",
+    "ell" => "ell",
+    "emptyset" => "emptyset",
+    "epsilon" => "varepsilon",
+    "epsilon.alt" => "epsilon",
     "eq" => "eq",
+    "eq.def" => "overset{\\text{def}}{=}",
+    "eq.delta" => "triangleq",
     "eq.not" => "neq",
+    "eq.quest" => "stackrel{?}{=}",
+    "eq.star" => "stackrel{*}{=}",
+    "eqcolon" => "eqqcolon",
     "equiv" => "equiv",
     "equiv.not" => "nequiv",
-    "approx" => "approx",
-    "approx.not" => "napprox",
-    "tilde.op" => "sim",
-    "tilde.eq" => "simeq",
-    "tilde.eq.not" => "nsimeq",
-    "tilde.equiv" => "cong",
-    "tilde.equiv.not" => "ncong",
-    "prop" => "propto",
-    "prec" => "prec",
-    "succ" => "succ",
-    "prec.eq" => "preceq",
-    "succ.eq" => "succeq",
-    "prec.not" => "nprec",
-    "succ.not" => "nsucc",
-    "subset" => "subset",
-    "supset" => "supset",
-    "subset.eq" => "subseteq",
-    "supset.eq" => "supseteq",
-    "subset.not" => "nsubset",
-    "supset.not" => "nsupset",
-    "subset.eq.not" => "nsubseteq",
-    "supset.eq.not" => "nsupseteq",
-    "subset.sq" => "sqsubset",
-    "supset.sq" => "sqsupset",
-    "subset.eq.sq" => "sqsubseteq",
-    "supset.eq.sq" => "sqsupseteq",
+    "eta" => "eta",
+    "euro" => "euro",
+    "exists" => "exists",
+    "exists.not" => "nexists",
+    "exp" => "exp",
+    "flat" => "flat",
+    "floor.l" => "lfloor",
+    "floor.r" => "rfloor",
+    "forall" => "forall",
+    "forces" => "Vdash",
+    "forces.not" => "\\nVdash",
+    "frown" => "frown",
+    "gamma" => "gamma",
+    "gcd" => "gcd",
+    "gimel" => "gimel",
+    "gradient" => "nabla",
+    "grave" => "grave",
+    "gt" => "gt",
+    "gt.approx" => "\\gtrapprox",
+    "gt.double" => "gg",
+    "gt.eq" => "geq",
+    "gt.eq.not" => "ngeq",
+    "gt.eq.slant" => "geqslant",
+    "gt.equiv" => "\\geqq",
+    "gt.lt" => "\\gtrless",
+    "gt.not" => "ngtr",
+    "gt.tilde" => "\\gtrsim",
+    "gt.tri" => "\\vartriangleright",
+    "gt.tri.eq" => "\\trianglerighteq",
+    "gt.tri.eq.not" => "\\ntrianglerighteq",
+    "gt.tri.not" => "\\ntriangleright",
+    "gt.triple" => "ggg",
+    "harpoon.lb" => "leftharpoondown",
+    "harpoon.lt" => "leftharpoonup",
+    "harpoon.rb" => "rightharpoondown",
+    "harpoon.rt" => "rightharpoonup",
+    "harpoons.ltrb" => "leftrightharpoons",
+    "harpoons.rtlb" => "rightleftharpoons",
+    "harpoons.rtlt" => "\\upharpoonright\\!\\upharpoonleft",
+    "hat" => "hat",
+    "hbar" => "hbar",
+    "hom" => "hom",
+    "hyph" => "-",
+    "hyph.minus" => "-",
+    "imath" => "imath",
     "in" => "in",
     "in.not" => "notin",
     "in.rev" => "ni",
     "in.rev.not" => "notni",
-    "divides" => "mid",
-    "divides.not" => "nmid",
-    "parallel" => "parallel",
-    "parallel.not" => "nparallel",
-    "perp" => "perp",
-    "models" => "models",
-    "forces" => "Vdash",
-    "tack.r" => "vdash",
-    "tack.l" => "dashv",
-    "tack.t" => "top",
-    "tack.b" => "bot",
-    "tack.r.double" => "vDash",
-    "tack.l.double" => "Dashv",
-    "tack.r.not" => "nvdash",
-    "tack.r.double.not" => "nvDash",
-    "colon" => "colon",
-    "coloneq" => "coloneqq",
-    "eqcolon" => "eqqcolon",
-    "doteq" => "doteq",
-    "asymp" => "asymp",
-    "bowtie" => "bowtie",
-    "smile" => "smile",
-    "frown" => "frown",
-
-    // =========================================================================
-    // Big Operators
-    // =========================================================================
-    "sum" => "sum",
-    "product" => "prod",
-    "coproduct" => "coprod",
-    "integral" => "int",
-    "integral.double" => "iint",
-    "integral.triple" => "iiint",
-    "integral.quad" => "iiiint",
-    "integral.cont" => "oint",
-    "integral.surf" => "oiint",
-    "integral.vol" => "oiiint",
-
-    // =========================================================================
-    // Functions
-    // =========================================================================
-    "sin" => "sin",
-    "cos" => "cos",
-    "tan" => "tan",
-    "cot" => "cot",
-    "sec" => "sec",
-    "csc" => "csc",
-    "arcsin" => "arcsin",
-    "arccos" => "arccos",
-    "arctan" => "arctan",
-    "sinh" => "sinh",
-    "cosh" => "cosh",
-    "tanh" => "tanh",
-    "coth" => "coth",
-    "exp" => "exp",
-    "log" => "log",
-    "ln" => "ln",
-    "lg" => "lg",
-    "lim" => "lim",
-    "limsup" => "limsup",
-    "liminf" => "liminf",
-    "max" => "max",
-    "min" => "min",
-    "sup" => "sup",
     "inf" => "inf",
-    "arg" => "arg",
-    "det" => "det",
-    "dim" => "dim",
-    "gcd" => "gcd",
-    "lcm" => "operatorname{lcm}",
-    "deg" => "deg",
-    "hom" => "hom",
-    "ker" => "ker",
-    "Pr" => "Pr",
-    "Im" => "Im",
-    "Re" => "Re",
-    "argmin" => "argmin",
-    "argmax" => "argmax",
-
-    // =========================================================================
-    // Delimiters
-    // =========================================================================
-    "paren.l" => "(",
-    "paren.r" => ")",
-    "bracket.l" => "[",
-    "bracket.r" => "]",
-    "brace.l" => "\\{",
-    "brace.r" => "\\}",
-    "chevron.l" => "langle",
-    "chevron.r" => "rangle",
-    "angle.l" => "langle",
-    "angle.r" => "rangle",
-    "floor.l" => "lfloor",
-    "floor.r" => "rfloor",
-    "ceil.l" => "lceil",
-    "ceil.r" => "rceil",
-    "vert" => "vert",
-    "vert.double" => "Vert",
-    "bar.v" => "|",
-    "bar.v.double" => "\\|",
-
-    // =========================================================================
-    // Miscellaneous Symbols
-    // =========================================================================
     "infinity" => "infty",
-    "oo" => "infty",
-    "diff" => "partial",
-    "partial" => "partial",
-    "nabla" => "nabla",
-    "gradient" => "nabla",
-    "laplace" => "Delta",
-    "emptyset" => "emptyset",
-    "nothing" => "varnothing",
-    "aleph" => "aleph",
-    "beth" => "beth",
-    "gimel" => "gimel",
-    "daleth" => "daleth",
-    "ell" => "ell",
-    "planck" => "hbar",
-    "planck.reduce" => "hbar",
-    "hbar" => "hbar",
-    "imath" => "imath",
-    "jmath" => "jmath",
-    "wp" => "wp",
-    "prime" => "prime",
-    "forall" => "forall",
-    "exists" => "exists",
-    "exists.not" => "nexists",
-    "not" => "neg",
-    "complement" => "complement",
-    "circle" => "circ",
-    "degree" => "degree",
-    "angle" => "angle",
-    "angle.arc" => "measuredangle",
-    "angle.spheric" => "sphericalangle",
-    "diameter" => "diameter",
-    "therefore" => "therefore",
-    "because" => "because",
-    "qed" => "square",
-    "square" => "square",
-    "square.stroked" => "square",
-    "square.filled" => "blacksquare",
-    "checkmark" => "checkmark",
-    "ballot" => "times",
-
-    // =========================================================================
-    // Dots
-    // =========================================================================
-    "dots" => "ldots",
-    "dots.h" => "ldots",
-    "dots.c" => "cdots",
-    "dots.v" => "vdots",
-    "dots.down" => "ddots",
-    "dots.up" => "iddots",
-
-    // =========================================================================
-    // Spaces
-    // =========================================================================
-    "space" => "\\ ",
-    "space.thin" => "\\,",
-    "space.med" => "\\:",
-    "space.thick" => "\\;",
-    "space.quad" => "\\quad",
-    "space.wide" => "\\qquad",
-    "space.neg" => "\\!",
-
-    // =========================================================================
-    // Accents (for use in math mode)
-    // =========================================================================
-    "hat" => "hat",
-    "grave" => "grave",
-    "acute" => "acute",
-    "tilde" => "tilde",
-    "macron" => "bar",
-    "breve" => "breve",
-    "dot" => "cdot",  // As symbol, dot is \cdot (middle dot); as function dot(x), handled separately
-    "diaer" => "ddot",
-    "caron" => "check",
-    "circle.stroked.tiny" => "mathring",
-    "vec" => "vec",
-
-    // =========================================================================
-    // Card Symbols
-    // =========================================================================
-    "suit.club" => "clubsuit",
-    "suit.diamond" => "diamondsuit",
-    "suit.heart" => "heartsuit",
-    "suit.spade" => "spadesuit",
-
-    // =========================================================================
-    // Music
-    // =========================================================================
-    "sharp" => "sharp",
-    "flat" => "flat",
-    "natural" => "natural",
-
-    // =========================================================================
-    // Currency and other
-    // =========================================================================
-    "dollar" => "\\$",
-    "euro" => "euro",
-    "pound" => "pounds",
-    "yen" => "textyen",
-    "percent" => "\\%",
-    "copyright" => "copyright",
-    "trademark" => "texttrademark",
-    "registered" => "textregistered",
-    "section" => "S",
-    "paragraph" => "P",
-    "star.filled" => "bigstar",
-
-    // =========================================================================
-    // Special Typst Symbols (from tex2typst shorthands and extras)
-    // =========================================================================
-    "dif" => "mathrm{d}",       // Typst's differential
-    "RR" => "mathbb{R}",
-    "NN" => "mathbb{N}",
-    "ZZ" => "mathbb{Z}",
-    "QQ" => "mathbb{Q}",
-    "CC" => "mathbb{C}",
-    "AA" => "forall",
-    "EE" => "exists",
-
-    // Shorthand arrows
-    "->" => "rightarrow",
-    "<-" => "leftarrow",
-    "=>" => "Rightarrow",
-    "<=>" => "Leftrightarrow",
-    "<->" => "leftrightarrow",
-    "-->" => "longrightarrow",
-    "<--" => "longleftarrow",
-    "==>" => "Longrightarrow",
-    "<==" => "Longleftarrow",
-    "<==>" => "Longleftrightarrow",
-    "<-->" => "longleftrightarrow",
-    "|->" => "mapsto",
-    "|=>" => "Mapsto",
-    "~>" => "rightsquigarrow",
-    "<~" => "leftsquigarrow",
-    "~~>" => "leadsto",
-    "->>" => "twoheadrightarrow",
-    "<<-" => "twoheadleftarrow",
-    ">->" => "rightarrowtail",
-    "<-<" => "leftarrowtail",
-
-    // Shorthand operators
-    "!=" => "neq",
-    ">=" => "geq",
-    "<=" => "leq",
-    ">>" => "gg",
-    "<<" => "ll",
-    ">>>" => "ggg",
-    "<<<" => "lll",
-    "||" => "|",
-    ":=" => "coloneqq",
-    "=:" => "eqqcolon",
-    "::=" => "Coloneqq",
-    "..." => "ldots",
-
-    // Additional Typst symbols
-    "hyph" => "-",
-    "hyph.minus" => "-",
-    "comma" => ",",
-    "thin" => ",",      // thin space
-    "med" => ":",       // medium space
-    "thick" => ";",     // thick space
-    "space.nobreak" => "~",
-    "eq.def" => "overset{\\text{def}}{=}",
-    "eq.delta" => "triangleq",
-    "eq.star" => "stackrel{*}{=}",
-    "eq.quest" => "stackrel{?}{=}",
-
-    // Note: Most bracket variants already defined above
-    // (floor.l, floor.r, ceil.l, ceil.r, angle.l, angle.r, brace.l, brace.r, paren.l, paren.r, bracket.l, bracket.r)
-
-    // Additional unique symbols
-    "star.op" => "*",
-
-    // =========================================================================
-    // Extended symbol mappings (from official Typst symbol table diff)
-    // =========================================================================
-
-    // Greek uppercase (trivial — rendered as Roman letters in LaTeX)
-    "Alpha" => "A",
-    "Beta" => "B",
-    "Chi" => "X",
-    "Digamma" => "\\Digamma",
-    "Epsilon" => "E",
-    "Eta" => "H",
-    "Iota" => "I",
-    "Kappa" => "K",
-    "Mu" => "M",
-    "Nu" => "N",
-    "Omicron" => "O",
-    "Rho" => "P",
-    "Tau" => "T",
-    "Zeta" => "Z",
-    "digamma" => "\\digamma",
-
-    // Blackboard bold (missing letters)
-    "BB" => "\\mathbb{B}",
-    "DD" => "\\mathbb{D}",
-    "FF" => "\\mathbb{F}",
-    "GG" => "\\mathbb{G}",
-    "HH" => "\\mathbb{H}",
-    "II" => "\\mathbb{I}",
-    "JJ" => "\\mathbb{J}",
-    "KK" => "\\mathbb{K}",
-    "LL" => "\\mathbb{L}",
-    "MM" => "\\mathbb{M}",
-    "OO" => "\\mathbb{O}",
-    "PP" => "\\mathbb{P}",
-    "SS" => "\\mathbb{S}",
-    "TT" => "\\mathbb{T}",
-    "UU" => "\\mathbb{U}",
-    "VV" => "\\mathbb{V}",
-    "WW" => "\\mathbb{W}",
-    "XX" => "\\mathbb{X}",
-    "YY" => "\\mathbb{Y}",
-
-    // Arrows (negated/curved variants)
-    "arrow.r.not" => "\\nrightarrow",
-    "arrow.l.not" => "\\nleftarrow",
-    "arrow.r.double.not" => "\\nRightarrow",
-    "arrow.l.double.not" => "\\nLeftarrow",
-    "arrow.l.r.not" => "\\nleftrightarrow",
-    "arrow.l.r.double.not" => "\\nLeftrightarrow",
-    "arrow.l.r.wave" => "\\leftrightsquigarrow",
-    "arrow.ccw" => "\\curvearrowleft",
-    "arrow.cw" => "\\curvearrowright",
-
-    // Comparison variants
-    "lt.approx" => "\\lessapprox",
-    "lt.equiv" => "\\leqq",
-    "lt.gt" => "\\lessgtr",
-    "lt.tilde" => "\\lesssim",
-    "lt.tri" => "\\vartriangleleft",
-    "lt.tri.eq" => "\\trianglelefteq",
-    "lt.tri.not" => "\\ntriangleleft",
-    "lt.tri.eq.not" => "\\ntrianglelefteq",
-    "gt.approx" => "\\gtrapprox",
-    "gt.equiv" => "\\geqq",
-    "gt.lt" => "\\gtrless",
-    "gt.tilde" => "\\gtrsim",
-    "gt.tri" => "\\vartriangleright",
-    "gt.tri.eq" => "\\trianglerighteq",
-    "gt.tri.not" => "\\ntriangleright",
-    "gt.tri.eq.not" => "\\ntrianglerighteq",
-
-    // Precedence / Succession variants
-    "prec.approx" => "\\precapprox",
-    "prec.curly.eq" => "\\preccurlyeq",
-    "prec.curly.eq.not" => "\\npreccurlyeq",
-    "prec.tilde" => "\\precsim",
-    "succ.approx" => "\\succapprox",
-    "succ.curly.eq" => "\\succcurlyeq",
-    "succ.curly.eq.not" => "\\nsucccurlyeq",
-    "succ.tilde" => "\\succsim",
-
-    // Tilde / Approx variants
-    "tilde.not" => "\\nsim",
-    "tilde.rev" => "\\backsim",
-    "tilde.rev.equiv" => "\\backcong",
-    "approx.eq" => "\\approxeq",
-    "forces.not" => "\\nVdash",
-
-    // Set operation variants
-    "subset.double" => "\\Subset",
-    "subset.neq" => "\\subsetneq",
-    "supset.double" => "\\Supset",
-    "supset.neq" => "\\supsetneq",
-    "union.dot" => "\\cupdot",
-    "union.double" => "\\Cup",
-    "union.plus" => "\\uplus",
+    "integral" => "int",
+    "integral.cont" => "oint",
+    "integral.double" => "iint",
+    "integral.quad" => "iiiint",
+    "integral.surf" => "oiint",
+    "integral.triple" => "iiint",
+    "integral.vol" => "oiiint",
     "inter" => "\\cap",
     "inter.big" => "\\bigcap",
     "inter.double" => "\\Cap",
     "inter.sq" => "\\sqcap",
-    "without" => "\\setminus",
-
-    // Binary operator variants
-    "plus" => "+",
-    "plus.square" => "\\boxplus",
+    "iota" => "iota",
+    "jmath" => "jmath",
+    "join" => "\\bowtie",
+    "kappa" => "kappa",
+    "kappa.alt" => "varkappa",
+    "ker" => "ker",
+    "lambda" => "lambda",
+    "laplace" => "Delta",
+    "lcm" => "operatorname{lcm}",
+    "lg" => "lg",
+    "lim" => "lim",
+    "liminf" => "liminf",
+    "limsup" => "limsup",
+    "ln" => "ln",
+    "log" => "log",
+    "lt" => "lt",
+    "lt.approx" => "\\lessapprox",
+    "lt.double" => "ll",
+    "lt.eq" => "leq",
+    "lt.eq.not" => "nleq",
+    "lt.eq.slant" => "leqslant",
+    "lt.equiv" => "\\leqq",
+    "lt.gt" => "\\lessgtr",
+    "lt.not" => "nless",
+    "lt.tilde" => "\\lesssim",
+    "lt.tri" => "\\vartriangleleft",
+    "lt.tri.eq" => "\\trianglelefteq",
+    "lt.tri.eq.not" => "\\ntrianglelefteq",
+    "lt.tri.not" => "\\ntriangleleft",
+    "lt.triple" => "lll",
+    "macron" => "bar",
+    "maltese" => "\\maltese",
+    "max" => "max",
+    "med" => ":",
+    "min" => "min",
     "minus" => "-",
     "minus.circle" => "\\ominus",
+    "minus.o" => "\\ominus",
+    "minus.plus" => "mp",
     "minus.square" => "\\boxminus",
-    "times.square" => "\\boxtimes",
-    "dot.circle" => "\\odot",
-    "ast.op" => "\\ast",
-    "xor" => "\\oplus",
-    "xor.big" => "\\bigoplus",
+    "models" => "models",
+    "mu" => "mu",
+    "nabla" => "nabla",
+    "natural" => "natural",
+    "not" => "neg",
+    "nothing" => "varnothing",
+    "nu" => "nu",
+    "omega" => "omega",
+    "oo" => "infty",
+    "or" => "vee",
+    "or.big" => "bigvee",
+    "paragraph" => "P",
+    "parallel" => "parallel",
+    "parallel.not" => "nparallel",
+    "paren.l" => "(",
+    "paren.r" => ")",
+    "partial" => "partial",
+    "percent" => "\\%",
+    "perp" => "perp",
+    "phi" => "varphi",
+    "phi.alt" => "phi",
+    "pi" => "pi",
+    "pi.alt" => "varpi",
+    "pilcrow" => "\\P",
+    "planck" => "hbar",
+    "planck.reduce" => "hbar",
+    "plus" => "+",
+    "plus.circle" => "oplus",
+    "plus.circle.big" => "bigoplus",
+    "plus.minus" => "pm",
+    "plus.o" => "\\oplus",
+    "plus.o.big" => "\\bigoplus",
+    "plus.square" => "\\boxplus",
+    "pound" => "pounds",
+    "prec" => "prec",
+    "prec.approx" => "\\precapprox",
+    "prec.curly.eq" => "\\preccurlyeq",
+    "prec.curly.eq.not" => "\\npreccurlyeq",
+    "prec.eq" => "preceq",
+    "prec.not" => "nprec",
+    "prec.tilde" => "\\precsim",
+    "prime" => "prime",
+    "prime.double" => "\\prime\\prime",
+    "product" => "prod",
     "product.co" => "\\coprod",
-    "dots.h.c" => "\\cdots",
-
-    // Triangle variants
-    "triangle.stroked.t" => "\\triangle",
-    "triangle.stroked.b" => "\\triangledown",
-    "triangle.stroked.r" => "\\triangleright",
-    "triangle.stroked.l" => "\\triangleleft",
-    "triangle.stroked.small.t" => "\\vartriangle",
-    "triangle.filled.t" => "\\blacktriangle",
-    "triangle.filled.b" => "\\blacktriangledown",
-    "triangle.filled.r" => "\\blacktriangleright",
-    "triangle.filled.l" => "\\blacktriangleleft",
-
-    // Delimiter variants
-    "angle.l.double" => "\\lAngle",
-    "angle.r.double" => "\\rAngle",
+    "prop" => "propto",
+    "psi" => "psi",
+    "qed" => "square",
+    "registered" => "textregistered",
+    "rho" => "rho",
+    "rho.alt" => "varrho",
+    "sec" => "sec",
+    "sect" => "cap",
+    "sect.big" => "bigcap",
+    "sect.sq" => "sqcap",
+    "sect.sq.big" => "bigsqcap",
+    "section" => "S",
+    "sharp" => "sharp",
     "shell.l" => "\\lgroup",
     "shell.r" => "\\rgroup",
-
-    // Shapes
-    "circle.stroked" => "\\circ",
-    "circle.stroked.small" => "\\circ",
-    "diamond.stroked" => "\\diamond",
-    "diamond.stroked.small" => "\\diamond",
-
-    // Dotless letters
-    "dotless.i" => "\\imath",
-    "dotless.j" => "\\jmath",
-
-    // Suits
-    "suit.club.filled" => "\\clubsuit",
-    "suit.spade.filled" => "\\spadesuit",
-    "suit.heart.stroked" => "\\heartsuit",
-    "suit.diamond.stroked" => "\\diamondsuit",
-
-    // Misc
-    "join" => "\\bowtie",
-    "maltese" => "\\maltese",
-    "pilcrow" => "\\P",
-    "prime.double" => "\\prime\\prime",
-    "harpoons.rtlt" => "\\upharpoonright\\!\\upharpoonleft",
+    "sigma" => "sigma",
+    "sigma.alt" => "varsigma",
+    "sin" => "sin",
+    "sinh" => "sinh",
+    "slash.o" => "\\oslash",
+    "smile" => "smile",
+    "space" => "\\ ",
     "space.en" => "\\;",
+    "space.med" => "\\:",
+    "space.neg" => "\\!",
+    "space.nobreak" => "~",
+    "space.quad" => "\\quad",
+    "space.thick" => "\\;",
+    "space.thin" => "\\,",
+    "space.wide" => "\\qquad",
+    "square" => "square",
+    "square.dot" => "boxdot",
+    "square.filled" => "blacksquare",
+    "square.minus" => "boxminus",
+    "square.plus" => "boxplus",
+    "square.stroked" => "square",
+    "square.times" => "boxtimes",
+    "star" => "star",
+    "star.filled" => "bigstar",
+    "star.op" => "*",
+    "subset" => "subset",
+    "subset.double" => "\\Subset",
+    "subset.eq" => "subseteq",
+    "subset.eq.not" => "nsubseteq",
+    "subset.eq.sq" => "sqsubseteq",
+    "subset.neq" => "\\subsetneq",
+    "subset.not" => "nsubset",
+    "subset.sq" => "sqsubset",
+    "succ" => "succ",
+    "succ.approx" => "\\succapprox",
+    "succ.curly.eq" => "\\succcurlyeq",
+    "succ.curly.eq.not" => "\\nsucccurlyeq",
+    "succ.eq" => "succeq",
+    "succ.not" => "nsucc",
+    "succ.tilde" => "\\succsim",
+    "suit.club" => "clubsuit",
+    "suit.club.filled" => "\\clubsuit",
+    "suit.diamond" => "diamondsuit",
+    "suit.diamond.stroked" => "\\diamondsuit",
+    "suit.heart" => "heartsuit",
+    "suit.heart.stroked" => "\\heartsuit",
+    "suit.spade" => "spadesuit",
+    "suit.spade.filled" => "\\spadesuit",
+    "sum" => "sum",
+    "sup" => "sup",
+    "supset" => "supset",
+    "supset.double" => "\\Supset",
+    "supset.eq" => "supseteq",
+    "supset.eq.not" => "nsupseteq",
+    "supset.eq.sq" => "sqsupseteq",
+    "supset.neq" => "\\supsetneq",
+    "supset.not" => "nsupset",
+    "supset.sq" => "sqsupset",
+    "tack.b" => "bot",
+    "tack.l" => "dashv",
+    "tack.l.double" => "Dashv",
+    "tack.r" => "vdash",
+    "tack.r.double" => "vDash",
+    "tack.r.double.not" => "nvDash",
+    "tack.r.not" => "nvdash",
+    "tack.t" => "top",
+    "tan" => "tan",
+    "tanh" => "tanh",
+    "tau" => "tau",
+    "therefore" => "therefore",
+    "theta" => "theta",
+    "theta.alt" => "vartheta",
+    "thick" => ";",
+    "thin" => ",",
+    "tilde" => "tilde",
+    "tilde.eq" => "simeq",
+    "tilde.eq.not" => "nsimeq",
+    "tilde.equiv" => "cong",
+    "tilde.equiv.not" => "ncong",
+    "tilde.not" => "\\nsim",
+    "tilde.op" => "sim",
+    "tilde.rev" => "\\backsim",
+    "tilde.rev.equiv" => "\\backcong",
+    "times" => "times",
+    "times.circle" => "otimes",
+    "times.circle.big" => "bigotimes",
+    "times.o" => "\\otimes",
+    "times.o.big" => "\\bigotimes",
+    "times.square" => "\\boxtimes",
+    "trademark" => "texttrademark",
+    "triangle.b" => "bigtriangledown",
+    "triangle.filled.b" => "\\blacktriangledown",
+    "triangle.filled.l" => "\\blacktriangleleft",
+    "triangle.filled.r" => "\\blacktriangleright",
+    "triangle.filled.t" => "\\blacktriangle",
+    "triangle.l" => "triangleleft",
+    "triangle.r" => "triangleright",
+    "triangle.stroked.b" => "\\triangledown",
+    "triangle.stroked.l" => "\\triangleleft",
+    "triangle.stroked.r" => "\\triangleright",
+    "triangle.stroked.small.t" => "\\vartriangle",
+    "triangle.stroked.t" => "\\triangle",
+    "triangle.t" => "bigtriangleup",
+    "union" => "cup",
+    "union.big" => "bigcup",
+    "union.dot" => "\\cupdot",
+    "union.double" => "\\Cup",
+    "union.plus" => "\\uplus",
+    "union.sq" => "sqcup",
+    "union.sq.big" => "bigsqcup",
+    "upsilon" => "upsilon",
+    "vec" => "vec",
+    "vert" => "vert",
+    "vert.double" => "Vert",
+    "without" => "\\setminus",
+    "wp" => "wp",
+    "wreath" => "wr",
+    "xi" => "xi",
+    "xor" => "\\oplus",
+    "xor.big" => "\\bigoplus",
+    "yen" => "textyen",
+    "zeta" => "zeta",
+    "|->" => "mapsto",
+    "|=>" => "Mapsto",
+    "||" => "|",
+    "~>" => "rightsquigarrow",
+    "~~>" => "leadsto",
 };
 
 // =============================================================================
@@ -2705,49 +2231,38 @@ pub static TYPST_TO_TEX: phf::Map<&'static str, &'static str> = phf_map! {
 /// Key: Typst representation (symbol name or Unicode char)
 /// Value: LaTeX output string
 pub static DELIMITER_MAP: phf::Map<&'static str, &'static str> = phf_map! {
-    // Parentheses
     "(" => "(",
     ")" => ")",
-    "paren.l" => "(",
-    "paren.r" => ")",
-    // Brackets
     "[" => "[",
     "]" => "]",
-    "bracket.l" => "[",
-    "bracket.r" => "]",
-    // Braces
-    "{" => "\\{",
-    "}" => "\\}",
+    "angle.l" => "\\langle",
+    "angle.r" => "\\rangle",
+    "bar.v" => "|",
+    "bar.v.double" => "\\|",
     "brace.l" => "\\{",
     "brace.r" => "\\}",
-    // Single bars
-    "|" => "|",
-    "bar.v" => "|",
+    "bracket.l" => "[",
+    "bracket.r" => "]",
+    "ceil.l" => "\\lceil",
+    "ceil.r" => "\\rceil",
+    "chevron.l" => "\\langle",
+    "chevron.r" => "\\rangle",
+    "floor.l" => "\\lfloor",
+    "floor.r" => "\\rfloor",
+    "paren.l" => "(",
+    "paren.r" => ")",
     "vert" => "|",
-    // Double bars
-    "||" => "\\|",
-    "bar.v.double" => "\\|",
     "vert.double" => "\\|",
-    // Angle brackets (Unicode)
+    "{" => "\\{",
+    "|" => "|",
+    "||" => "\\|",
+    "}" => "\\}",
+    "⌈" => "\\lceil",
+    "⌉" => "\\rceil",
+    "⌊" => "\\lfloor",
+    "⌋" => "\\rfloor",
     "⟨" => "\\langle",
     "⟩" => "\\rangle",
     "〈" => "\\langle",
     "〉" => "\\rangle",
-    // Angle brackets (Typst names)
-    "angle.l" => "\\langle",
-    "angle.r" => "\\rangle",
-    "chevron.l" => "\\langle",
-    "chevron.r" => "\\rangle",
-    // Floor (Unicode)
-    "⌊" => "\\lfloor",
-    "⌋" => "\\rfloor",
-    // Floor (Typst names)
-    "floor.l" => "\\lfloor",
-    "floor.r" => "\\rfloor",
-    // Ceiling (Unicode)
-    "⌈" => "\\lceil",
-    "⌉" => "\\rceil",
-    // Ceiling (Typst names)
-    "ceil.l" => "\\lceil",
-    "ceil.r" => "\\rceil",
 };

@@ -2732,6 +2732,110 @@ mod l2t_document {
         );
     }
 
+    /// Read a `NAME = { "key": "value", ... }` table out of the generator.
+    ///
+    /// Both Python quote styles appear (the imported tables use the other one
+    /// from the hand-written ones), and a `#` only starts a comment outside a
+    /// string -- `"hspace": "#h"` must not lose the rest of its line.
+    fn python_table(generator: &str, name: &str) -> std::collections::HashMap<String, String> {
+        let body = generator
+            .split_once(&format!("\n{name} = {{"))
+            .and_then(|(_, rest)| rest.split_once("\n}"))
+            .map(|(body, _)| body)
+            .unwrap_or_else(|| panic!("generator table `{name}` should be present"));
+
+        let mut table = std::collections::HashMap::new();
+        for line in body.lines() {
+            let mut rest = line;
+            let mut pending_key: Option<&str> = None;
+            while let Some(open) = rest.find(['"', '\'', '#']) {
+                let quote = rest.as_bytes()[open] as char;
+                if quote == '#' {
+                    break;
+                }
+                let Some((text, after)) = rest[open + 1..].split_once(quote) else {
+                    break;
+                };
+                match pending_key.take() {
+                    Some(key) => {
+                        table.insert(key.to_string(), text.to_string());
+                    }
+                    None if after.trim_start().starts_with(':') => pending_key = Some(text),
+                    None => {}
+                }
+                rest = after;
+            }
+        }
+        table
+    }
+
+    /// The KEYS of a generator table, whatever its values look like.
+    ///
+    /// [`python_table`] pairs a key with a following quoted value, so it drops
+    /// keys whose value is not a string -- `{"acute": 1}` would come back
+    /// empty. Callers that only need the names use this instead.
+    fn python_table_keys(generator: &str, name: &str) -> std::collections::HashSet<String> {
+        let (opener, closer) = if generator.contains(&format!("\n{name} = {{")) {
+            (" = {", "\n}")
+        } else {
+            (" = [", "\n]")
+        };
+        let body = generator
+            .split_once(&format!("\n{name}{opener}"))
+            .and_then(|(_, rest)| rest.split_once(closer))
+            .map(|(body, _)| body)
+            .unwrap_or_else(|| panic!("generator table `{name}` should be present"));
+        let keyed = opener == " = {";
+
+        let mut keys = std::collections::HashSet::new();
+        for line in body.lines() {
+            let mut rest = line;
+            while let Some(open) = rest.find(['"', '\'', '#']) {
+                let quote = rest.as_bytes()[open] as char;
+                if quote == '#' {
+                    break;
+                }
+                let Some((text, after)) = rest[open + 1..].split_once(quote) else {
+                    break;
+                };
+                if !keyed || after.trim_start().starts_with(':') {
+                    keys.insert(text.to_string());
+                }
+                rest = after;
+            }
+        }
+        keys
+    }
+
+    /// `"key" => "value",` from a Rust `phf_map!` body, honouring `\"`.
+    fn rust_phf_entry(line: &str) -> Option<(&str, &str)> {
+        let line = line.trim();
+        let rest = line.strip_prefix('"')?;
+        let mut end = None;
+        let bytes = rest.as_bytes();
+        for (i, b) in bytes.iter().enumerate() {
+            if *b == b'"' && (i == 0 || bytes[i - 1] != b'\\') {
+                end = Some(i);
+                break;
+            }
+        }
+        let key = &rest[..end?];
+        let after = rest[end? + 1..]
+            .trim_start()
+            .strip_prefix("=>")?
+            .trim_start();
+        let value_rest = after.strip_prefix('"')?;
+        let vbytes = value_rest.as_bytes();
+        let mut vend = None;
+        for (i, b) in vbytes.iter().enumerate() {
+            if *b == b'"' && (i == 0 || vbytes[i - 1] != b'\\') {
+                vend = Some(i);
+                break;
+            }
+        }
+        Some((key, &value_rest[..vend?]))
+    }
+
     /// `maps.rs` declares most command shapes through local closures rather
     /// than spelling the pattern out. The generator/`maps.rs` guards have to
     /// expand them or they compare only a fraction of the table.
@@ -2787,6 +2891,62 @@ mod l2t_document {
         assert!(out.contains("<knuth84>"), "entry anchor:\n{out}");
         assert!(out.contains("@knuth84"), "citation:\n{out}");
         assert_compiles_with_real_typst(&out);
+    }
+
+    /// `GLOB_ARG_COMMANDS` had no guard at all, and it is the one table whose
+    /// emission depends on recognising the pattern: a shape with no matching
+    /// closure used to be skipped, so adding one would have left the generator
+    /// exiting 0 with the command missing from the map.
+    ///
+    /// Compared in BOTH directions. The other guards only ask whether every
+    /// `maps.rs` entry is known to the generator, which cannot see an entry the
+    /// generator declares and never emits.
+    #[test]
+    fn glob_arg_commands_match_the_generator() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let generator = std::fs::read_to_string(root.join("tools/gen_maps.py"))
+            .expect("tools/gen_maps.py should be readable");
+        let maps = std::fs::read_to_string(root.join("src/data/maps.rs"))
+            .expect("src/data/maps.rs should be readable");
+
+        let mut from_generator: Vec<(String, String)> =
+            python_table(&generator, "GLOB_ARG_COMMANDS")
+                .into_iter()
+                .collect();
+        assert!(
+            from_generator.len() > 5,
+            "failed to parse GLOB_ARG_COMMANDS, got: {from_generator:?}"
+        );
+
+        let names: std::collections::HashSet<&str> =
+            from_generator.iter().map(|(n, _)| n.as_str()).collect();
+        let mut from_maps: Vec<(String, String)> = Vec::new();
+        for chunk in maps.split("m.insert(\"").skip(1) {
+            let Some((name, rest)) = chunk.split_once("\".to_string(), ") else {
+                continue;
+            };
+            if !names.contains(name) {
+                continue;
+            }
+            let glob = GLOB_SHORTHANDS
+                .iter()
+                .find(|(shorthand, _)| rest.starts_with(&format!("{shorthand}()")))
+                .map(|(_, glob)| (*glob).to_string())
+                .or_else(|| {
+                    rest.split_once("GlobStr::from(\"")
+                        .and_then(|(_, after)| after.split_once('"'))
+                        .map(|(glob, _)| glob.to_string())
+                })
+                .unwrap_or_else(|| "<not a glob>".to_string());
+            from_maps.push((name.to_string(), glob));
+        }
+
+        from_generator.sort();
+        from_maps.sort();
+        assert_eq!(
+            from_generator, from_maps,
+            "tools/gen_maps.py and src/data/maps.rs disagree about glob-argument commands"
+        );
     }
 
     /// Every command `maps.rs` declares must be declared by the generator too.
@@ -2874,6 +3034,19 @@ mod l2t_document {
             declared.len()
         );
 
+        // Every insert in `maps.rs` must be a literal one, or the guards above
+        // read past it in silence: the slanted-Greek block used to be a runtime
+        // `for` loop, and its 11 entries were invisible to all of them.
+        let literal_inserts = maps.matches("m.insert(\"").count();
+        let all_inserts = maps.matches("m.insert(").count();
+        assert_eq!(
+            literal_inserts,
+            all_inserts,
+            "{} insert(s) in src/data/maps.rs do not name their command literally, \
+             so the generator guards cannot see them",
+            all_inserts - literal_inserts
+        );
+
         let mut missing: Vec<&str> = maps
             .split("m.insert(\"")
             .skip(1)
@@ -2892,6 +3065,108 @@ mod l2t_document {
         );
     }
 
+    /// The name guards cannot see a drifted VALUE. A symbol whose alias, or a
+    /// `TYPST_TO_TEX`/`DELIMITER_MAP` entry whose target, differs between the
+    /// two files is as much a regression as a missing one -- regenerating
+    /// would silently replace one with the other.
+    #[test]
+    fn mapping_values_match_the_generator() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let generator = std::fs::read_to_string(root.join("tools/gen_maps.py"))
+            .expect("tools/gen_maps.py should be readable");
+        let maps = std::fs::read_to_string(root.join("src/data/maps.rs"))
+            .expect("src/data/maps.rs should be readable");
+
+        let mut mismatches: Vec<String> = Vec::new();
+
+        // Symbol aliases: `alias: Some("x".to_string())` against SYMBOL_MAP.
+        // A command that also takes arguments is emitted from the arity table
+        // WITHOUT an alias -- the generator skips it in the symbol loop -- so
+        // the accents (`\bar`, `\dot`, ...) are aliasless here by design.
+        let mut symbols = python_table(&generator, "SYMBOL_MAP");
+        for arg_command in python_table_keys(&generator, "COMMANDS_WITH_ARGS") {
+            symbols.remove(&arg_command);
+        }
+        // A few entries are written by hardcoded emitter fragments rather than
+        // from a table, and carry their own alias (`typstcite`). Those win.
+        for chunk in generator.split("m.insert(\"").skip(1) {
+            let Some((name, rest)) = chunk.split_once('"') else {
+                continue;
+            };
+            let fragment = &rest[..rest.len().min(400)];
+            match fragment
+                .split_once("alias: Some(\"")
+                .and_then(|(_, after)| after.split_once('"'))
+            {
+                Some((alias, _)) => {
+                    symbols.insert(name.to_string(), alias.to_string());
+                }
+                None => {
+                    symbols.remove(name);
+                }
+            }
+        }
+        for chunk in maps.split("m.insert(\"").skip(1) {
+            let Some((name, rest)) = chunk.split_once("\".to_string(), ") else {
+                continue;
+            };
+            let head = &rest[..rest.len().min(300)];
+            let alias = head
+                .split_once("alias: Some(\"")
+                .and_then(|(_, after)| after.split_once('"'))
+                .map(|(alias, _)| alias)
+                .or_else(|| {
+                    head.split_once("cmd0(Some(\"")
+                        .and_then(|(_, after)| after.split_once('"'))
+                        .map(|(alias, _)| alias)
+                });
+            // Compared in BOTH directions: an alias that was deleted on one
+            // side (`Some("x")` becoming `None`) is a drift too, and skipping
+            // the pair whenever either half is absent hides exactly that.
+            match (alias, symbols.get(name).map(String::as_str)) {
+                (Some(a), Some(d)) if a == d => {}
+                (None, None) => {}
+                (a, d) => mismatches.push(format!("SYMBOL_MAP[{name}]: {d:?} vs {a:?}")),
+            }
+        }
+
+        // Both phf tables, compared entry for entry.
+        for table in ["TYPST_TO_TEX", "DELIMITER_MAP"] {
+            let declared = python_table(&generator, table);
+            let Some(body) = maps
+                .split_once(&format!("pub static {table}: phf::Map"))
+                .and_then(|(_, rest)| rest.split_once("\n};"))
+                .map(|(body, _)| body)
+            else {
+                panic!("`{table}` should be present in src/data/maps.rs");
+            };
+            let mut seen = 0usize;
+            for line in body.lines() {
+                let Some((key, value)) = rust_phf_entry(line) else {
+                    continue;
+                };
+                seen += 1;
+                match declared.get(key) {
+                    Some(d) if d == value => {}
+                    Some(d) => mismatches.push(format!("{table}[{key:?}]: {d:?} vs {value:?}")),
+                    None => mismatches.push(format!("{table}[{key:?}] missing from the generator")),
+                }
+            }
+            assert!(
+                seen > 30,
+                "failed to parse `{table}` from maps.rs, saw {seen}"
+            );
+        }
+
+        mismatches.sort();
+        assert!(
+            mismatches.is_empty(),
+            "{} mapping value(s) differ between tools/gen_maps.py and src/data/maps.rs: {:?}",
+            mismatches.len(),
+            &mismatches[..mismatches.len().min(10)]
+        );
+    }
+
     /// Commands shaped `\cmd[optional]{required}` are emitted with a glob, not
     /// an arity, so the arity guard above cannot see them. They need the same
     /// protection: `\sqrt` already carried a fixed arity of 1 in the generator
@@ -2905,13 +3180,14 @@ mod l2t_document {
         let maps = std::fs::read_to_string(root.join("src/data/maps.rs"))
             .expect("src/data/maps.rs should be readable");
 
-        // The pattern the generator emits for every command in the list.
+        // The pattern every command in the list gets. They are emitted through
+        // the `cmd1_opt` closure, so the pattern is that closure's glob.
         let pattern = generator
-            .split_once("for cmd in OPTIONAL_ARG_COMMANDS:")
+            .split_once("let cmd1_opt = ||")
             .and_then(|(_, rest)| rest.split_once("GlobStr::from(\""))
             .and_then(|(_, rest)| rest.split_once('"'))
             .map(|(pattern, _)| pattern.to_string())
-            .expect("the emitted glob pattern should be readable");
+            .expect("the `cmd1_opt` glob pattern should be readable");
 
         let table = generator
             .split_once("OPTIONAL_ARG_COMMANDS = [")
