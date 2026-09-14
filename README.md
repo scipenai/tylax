@@ -77,7 +77,7 @@ from the input alone, so this is an explicit choice rather than a guess.
 Add to `Cargo.toml`:
 ```toml
 [dependencies]
-tylax = "0.3.7"
+tylax = "0.3.8"
 ```
 
 ```rust

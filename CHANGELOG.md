@@ -7,38 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-09-14
+
 ### Fixed
-- **L2T literal text**: `verbatim`/`Verbatim`/`lstlisting` bodies and inline `\verb` are shielded from LaTeX interpretation and emitted as Typst raw, so a `tikzpicture` shown as an example stays literal instead of becoming live CeTZ. `\begin`/`\end` accept the TeX-ignorable separators (whitespace and `%` comments) that may sit before `{env}`.
-- **L2T diagnostics**: environment-balance checking handles whichever of `\begin`/`\end` appears first, so a repeated environment name no longer reports a false "unclosed environment" (#38). Comments, `\verb` spans and verbatim bodies are masked before every scan, so literal text cannot fake an imbalance.
-- **L2T argument binding**: every command and environment now consumes its own optional arguments, so a literal `[` `]` in body text is emitted as typed instead of being mistaken for a slot. `\documentclass[12pt]{book}` reads the class, `minipage`/`tabular*`/`multicols` read past their optional slots, and `%` comments count as trivia before an argument, so `\SI{47}% note` + `{\metre}` still binds the unit and `\% note` + `[6pt]` is still a row spacing.
-- **L2T sectioning**: starred forms (`\section*` through `\subparagraph*`, `\chapter*`, `\part*`) emit unnumbered headings. mitex's argument patterns have no star kind, so the `*` was being bound as the title.
-- **L2T math arguments**: accent, root and fraction arguments are converted as math whatever the surrounding mode, so the document path no longer emits `arrow(PC)` or `AB/CD` -- single Typst variables that fail to compile -- instead of `arrow(P C)` and `(A B)/(C D)`.
-- **L2T sized delimiters**: matched `\big|`/`\big\|` pairs become `abs(..)`/`norm(..)`, and a delimiterless matrix between them stays a determinant rather than collapsing to a scalar. Plain `|`/`\vert` are untouched. Plain TeX's `\cal` is handled as a declaration scoped to its group, not as an argument-taking `\mathcal{..}`.
-- **L2T figures**: `figure`/`subfigure` bodies keep tikzpictures, tabulars and prose. Only `\includegraphics` was recognised, so everything else was silently dropped (#39, #44).
-- **L2T tables**: `\cmidrule`/`\cline` column ranges are preserved, a source declaring its own rules switches off Typst's default full grid, and `|` separators from the column spec become `table.vline`. `||` is reported as a downgrade rather than silently drawn as one line (#43).
-- **L2T lists**: a nested list stays nested. The blank line emitted before every list ended the parent list too, flattening the structure (#43).
-- **L2T equation labels**: a label nested in `aligned`/`split` names the enclosing equation and is emitted once, outside the math body (#43).
-- **L2T citations**: with a manual `thebibliography`, `\cite{k}` resolves to `@k` against the rendered entry anchors, which compiles. Typst's `#cite(..)` needs a real `#bibliography(..)` that the manual path never emits, so the output previously failed with "the document does not contain a bibliography". Documents using external BibTeX keep `#cite(..)` unchanged (#37).
-- **L2T references**: `\eqref{k}` targets the label the document actually defines -- an injected `eq-` prefix pointed at a label that was never created -- and renders as `(2)` without Typst re-inserting a supplement the author already wrote (#43).
-- **TikZ**: `\node[draw, ...]` emits a CeTZ `rect` only for a genuine rectangle with concrete dimensions at an absolute position. A circle, an ellipse, rounded corners or any option the converter does not understand falls back to a label-only `content`, instead of drawing a box the source never asked for (#39). Repeated options take their last value, as TikZ applies them, and `draw=none` is treated as the mode switch it is rather than as a stroke colour.
-- **T2L references**: a bare `@sec-one` becomes `Section~\ref{sec-one}`. Typst renders the supplement word from the kind of element a label is attached to and the source never writes it, so converting to a plain `\ref` silently turned "See Section 1" into "See 1" (#43). The word is recovered from what the label actually points at; an unknown target is left bare rather than given an invented word.
-- **CLI**: nested lists keep their indentation through `pretty_print`, which previously re-derived it from brace depth and flattened them.
-- **L2T numbers**: a multi-digit number or decimal stays one literal in math (`120`, `0.008`, `x_{16}`). Adjacent letters really are separate symbols, so `AB` still splits into `A B`, but applying that to digits rendered `120` as three numerals side by side.
-- **L2T symbols**: `\textcircled{\cdot}` maps to `dot.o`, and the other circled operators to `plus.o` / `minus.o` / `times.o` / `slash.o`. Anything Typst has no circled form of still falls back to the content alone.
-- **L2T diagnostics**: the two repairs the math cleanup applies to `_`/`^` attachments are reported, each from the rewrite actually performed. An empty base inserted where Typst requires one (`$^{2}$`, `$(^{2})$`) changes nothing semantically -- LaTeX accepts a missing base, TeX supplies an empty atom -- but usually means the source lost a base upstream. A flattened nested script (`x_{_{y}}` to `x_(y)`) is reported separately, because it loses a level of lowering. Neither fires where no repair happened: `a + ^{2}` and `\left\langle ^{2}\right.` are silent.
-- **T2L references**: `@target[supplement]` is read as a supplement rather than as part of the label. The whole `@..[..]` was taken as the target, so `@sec-one[p. 5]` became `\ref{sec-one[p. 5]}` -- a reference resolving to nothing. A supplement is content and is converted as such, so `@sec-one[*Custom*]` gives `\textbf{Custom}~\ref{sec-one}`; it replaces the automatic word for a label and becomes the postnote for a bibliography key (`\cite[p. 5]{smith2020}`). An explicit EMPTY supplement is preserved as the distinct instruction it is: `@sec-one[]` renders the bare number in Typst, so it converts to a plain `\ref{sec-one}` with no word, and `@key[]` to `\cite{key}` with no postnote.
-- **T2L grids**: `#grid` converts through the same cell model as `#table`, so `#grid(columns: 2, [a], [b], [c], [d])` keeps its cells instead of collapsing into one `minipage` holding `abcd`. `#grid` does not stroke, so no rules are added; `#columns(n)[..]`, a multi-column page layout rather than a cell grid, keeps its own conversion.
-- **L2T tables**: a `table` float keeps the prose, notes and extra content around its `tabular`. Only `\caption`, `\label` and the `tabular` child were recognised, so everything else was dropped -- the same defect `figure` had.
-- **L2T bibliography**: `thebibliography` entries render as left-aligned hanging-indent rows instead of centred figure captions, which had put the entry number alone on its own line above centred body text. Entries stay `#figure`s so `@key` still resolves.
+- **L2T full documents**: `figure`/`table` floats keep every part of their body, nested lists stay nested, starred sectioning commands emit unnumbered headings, and `align` row labels survive outside the math body.
+- **L2T arguments**: every command and environment consumes its own optional arguments, so a literal `[` `]` in body text survives. `%` comments count as trivia before an argument, keeping siunitx units and `@[6pt]` row spacing intact.
+- **L2T literal text**: `verbatim`/`lstlisting` bodies and inline `\verb` are emitted as Typst raw instead of being interpreted, and `check` no longer reports a false "unclosed environment" on a repeated name.
+- **L2T math**: multi-digit numbers stay whole (`120`, not `1 2 0`); accent, root and fraction arguments render as math on every path; matched `\big|` pairs become `abs(..)`/`norm(..)`; `\textcircled{\cdot}` maps to `dot.o`.
+- **L2T citations**: `\cite{k}` against a manual `thebibliography` resolves to `@k` and compiles, entries render as left-aligned rows rather than centred captions, and `\eqref` targets the label the document actually defines. An external `\bibliography` still emits no `#bibliography(...)`, so only the manual path is reconciled.
+- **T2L references**: a bare `@sec-one` becomes `Section~\ref{sec-one}`, recovering the supplement Typst renders automatically, and `@target[supplement]` is read as a supplement rather than as part of the label.
+- **T2L tables**: empty cells keep their position, and `#grid` converts through the table cell model instead of collapsing into a single `minipage`.
+- **TikZ**: `\node[draw, ...]` emits a CeTZ `rect` only for a genuine rectangle; other shapes fall back to `content` rather than an invented box.
+- **CLI**: `--pretty` no longer re-flows indentation, which is semantic in Typst.
 
 ### Added
-- **T2L directives**: `//! tylax: ignore-next-line`, `ignore-begin` and `ignore-end` drop source regions from conversion. Only a genuine Typst line comment counts, so the markers stay literal inside raw blocks and strings.
-- **T2L file API**: `typst_file_to_latex_with_options` / `typst_file_to_latex_with_diagnostics` resolve bare `@key` citations from literal sibling BibTeX files named by `#bibliography("...")`. A bare `@target` is a cross-reference or a citation depending on the completed document, so this needs the filesystem; the string and WASM APIs have no implicit file access and conservatively keep such targets as references.
-- **CLI**: `--math` (alias `--math-only`) selects the math pipeline for a bare formula, and is rejected -- not silently ignored -- when the resolved direction is Typst -> LaTeX, which has no counterpart. Document mode emits a letter run as written, because in prose `AB` is the text "AB"; math mode splits it into atoms (`A B`), which is what Typst math requires. The two cannot be decided from the input alone, so this is an explicit choice rather than a guess.
-- **Web**: LaTeX document detection is verbatim- and comment-aware, so `\verb|\begin{document}|` is no longer misrouted to the full-document converter.
-
-### Known limitations
-- An external bibliography (`\bibliography{refs}`, `\addbibresource`) still emits no `#bibliography(...)`, so `#cite(...)` in that output does not compile on its own. Only the manual `thebibliography` path is fully reconciled.
+- **CLI**: `--math` selects the math pipeline for a bare formula, and is rejected when the resolved direction is Typst -> LaTeX.
+- **T2L**: `//! tylax: ignore-next-line` / `ignore-begin` / `ignore-end` directives, and file-oriented entry points that resolve bare `@key` citations from sibling BibTeX files.
+- **Web**: LaTeX document detection is verbatim- and comment-aware.
 
 ## [0.3.7] - 2026-07-18
 
@@ -181,7 +166,8 @@ This release is a major overhaul of the core conversion logic, introducing prope
 - CLI tool (`t2l`)
 - Structured error handling with warnings
 
-[Unreleased]: https://github.com/scipenai/tylax/compare/v0.3.7...HEAD
+[Unreleased]: https://github.com/scipenai/tylax/compare/v0.3.8...HEAD
+[0.3.8]: https://github.com/scipenai/tylax/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/scipenai/tylax/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/scipenai/tylax/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/scipenai/tylax/compare/v0.3.4...v0.3.5
