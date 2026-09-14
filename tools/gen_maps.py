@@ -198,17 +198,19 @@ ENVIRONMENT_SIGNATURES = {
 # Commands shaped `\cmd[optional]{required}`. A fixed arity cannot express the
 # optional argument: the parser then binds nothing at all and BOTH arguments
 # degrade to body text. They are emitted with a glob pattern instead.
-SECTIONING_COMMANDS = [
+OPTIONAL_ARG_COMMANDS = [
     "part", "chapter", "section", "subsection", "subsubsection",
     "paragraph", "subparagraph",
     # `\caption[short]{long}` — the short form is a list-of-figures entry.
     "caption",
+    # `\sqrt[n]{x}` has the same shape; a fixed arity of 1 would drop the index.
+    "sqrt",
 ]
 
 COMMANDS_WITH_ARGS = {
     # Document structure (1 arg)
     # NOTE: the sectioning commands are NOT here — they take an optional
-    # `[short title]` that a fixed arity cannot express. See SECTIONING_COMMANDS.
+    # `[short title]` that a fixed arity cannot express. See OPTIONAL_ARG_COMMANDS.
     "title": 1, "author": 1, "date": 1, "label": 1,
     
     # Macro definitions (2 args)
@@ -238,15 +240,33 @@ COMMANDS_WITH_ARGS = {
     "mathopen": 1, "mathclose": 1, "mathpunct": 1, "mathinner": 1,
     
     # Misc math (1 arg)
+    # `textcircled` must stay here: without a pattern mitex leaves `{..}` as a
+    # following sibling instead of binding it, and the converter can no longer
+    # see the operator it wraps, so `\textcircled{\cdot}` loses its circle.
     "pmod": 1, "pod": 1, "displaylines": 1, "set": 1, "Set": 1,
-    "sqrt": 1, "not": 1, "phantom": 1, "cancel": 1, "bcancel": 1,
+    "not": 1, "phantom": 1, "cancel": 1, "bcancel": 1,
     "boxed": 1, "fbox": 1, "hspace": 1, "hspace*": 1, "vspace": 1, "vspace*": 1,
+    "textcircled": 1,
     
     # Fractions and roots (2 args)
     "frac": 2, "dfrac": 2, "tfrac": 2, "cfrac": 2, "binom": 2,
     
-    # Colors (1-2 args)
-    "textcolor": 2, "colorbox": 2, "color": 1,
+    # Colors (1-3 args)
+    "textcolor": 2, "colorbox": 2, "color": 1, "fcolorbox": 3,
+    "highlight": 1, "hl": 1,
+
+    # Table cell spans (3 args)
+    "multicolumn": 3, "multirow": 3,
+
+    # Bibliography entry: `ibitem{key}`
+    "bibitem": 1,
+
+    # Extensible arrow variants (1 arg)
+    "xLeftarrow": 1, "xLeftrightarrow": 1, "xRightarrow": 1,
+    "xhookleftarrow": 1, "xhookrightarrow": 1, "xleftharpoondown": 1,
+    "xleftharpoonup": 1, "xleftrightharpoons": 1, "xlongequal": 1,
+    "xrightharpoondown": 1, "xrightharpoonup": 1, "xrightleftharpoons": 1,
+    "xtofrom": 1, "xtwoheadleftarrow": 1, "xtwoheadrightarrow": 1,
     
     # Links (1-2 args)
     "url": 1, "href": 2,
@@ -385,7 +405,7 @@ def generate_rust_code():
     # These take an optional `[..]` before the required argument, so a fixed
     # arity would leave the `[..]` unconsumed: the parser then binds no argument
     # at all and the whole construct degrades to body text.
-    for cmd in SECTIONING_COMMANDS:
+    for cmd in OPTIONAL_ARG_COMMANDS:
         lines.append(f'        m.insert("{cmd}".to_string(), CommandSpecItem::Cmd(CmdShape {{')
         lines.append('            args: ArgShape::Right { pattern: ArgPattern::Glob { pattern: GlobStr::from("{,b}t") } },')
         lines.append('            alias: None,')

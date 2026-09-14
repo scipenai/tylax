@@ -9,6 +9,7 @@ use mitex_spec_gen::DEFAULT_SPEC;
 use rowan::ast::AstNode;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use crate::data::constants::{AcronymDef, GlossaryDef};
 use crate::data::extended_symbols::EXTENDED_SYMBOLS;
@@ -527,6 +528,9 @@ pub struct LatexConverter {
     pub(crate) siunitx_arg_collector: Option<PendingSiunitx>,
     /// A starred sectioning command whose title has not been reached yet.
     pub(crate) pending_section: Option<PendingSection>,
+
+    /// Repairs the math cleanup applied to `_`/`^` attachments.
+    pub(crate) attachment_repairs: AttachmentRepairs,
 }
 
 /// A `ClauseArgument` is a *required* argument iff it does not carry an
@@ -777,28 +781,49 @@ fn resolve_sized_delimiter_pair(
     output
 }
 
-/// Number of `_`/`^` attachments in `output` that have nothing to attach to.
+/// Repairs the math cleanup applied to `_`/`^` attachments, so the converter
+/// can report what it actually changed.
 ///
-/// Counts both shapes the converter can produce: one the math repair already
-/// gave an empty base (`""^(..)`, which compiles), and one still base-less
-/// (`^(..)` opening an expression, which does not). Both mean the same thing
-/// about the SOURCE -- a script with no operand, which LaTeX rejects too -- so
-/// they are reported together.
-fn baseless_attachment_count(output: &str) -> usize {
-    let bytes = output.as_bytes();
-    let mut count = 0;
-    for (i, window) in bytes.windows(2).enumerate() {
-        if !matches!(window, [b'_', b'('] | [b'^', b'(']) {
-            continue;
-        }
-        let before = output[..i].trim_end();
-        // An EMPTY `""` is the repair's own base; a non-empty `"foo"` is real
-        // `\text{..}` content, so only the exact empty pair counts.
-        if before.is_empty() || before.ends_with('(') || before.ends_with("\"\"") {
-            count += 1;
-        }
+/// Counted at the point of repair rather than predicted from the tree: whether
+/// Typst needs a base cannot be decided from the LaTeX shape. `^{2}` needs one,
+/// but `\left\langle ^{2}\right.` renders as `lr(chevron.l^(2))`, where the
+/// delimiter serves as the base and nothing is inserted. Only the rewrite
+/// itself knows.
+///
+/// Interior mutability is needed because the rewrites run inside
+/// `postprocess_math` / `cleanup_math_spacing`, public `&self` methods whose
+/// signatures are fixed for 0.3.x, while the report is emitted by the
+/// `&mut self` finalizer.
+///
+/// ATOMICS, not `Cell`: `LatexConverter` is public, so its auto traits are part
+/// of the API. A `Cell` here would silently take away its `Sync` impl and break
+/// any downstream `Arc<LatexConverter>` or `T: Sync` bound. `Relaxed` is enough
+/// -- these are independent tallies that order nothing else.
+#[derive(Debug, Default)]
+pub(crate) struct AttachmentRepairs {
+    empty_bases: AtomicUsize,
+    nested_collapsed: AtomicUsize,
+}
+
+impl AttachmentRepairs {
+    /// An empty `""` base was inserted before a script Typst would reject.
+    fn note_empty_base(&self) {
+        self.empty_bases.fetch_add(1, AtomicOrdering::Relaxed);
     }
-    count
+
+    /// A `_(_(X))` wrapper was flattened to `_(X)`, losing one level of
+    /// lowering: a downgrade, not a neutral cleanup.
+    fn note_nested_collapsed(&self) {
+        self.nested_collapsed.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// Read and clear both counters.
+    fn take(&self) -> (usize, usize) {
+        (
+            self.empty_bases.swap(0, AtomicOrdering::Relaxed),
+            self.nested_collapsed.swap(0, AtomicOrdering::Relaxed),
+        )
+    }
 }
 
 /// Split a math word into Typst atoms, separated by spaces.
@@ -1438,6 +1463,7 @@ impl LatexConverter {
             citations: CitationSession::default(),
             siunitx_arg_collector: None,
             pending_section: None,
+            attachment_repairs: AttachmentRepairs::default(),
         }
     }
 
@@ -1451,6 +1477,7 @@ impl LatexConverter {
             citations: CitationSession::default(),
             siunitx_arg_collector: None,
             pending_section: None,
+            attachment_repairs: AttachmentRepairs::default(),
         }
     }
 
@@ -1597,6 +1624,7 @@ impl LatexConverter {
         self.citations = CitationSession::default();
         self.siunitx_arg_collector = None;
         self.pending_section = None;
+        self.attachment_repairs.take();
     }
 
     /// Convert a complete LaTeX document to Typst
@@ -1637,7 +1665,7 @@ impl LatexConverter {
         // Report the backend, then resolve the markers; both before `build_document`.
         self.finalize_bibliography_diagnostics();
         let output = self.resolve_citations(&output);
-        self.warn_baseless_attachments(&output);
+        self.warn_attachment_repairs();
 
         // Build final document with preamble
         let mut result = self.build_document(output);
@@ -1678,26 +1706,40 @@ impl LatexConverter {
 
         // Post-process
         let output = self.postprocess_math(output);
-        self.warn_baseless_attachments(&output);
+        self.warn_attachment_repairs();
         output
     }
 
-    /// Report each `_`/`^` the math repair had to give an empty base.
+    /// Report the repairs the math cleanup applied to `_`/`^` attachments.
     ///
-    /// A superscript or subscript with nothing to attach to is already invalid
-    /// LaTeX, so there is no correct reading to recover: guessing a base, or
-    /// demoting the marker to text, would silently invent content. The repair
-    /// only makes the output compile; this says the source needs fixing.
-    fn warn_baseless_attachments(&mut self, output: &str) {
-        let count = baseless_attachment_count(output);
-        if count == 0 {
-            return;
+    /// Reported separately because they are different events. Inserting an
+    /// empty base changes nothing semantically -- it satisfies a Typst rule
+    /// that LaTeX does not have -- while flattening a nested script loses a
+    /// level of lowering. Neither says the source is invalid: TeX supplies an
+    /// empty atom, so `$^{2}$` compiles under pdfTeX. They say what the
+    /// converter changed, which for OCR input is usually a base that went
+    /// missing upstream.
+    fn warn_attachment_repairs(&mut self) {
+        let (empty_bases, nested_collapsed) = self.attachment_repairs.take();
+
+        if empty_bases > 0 {
+            self.warn_repair(format!(
+                "{empty_bases} subscript/superscript given an empty base, \
+                 which Typst requires and LaTeX does not. The source is valid \
+                 either way, so check whether it lost a base upstream."
+            ));
         }
-        let message = format!(
-            "{count} subscript/superscript without a base; \
-             LaTeX requires an operand before `_` or `^`. \
-             Check the source: the converter cannot tell what it was meant to attach to."
-        );
+        if nested_collapsed > 0 {
+            self.warn_repair(format!(
+                "{nested_collapsed} nested subscript/superscript flattened \
+                 (`x_{{_{{y}}}}` -> `x_(y)`). Typst has no equivalent, so one \
+                 level of lowering is lost."
+            ));
+        }
+    }
+
+    /// Record a repair notice on both warning sinks.
+    fn warn_repair(&mut self, message: String) {
         self.state.warnings.push(message.clone());
         self.state
             .add_warning(ConversionWarning::new(WarningKind::ParseError, message));
@@ -2773,6 +2815,7 @@ impl LatexConverter {
                     // Pure wrapper: the inner group's ')' is immediately
                     // followed by the outer ')'.
                     if inner_close + 1 == outer_close {
+                        self.attachment_repairs.note_nested_collapsed();
                         let inner_content = result[inner_open + 1..inner_close].to_string();
                         let replacement = format!("{op}({inner_content})");
                         result = format!(
@@ -2803,6 +2846,7 @@ impl LatexConverter {
                 && chars.peek() == Some(&'(')
                 && matches!(last_nonspace, None | Some('('))
             {
+                self.attachment_repairs.note_empty_base();
                 out.push_str("\"\"");
                 last_nonspace = Some('"');
             }

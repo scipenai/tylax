@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CLI**: nested lists keep their indentation through `pretty_print`, which previously re-derived it from brace depth and flattened them.
 - **L2T numbers**: a multi-digit number or decimal stays one literal in math (`120`, `0.008`, `x_{16}`). Adjacent letters really are separate symbols, so `AB` still splits into `A B`, but applying that to digits rendered `120` as three numerals side by side.
 - **L2T symbols**: `\textcircled{\cdot}` maps to `dot.o`, and the other circled operators to `plus.o` / `minus.o` / `times.o` / `slash.o`. Anything Typst has no circled form of still falls back to the content alone.
-- **L2T diagnostics**: a `_` or `^` with no base is reported as a parse-error warning. The source is already invalid LaTeX, so the converter says so instead of guessing what the script was meant to attach to.
+- **L2T diagnostics**: the two repairs the math cleanup applies to `_`/`^` attachments are reported, each from the rewrite actually performed. An empty base inserted where Typst requires one (`$^{2}$`, `$(^{2})$`) changes nothing semantically -- LaTeX accepts a missing base, TeX supplies an empty atom -- but usually means the source lost a base upstream. A flattened nested script (`x_{_{y}}` to `x_(y)`) is reported separately, because it loses a level of lowering. Neither fires where no repair happened: `a + ^{2}` and `\left\langle ^{2}\right.` are silent.
 
 ### Added
 - **T2L directives**: `//! tylax: ignore-next-line`, `ignore-begin` and `ignore-end` drop source regions from conversion. Only a genuine Typst line comment counts, so the markers stay literal inside raw blocks and strings.

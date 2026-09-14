@@ -2151,12 +2151,17 @@ mod l2t_math {
         );
     }
 
-    /// A `_`/`^` with nothing to attach to is invalid LaTeX, so there is no
-    /// correct reading to recover. The repair only makes the output compile;
-    /// a diagnostic says the source needs fixing, rather than guessing a base
-    /// or silently demoting the marker to text.
+    /// The report follows the repair actually performed, not a guess from the
+    /// LaTeX shape -- whether Typst needs a base cannot be read off the source.
+    /// `$^{2}$` needs one, but `$\left\langle ^{2}\right.$` renders as
+    /// `lr(chevron.l^(2))`, where the delimiter is the base and nothing is
+    /// inserted. Both are valid LaTeX (pdfTeX compiles them), so reporting the
+    /// second would fail `--strict` on good input.
+    ///
+    /// Flattening a nested script is a different event -- it loses a level of
+    /// lowering -- so it is counted and worded separately.
     #[test]
-    fn baseless_attachment_is_repaired_and_reported() {
+    fn attachment_repairs_are_reported_as_performed() {
         let result = latex_math_to_typst_with_diagnostics("^{2}");
         assert!(
             result.output.contains("\"\"^("),
@@ -2167,39 +2172,93 @@ mod l2t_math {
             result
                 .warnings
                 .iter()
-                .any(|w| w.message.contains("without a base")),
-            "a base-less attachment must be reported, got: {:?}",
+                .any(|w| w.message.contains("empty base")),
+            "an empty nucleus must be reported, got: {:?}",
             result.warnings
         );
 
-        // The document pipeline does not repair, but must still report it.
-        let doc = latex_to_typst_with_diagnostics("^{2}");
+        // The document path repairs and reports the same way, for math it
+        // actually recognises as math.
+        let doc = latex_to_typst_with_diagnostics(
+            "\\documentclass{article}\n\\begin{document}\nText $^{2}$ end.\n\\end{document}\n",
+        );
+        assert!(
+            doc.output.contains("\"\"^("),
+            "the document path must repair too, got: {}",
+            doc.output
+        );
         assert!(
             doc.warnings
                 .iter()
-                .any(|w| w.message.contains("without a base")),
+                .any(|w| w.message.contains("empty base")),
             "the document path must report it too, got: {:?}",
             doc.warnings
         );
 
-        // A well-formed script reports nothing, and `\text{..}^2` is not a
-        // base-less attachment merely because its base ends with a quote.
+        // A script after an operator is NOT an empty nucleus: these are valid
+        // LaTeX whose Typst output compiles, so reporting them would be a false
+        // positive that fails `--strict` on good input.
+        for legal in [
+            r"a + ^{2}",
+            r"a \cdot ^{2}",
+            r"a \leq ^{2}",
+            r"{ab}^{2}",
+            // The delimiter serves as the base, so nothing is inserted.
+            r"\left\langle ^{2}\right.",
+        ] {
+            let out = latex_math_to_typst_with_diagnostics(legal);
+            assert!(
+                !out.warnings
+                    .iter()
+                    .any(|w| w.message.contains("empty base")),
+                "`{legal}` has a nucleus and must not be reported, got: {:?}",
+                out.warnings
+            );
+        }
+
+        // A well-formed script reports nothing, and `\text{..}^2` is not an
+        // empty nucleus merely because its base ends with a quote.
         let clean = latex_math_to_typst_with_diagnostics("x^{2}");
         assert!(
             !clean
                 .warnings
                 .iter()
-                .any(|w| w.message.contains("without a base")),
+                .any(|w| w.message.contains("empty base")),
             "a normal script must not warn, got: {:?}",
             clean.warnings
         );
 
-        let texty = latex_math_to_typst_with_diagnostics(r"	ext{ab}^{2}");
+        // A flattened nested script is a different repair: no `""` is
+        // inserted, but a level of lowering is lost, so it is reported as such.
+        let nested = latex_math_to_typst_with_diagnostics(r"V_{_{M-ABF}}");
+        assert!(
+            !nested.output.contains("\"\""),
+            "the collapse inserts no empty base, got: {}",
+            nested.output
+        );
+        assert!(
+            nested
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("flattened")),
+            "a flattened nested script must be reported as such, got: {:?}",
+            nested.warnings
+        );
+        assert!(
+            !nested
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("empty base")),
+            "a collapse must not claim an empty base was inserted, got: {:?}",
+            nested.warnings
+        );
+
+        let texty = latex_math_to_typst_with_diagnostics(r"\text{ab}^{2}");
         assert!(
             !texty
                 .warnings
                 .iter()
-                .any(|w| w.message.contains("without a base")),
+                .any(|w| w.message.contains("empty base")),
             "a quoted text base must not be read as empty, got: {:?}",
             texty.warnings
         );
@@ -2472,6 +2531,26 @@ mod l2t_document {
         }
     }
 
+    /// Auto traits are part of the public API: a downstream `Arc<T>`, a
+    /// `static`, or any `T: Sync` bound stops compiling the moment a public
+    /// type loses `Send` or `Sync`, and nothing in this crate has to mention
+    /// either trait for that to happen. A single `Cell` field added for
+    /// internal bookkeeping did exactly that to `LatexConverter`.
+    ///
+    /// All six were `Send + Sync` in 0.3.7, so all six are pinned. Interior
+    /// mutability in any of them has to use atomics or a lock.
+    #[test]
+    fn public_types_stay_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<tylax::LatexConverter>();
+        assert_send_sync::<tylax::ConversionState>();
+        assert_send_sync::<tylax::L2TOptions>();
+        assert_send_sync::<tylax::T2LOptions>();
+        assert_send_sync::<tylax::core::typst2latex::ConvertContext>();
+        assert_send_sync::<tylax::tikz::DrawOptions>();
+    }
+
     /// A downstream literal fixes the complete field set and field types of the
     /// 0.3.7 public `ConvertContext` API. It catches both removal and addition:
     /// either change makes an external struct literal fail to compile. Unlike a
@@ -2555,6 +2634,146 @@ mod l2t_document {
         assert_eq!(
             from_generator, from_maps,
             "tools/gen_maps.py and src/data/maps.rs disagree about environment signatures"
+        );
+    }
+
+    /// The same guard for COMMAND arities. A command bound in only one of the
+    /// two files is a latent regression: regenerating `maps.rs` would drop the
+    /// binding, and without a pattern mitex stops treating `{..}` as the
+    /// command's argument at all -- which is exactly how `\textcircled` lost
+    /// the operator it wraps.
+    #[test]
+    fn command_arities_match_the_generator() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let generator = std::fs::read_to_string(root.join("tools/gen_maps.py"))
+            .expect("tools/gen_maps.py should be readable");
+        let maps = std::fs::read_to_string(root.join("src/data/maps.rs"))
+            .expect("src/data/maps.rs should be readable");
+
+        // `COMMANDS_WITH_ARGS = { "name": arity, ... }`
+        let table = generator
+            .split_once("COMMANDS_WITH_ARGS = {")
+            .and_then(|(_, rest)| rest.split_once("\n}"))
+            .map(|(body, _)| body)
+            .expect("COMMANDS_WITH_ARGS table should be present");
+
+        let mut from_generator: Vec<(String, usize)> = Vec::new();
+        for line in table.lines() {
+            let line = line.split('#').next().unwrap_or(line);
+            for entry in line.split(',') {
+                let Some((name, arity)) = entry.split_once(':') else {
+                    continue;
+                };
+                let name = name.trim().trim_matches('"');
+                let Ok(arity) = arity.trim().parse::<usize>() else {
+                    continue;
+                };
+                if !name.is_empty() {
+                    from_generator.push((name.to_string(), arity));
+                }
+            }
+        }
+        assert!(
+            from_generator.len() > 40,
+            "failed to parse the generator table, got {} entries",
+            from_generator.len()
+        );
+
+        let mut from_maps: Vec<(String, usize)> = Vec::new();
+        for chunk in maps.split("m.insert(\"").skip(1) {
+            let Some((name, rest)) = chunk.split_once("\".to_string(), ") else {
+                continue;
+            };
+            if !rest.starts_with("CommandSpecItem::Cmd(") {
+                continue;
+            }
+            // Only fixed arities are comparable; the sectioning commands use a
+            // glob and live in their own generator table.
+            let Some((_, after)) = rest.split_once("FixedLenTerm { len: ") else {
+                continue;
+            };
+            if let Some((len, _)) = after.split_once(' ') {
+                if let Ok(arity) = len.trim_end_matches('}').trim().parse::<usize>() {
+                    from_maps.push((name.to_string(), arity));
+                }
+            }
+        }
+
+        // `typstcite` is emitted separately, with an alias.
+        from_generator.retain(|(name, _)| name != "typstcite");
+        from_maps.retain(|(name, _)| name != "typstcite");
+        from_generator.sort();
+        from_maps.sort();
+        assert_eq!(
+            from_generator, from_maps,
+            "tools/gen_maps.py and src/data/maps.rs disagree about command arities"
+        );
+    }
+
+    /// Commands shaped `\cmd[optional]{required}` are emitted with a glob, not
+    /// an arity, so the arity guard above cannot see them. They need the same
+    /// protection: `\sqrt` already carried a fixed arity of 1 in the generator
+    /// while `maps.rs` gave it `{,b}t`, and regenerating would have silently
+    /// dropped the `[n]` of `\sqrt[n]{x}`.
+    #[test]
+    fn optional_arg_commands_match_the_generator() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let generator = std::fs::read_to_string(root.join("tools/gen_maps.py"))
+            .expect("tools/gen_maps.py should be readable");
+        let maps = std::fs::read_to_string(root.join("src/data/maps.rs"))
+            .expect("src/data/maps.rs should be readable");
+
+        // The pattern the generator emits for every command in the list.
+        let pattern = generator
+            .split_once("for cmd in OPTIONAL_ARG_COMMANDS:")
+            .and_then(|(_, rest)| rest.split_once("GlobStr::from(\""))
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(pattern, _)| pattern.to_string())
+            .expect("the emitted glob pattern should be readable");
+
+        let table = generator
+            .split_once("OPTIONAL_ARG_COMMANDS = [")
+            .and_then(|(_, rest)| rest.split_once("\n]"))
+            .map(|(body, _)| body)
+            .expect("OPTIONAL_ARG_COMMANDS table should be present");
+        let mut from_generator: Vec<(String, String)> = Vec::new();
+        for line in table.lines() {
+            let line = line.split('#').next().unwrap_or(line);
+            for name in line.split('"').skip(1).step_by(2) {
+                from_generator.push((name.to_string(), pattern.clone()));
+            }
+        }
+        assert!(
+            from_generator.len() > 5,
+            "failed to parse the generator table, got: {from_generator:?}"
+        );
+
+        // Only the commands the generator claims; `maps.rs` has other globs
+        // (environments, `{,b}{,b}t` shapes) that this list does not own.
+        let mut from_maps: Vec<(String, String)> = Vec::new();
+        for chunk in maps.split("m.insert(\"").skip(1) {
+            let Some((name, rest)) = chunk.split_once("\".to_string(), ") else {
+                continue;
+            };
+            if !rest.starts_with("CommandSpecItem::Cmd(") {
+                continue;
+            }
+            if !from_generator.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            let found = rest
+                .split_once("GlobStr::from(\"")
+                .and_then(|(_, after)| after.split_once('"'))
+                .map(|(p, _)| p.to_string())
+                .unwrap_or_else(|| "<not a glob>".to_string());
+            from_maps.push((name.to_string(), found));
+        }
+
+        from_generator.sort();
+        from_maps.sort();
+        assert_eq!(
+            from_generator, from_maps,
+            "tools/gen_maps.py and src/data/maps.rs disagree about optional-argument commands"
         );
     }
 
