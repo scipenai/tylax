@@ -22,7 +22,6 @@ use super::value::{
     SourceSpan, Value, VertAlign,
 };
 use super::vfs::{NoopVfs, VirtualFileSystem};
-use crate::core::typst2latex::supplement::mark_at_reference;
 
 /// Maximum number of loop iterations (infinite loop protection).
 const MAX_ITERATIONS: usize = 10_000;
@@ -600,8 +599,14 @@ impl MiniEval {
             // Bare `@target` needs the document's complete label and
             // bibliography declarations to decide between `\\ref` and `\\cite`.
             // `ContentNode::Reference` is reserved for explicit `#ref(...)`.
+            // Evaluated content is written back out as TYPST SOURCE and
+            // converted on a second pass, so the reference is reproduced as
+            // written rather than resolved here. Emitting a marker containing
+            // already-converted LaTeX made the second pass escape it, turning
+            // `@x[*y*]` into `textbf\{y\}`; an explicit supplement is content
+            // and belongs to the markup converter, which handles it correctly.
             ast::Expr::Ref(reference) => Ok(Value::Content(vec![ContentNode::RawSource(
-                mark_at_reference(reference.target()),
+                reference.to_untyped().clone().into_text().to_string(),
             )])),
             ast::Expr::Escape(esc) => Ok(Value::Content(vec![ContentNode::Text(
                 esc.get().to_string(),

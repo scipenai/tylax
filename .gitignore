@@ -23,3 +23,7 @@ Desktop.ini
 *.swp
 *.swo
 *.log
+
+# Python
+__pycache__/
+*.pyc

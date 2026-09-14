@@ -464,6 +464,27 @@ pub fn is_content_node(node: &SyntaxNode) -> bool {
     )
 }
 
+/// The `Markup` body of an explicit `@target[supplement]`, if written.
+///
+/// `Some` means the brackets were there, EVEN WHEN EMPTY: `@label[]` is an
+/// explicit request for no supplement (Typst renders the bare number), which is
+/// a different instruction from `@label`, where Typst supplies "Section". The
+/// two must not collapse into one.
+///
+/// The block's own `[` `]` are delimiters, not content, so the `Markup` child
+/// is returned rather than the block: taking the block yields `\cite[[p. 5]]`.
+pub fn ref_supplement_markup(node: &SyntaxNode) -> Option<SyntaxNode> {
+    node.children()
+        .find(|child| child.kind() == SyntaxKind::ContentBlock)
+        .map(|block| {
+            block
+                .children()
+                .find(|c| c.kind() == SyntaxKind::Markup)
+                .cloned()
+                .unwrap_or_else(|| block.clone())
+        })
+}
+
 /// Get simple text representation of a node (recursive)
 pub fn get_simple_text(node: &SyntaxNode) -> String {
     let mut result = String::new();

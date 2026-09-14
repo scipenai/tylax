@@ -443,37 +443,38 @@ fn convert_table(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut Stri
 
     let mut caption_cmd: Option<CmdItem> = None;
     let mut label_text = String::new();
-    let mut table_content = String::new();
+    let mut body_elements: Vec<SyntaxElement> = Vec::new();
 
-    // First pass: extract caption, label, and tabular content using AST
+    // `\caption`/`\label` become `#figure(..)` arguments; EVERYTHING else is
+    // real content. Recognising only the `tabular` child dropped the prose,
+    // lists and second tables a `table` float is allowed to carry.
     for child in node.children_with_tokens() {
+        if matches!(child.kind(), SyntaxKind::ItemBegin | SyntaxKind::ItemEnd) {
+            continue;
+        }
         if let SyntaxElement::Node(n) = &child {
             if let Some(cmd) = CmdItem::cast(n.clone()) {
-                if let Some(name_tok) = cmd.name_tok() {
-                    let name = name_tok.text();
-                    if name == "\\caption" {
+                match cmd.name_tok().as_ref().map(|t| t.text()) {
+                    Some("\\caption") => {
                         caption_cmd = Some(cmd.clone());
-                    } else if name == "\\label" {
+                        continue;
+                    }
+                    Some("\\label") => {
                         if let Some(lbl) = conv.get_required_arg(&cmd, 0) {
                             label_text = lbl;
                         }
+                        continue;
                     }
-                }
-            }
-            // Check for tabular environment
-            if let Some(env) = EnvItem::cast(n.clone()) {
-                if env
-                    .name_tok()
-                    .map(|t| t.text().to_string())
-                    .unwrap_or_default()
-                    .starts_with("tabular")
-                {
-                    // convert_tabular handles its own push/pop of Tabular context
-                    convert_tabular(conv, n, &mut table_content);
+                    _ => {}
                 }
             }
         }
+        body_elements.push(child);
     }
+
+    let mut table_content = String::new();
+    conv.visit_elements(&body_elements, &mut table_content);
+    let table_content = table_content.trim();
 
     // Build properly formatted figure
     output.push_str("\n#figure(");
@@ -486,7 +487,7 @@ fn convert_table(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut Stri
     }
 
     output.push_str(")[\n");
-    output.push_str(&table_content);
+    output.push_str(table_content);
     output.push_str("\n] ");
 
     if !label_text.is_empty() {
@@ -1053,7 +1054,16 @@ fn convert_bibliography(conv: &mut LatexConverter, node: &SyntaxNode, output: &m
     conv.state.push_env(EnvironmentContext::Bibliography);
 
     output.push_str("\n= References\n\n");
-    output.push_str("#show figure.where(kind: \"bib\"): it => block[#it.caption #it.body]\n");
+    // The entries stay `#figure`s so `@key` has something numbered to resolve
+    // against, but a figure centres its caption on its own line -- which put
+    // the entry number alone above centred body text, nothing like a
+    // bibliography. Lay each one out as a left-aligned hanging-indent row:
+    // `it.caption.body` is the bare number, without the caption's own styling.
+    output.push_str(
+        "#show figure.where(kind: \"bib\"): it => block(width: 100%, above: 0.65em, below: 0.65em)[\n  \
+         #grid(columns: (auto, 1fr), column-gutter: 0.65em, align: (right + top, left + top),\n    \
+         it.caption.body, it.body)\n]\n",
+    );
 
     // Process bibitem commands using the dedicated function
     convert_thebibliography_content(conv, node, output);

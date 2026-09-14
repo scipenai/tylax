@@ -2679,11 +2679,33 @@ mod l2t_document {
             from_generator.len()
         );
 
+        // `maps.rs` writes most fixed arities through local `cmdN()` closures,
+        // so reading only the spelled-out form sees a fraction of them. Check
+        // the closures still mean what this expansion assumes.
+        for (shorthand, arity) in FIXED_ARITY_SHORTHANDS {
+            let body = maps
+                .split_once(&format!("let {shorthand} = ||"))
+                .map(|(_, rest)| &rest[..rest.len().min(200)])
+                .unwrap_or_else(|| panic!("`{shorthand}` closure is gone from src/data/maps.rs"));
+            assert!(
+                body.contains(&format!("FixedLenTerm {{ len: {arity} }}")),
+                "`{shorthand}` no longer expands to arity {arity}; this test's expansion is stale"
+            );
+        }
+
         let mut from_maps: Vec<(String, usize)> = Vec::new();
         for chunk in maps.split("m.insert(\"").skip(1) {
             let Some((name, rest)) = chunk.split_once("\".to_string(), ") else {
                 continue;
             };
+            if let Some((shorthand, arity)) = FIXED_ARITY_SHORTHANDS
+                .iter()
+                .find(|(shorthand, _)| rest.starts_with(&format!("{shorthand}()")))
+            {
+                let _ = shorthand;
+                from_maps.push((name.to_string(), *arity));
+                continue;
+            }
             if !rest.starts_with("CommandSpecItem::Cmd(") {
                 continue;
             }
@@ -2707,6 +2729,166 @@ mod l2t_document {
         assert_eq!(
             from_generator, from_maps,
             "tools/gen_maps.py and src/data/maps.rs disagree about command arities"
+        );
+    }
+
+    /// `maps.rs` declares most command shapes through local closures rather
+    /// than spelling the pattern out. The generator/`maps.rs` guards have to
+    /// expand them or they compare only a fraction of the table.
+    const FIXED_ARITY_SHORTHANDS: &[(&str, usize)] = &[("cmd1", 1), ("cmd2", 2), ("cmd3", 3)];
+    const GLOB_SHORTHANDS: &[(&str, &str)] = &[
+        ("cmd1_opt", "{,b}t"),
+        ("cmd2_opt", "{,b}tt"),
+        ("cmd3_opt", "{,b}ttt"),
+    ];
+
+    /// A `table` float is not just its `tabular`. It may carry prose, a second
+    /// table or a note, all of which were dropped because the converter picked
+    /// out only `\caption`, `\label` and the `tabular` child -- the same defect
+    /// `figure` had.
+    #[test]
+    fn table_float_keeps_the_prose_around_its_tabular() {
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\n\
+             \\begin{table}[h]\nBefore.\n\\centering\n\
+             \\begin{tabular}{cc}\na & b \\\\\n\\end{tabular}\n\
+             After.\n\\caption{Cap}\n\\end{table}\n\\end{document}\n",
+        );
+
+        assert!(out.contains("Before."), "prose before the tabular:\n{out}");
+        assert!(out.contains("After."), "prose after the tabular:\n{out}");
+        assert!(out.contains("#table("), "the tabular itself:\n{out}");
+        assert!(out.contains("caption: [Cap]"), "the caption:\n{out}");
+        assert_compiles_with_real_typst(&out);
+    }
+
+    /// `thebibliography` entries stay `#figure`s so `@key` has something
+    /// numbered to resolve against, but a figure centres its caption on its own
+    /// line: the number ended up alone above centred body text. The show rule
+    /// has to lay each entry out as a left-aligned hanging-indent row.
+    #[test]
+    fn bibliography_entries_are_not_centred_figures() {
+        let out = latex_document_to_typst(
+            "\\documentclass{article}\n\\begin{document}\nText \\cite{knuth84}.\n\
+             \\begin{thebibliography}{9}\n\
+             \\bibitem{knuth84} D. Knuth, \\emph{The TeXbook}, 1984.\n\
+             \\end{thebibliography}\n\\end{document}\n",
+        );
+
+        assert!(
+            out.contains("#grid(columns: (auto, 1fr)") && out.contains("align: (right + top"),
+            "entries must be laid out as a left-aligned row, got:\n{out}"
+        );
+        assert!(
+            !out.contains("it => block[#it.caption #it.body]"),
+            "the centring caption layout must be gone, got:\n{out}"
+        );
+        // The anchor `@key` resolves against must survive the layout change.
+        assert!(out.contains("<knuth84>"), "entry anchor:\n{out}");
+        assert!(out.contains("@knuth84"), "citation:\n{out}");
+        assert_compiles_with_real_typst(&out);
+    }
+
+    /// Every command `maps.rs` declares must be declared by the generator too.
+    ///
+    /// The generator is meant to be the single source for this file, but it had
+    /// drifted far enough that regenerating would have dropped 527 mappings,
+    /// `DELIMITER_MAP` entirely, and 145 commands `maps.rs` carries through its
+    /// own `cmd1()`/`cmd0(..)` shorthands. Its own guard refuses a lossy
+    /// overwrite, which is the right behaviour but only reports the problem;
+    /// this keeps the gap from reopening, without needing a Python interpreter.
+    #[test]
+    fn every_maps_command_is_declared_by_the_generator() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let generator = std::fs::read_to_string(root.join("tools/gen_maps.py"))
+            .expect("tools/gen_maps.py should be readable");
+        let maps = std::fs::read_to_string(root.join("src/data/maps.rs"))
+            .expect("src/data/maps.rs should be readable");
+
+        // Every quoted string in the generator's data tables, which is a
+        // superset of the names it can emit. A name missing from ALL of them
+        // cannot be regenerated.
+        // Only the generator's data tables count, and inside them only the KEY
+        // position: a name appearing in a comment, a docstring or an emitted
+        // Rust fragment is not a declaration, and would let this guard pass on
+        // a coincidence.
+        let mut declared: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (table, keyed) in [
+            ("SYMBOL_MAP", true),
+            ("COMMANDS_WITH_ARGS", true),
+            ("GLOB_ARG_COMMANDS", true),
+            ("ENVIRONMENT_SIGNATURES", true),
+            ("DELIMITER_MAP", true),
+            ("TYPST_TO_TEX", true),
+            ("OPTIONAL_ARG_COMMANDS", false),
+            ("BARE_COMMANDS", false),
+        ] {
+            let (opener, closer) = if keyed {
+                (" = {", "\n}")
+            } else {
+                (" = [", "\n]")
+            };
+            let body = generator
+                .split_once(&format!("\n{table}{opener}"))
+                .and_then(|(_, rest)| rest.split_once(closer))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("generator table `{table}` should be present"));
+
+            for line in body.lines() {
+                // Walk the quoted strings: a key is one followed by `:`.
+                // Counting every other string would be wrong for
+                // `{"title": 1, "author": 1}`, whose values are not quoted at
+                // all. A `#` only starts a comment OUTSIDE a string, so the
+                // scan skips to it rather than truncating the line first --
+                // `"hspace": "#h"` would otherwise lose the rest of its line.
+                let mut rest = line;
+                while let Some(open) = rest.find(['"', '\'', '#']) {
+                    // Python accepts either quote, and the imported tables use
+                    // the other one from the hand-written ones.
+                    let quote = rest.as_bytes()[open] as char;
+                    if quote == '#' {
+                        break;
+                    }
+                    let after_open = &rest[open + 1..];
+                    let Some((text, after_close)) = after_open.split_once(quote) else {
+                        break;
+                    };
+                    if !keyed || after_close.trim_start().starts_with(':') {
+                        declared.insert(text);
+                    }
+                    rest = after_close;
+                }
+            }
+        }
+        // A handful of entries are emitted by hardcoded fragments rather than
+        // from a table (`aligned`, `item`). Those are declarations too.
+        for chunk in generator.split("m.insert(\"").skip(1) {
+            if let Some((name, _)) = chunk.split_once('"') {
+                declared.insert(name);
+            }
+        }
+
+        assert!(
+            declared.len() > 900,
+            "failed to parse the generator tables, got {} names",
+            declared.len()
+        );
+
+        let mut missing: Vec<&str> = maps
+            .split("m.insert(\"")
+            .skip(1)
+            .filter_map(|chunk| chunk.split_once("\".to_string(), ").map(|(name, _)| name))
+            .filter(|name| !declared.contains(name))
+            .collect();
+        missing.sort_unstable();
+        missing.dedup();
+
+        assert!(
+            missing.is_empty(),
+            "{} command(s) in src/data/maps.rs are unknown to tools/gen_maps.py, \
+             so regenerating would drop them: {:?}",
+            missing.len(),
+            &missing[..missing.len().min(15)]
         );
     }
 
@@ -2750,11 +2932,31 @@ mod l2t_document {
 
         // Only the commands the generator claims; `maps.rs` has other globs
         // (environments, `{,b}{,b}t` shapes) that this list does not own.
+        for (shorthand, glob) in GLOB_SHORTHANDS {
+            let body = maps
+                .split_once(&format!("let {shorthand} = ||"))
+                .map(|(_, rest)| &rest[..rest.len().min(260)])
+                .unwrap_or_else(|| panic!("`{shorthand}` closure is gone from src/data/maps.rs"));
+            assert!(
+                body.contains(&format!("GlobStr::from(\"{glob}\")")),
+                "`{shorthand}` no longer expands to `{glob}`; this test's expansion is stale"
+            );
+        }
+
         let mut from_maps: Vec<(String, String)> = Vec::new();
         for chunk in maps.split("m.insert(\"").skip(1) {
             let Some((name, rest)) = chunk.split_once("\".to_string(), ") else {
                 continue;
             };
+            if let Some((_, glob)) = GLOB_SHORTHANDS
+                .iter()
+                .find(|(shorthand, _)| rest.starts_with(&format!("{shorthand}()")))
+            {
+                if from_generator.iter().any(|(n, _)| n == name) {
+                    from_maps.push((name.to_string(), (*glob).to_string()));
+                }
+                continue;
+            }
             if !rest.starts_with("CommandSpecItem::Cmd(") {
                 continue;
             }
@@ -6207,13 +6409,22 @@ mod t2l_named_args {
         );
     }
 
+    /// `#grid` is a cell grid, so `columns: 3` sets the COLUMN COUNT, not a
+    /// minipage width. It used to become one minipage holding `ABC`, which lost
+    /// every cell boundary; the named argument still must not leak.
     #[test]
     fn test_grid_columns_named_arg_preserved() {
         let result =
             typst_to_latex_with_options("#grid(columns: 3)[A][B][C]", &T2LOptions::default());
         assert!(
-            result.contains("0.32\\textwidth"),
-            "grid columns should drive width, got: {}",
+            result.contains("\\begin{tabular}{ccc}") && result.contains("A & B & C"),
+            "grid columns should drive the cell layout, got: {}",
+            result
+        );
+        // `#grid` does not stroke, unlike `#table`.
+        assert!(
+            !result.contains("\\hline") && !result.contains('|'),
+            "an unstroked grid must not gain rules, got: {}",
             result
         );
         assert!(
@@ -6230,7 +6441,7 @@ mod t2l_named_args {
             &T2LOptions::default(),
         );
         assert!(
-            result.contains("0.32\\textwidth"),
+            result.contains("\\begin{tabular}{ccc}") && result.contains("A & B & C"),
             "tuple-valued columns should still infer 3 columns, got: {}",
             result
         );
@@ -6759,6 +6970,144 @@ See #ref(<external-label>).
         assert!(
             !output.contains(r"\cite{external-label}"),
             "an explicit #ref must not become a citation:\n{output}"
+        );
+    }
+
+    /// `@target[supplement]` sets a custom supplement, which REPLACES the word
+    /// the reference would render. Reading the whole `Ref` node as the target
+    /// swallowed the body into the label, giving `\ref{sec-one[p. 5]}` -- a
+    /// reference that resolves to nothing.
+    #[test]
+    fn at_reference_supplement_is_not_swallowed_into_the_label() {
+        let output = typst_to_latex("See @sec-one[p. 5] and @sec-one here.\n\n= One <sec-one>\n");
+
+        assert!(
+            !output.contains("sec-one[p. 5]"),
+            "the supplement must not end up inside the label:\n{output}"
+        );
+        assert!(
+            output.contains(r"p. 5~\ref{sec-one}"),
+            "an explicit supplement replaces the automatic word:\n{output}"
+        );
+        // The plain form still gets the word recovered from the target's kind.
+        assert!(
+            output.contains(r"Section~\ref{sec-one}"),
+            "a plain reference keeps its automatic supplement:\n{output}"
+        );
+    }
+
+    /// `@label[]` is an EXPLICIT empty supplement, which Typst renders as the
+    /// bare number -- a different instruction from `@label`, where it supplies
+    /// "Section". Verified against the real compiler: `@sec-one` renders
+    /// "Section 1" and `@sec-one[]` renders "1".
+    #[test]
+    fn empty_at_supplement_suppresses_the_automatic_word() {
+        let output = typst_to_latex("A @sec-one[] B @sec-one\n\n= One <sec-one>\n");
+
+        assert!(
+            output.contains(r"A \ref{sec-one}"),
+            "an explicit empty supplement means no word at all:\n{output}"
+        );
+        assert!(
+            output.contains(r"B Section~\ref{sec-one}"),
+            "the plain form must still get one:\n{output}"
+        );
+    }
+
+    /// A supplement is CONTENT, not a string: Typst renders `@sec-one[*Custom*]`
+    /// in bold, so it goes through the normal markup conversion rather than
+    /// being flattened to its source text.
+    #[test]
+    fn at_supplement_keeps_its_markup() {
+        for (source, expected) in [
+            ("@sec-one[*Custom*]", r"\textbf{Custom}~\ref{sec-one}"),
+            ("@sec-one[_it_]", r"\textit{it}~\ref{sec-one}"),
+        ] {
+            let doc = format!("See {source} here.\n\n= One <sec-one>\n");
+            let output = typst_to_latex(&doc);
+            assert!(
+                output.contains(expected),
+                "`{source}` should render as `{expected}`:\n{output}"
+            );
+        }
+    }
+
+    /// The evaluator writes content back out as Typst source for a second
+    /// conversion pass, so it must reproduce the reference AS WRITTEN. Emitting
+    /// an already-converted supplement there made the second pass escape it
+    /// (`textbf\{y\}`), and MiniEval is on by default.
+    #[test]
+    fn at_supplement_survives_minieval() {
+        let output = typst_to_latex(
+            "#let k = [Item]\n#for i in range(2) [ #k @sec-one[*b*] ]\n\n= One <sec-one>\n",
+        );
+
+        assert!(
+            output.contains(r"\textbf{b}~\ref{sec-one}"),
+            "the supplement must not be re-escaped by the second pass:\n{output}"
+        );
+        assert!(
+            !output.contains(r"textbf\{"),
+            "an escaped supplement means it round-tripped as text:\n{output}"
+        );
+    }
+
+    /// With the document's own bibliography in reach, a supplement on a
+    /// bibliography key is `\cite`'s postnote rather than a word in front.
+    #[test]
+    fn at_citation_supplement_becomes_the_cite_postnote() {
+        let dir = TempSourceDir::new("cite-supplement");
+        dir.write(
+            "refs.bib",
+            "@article{smith2020, title={T}, author={S}, year={2020}, journal={J}}\n",
+        );
+        let source = dir.write(
+            "in.typ",
+            "See @smith2020[p. 5] and @sec-one[Chapter].\n\n= One <sec-one>\n\n\
+             #bibliography(\"refs.bib\")\n",
+        );
+
+        let output = typst_file_to_latex_with_options(
+            &std::fs::read_to_string(&source).expect("source should be readable"),
+            &source,
+            &T2LOptions::default(),
+        );
+        assert!(
+            output.contains(r"\cite[p. 5]{smith2020}"),
+            "a bibliography key takes the supplement as a postnote:\n{output}"
+        );
+        assert!(
+            output.contains(r"Chapter~\ref{sec-one}"),
+            "a local label still takes it as the leading word:\n{output}"
+        );
+    }
+
+    /// For a citation, an explicit empty supplement is simply no postnote --
+    /// not an empty `\cite[]{..}`, which renders a stray bracket pair.
+    #[test]
+    fn empty_at_supplement_on_a_citation_emits_no_postnote() {
+        let dir = TempSourceDir::new("cite-empty-supplement");
+        dir.write(
+            "refs.bib",
+            "@article{smith2020, title={T}, author={S}, year={2020}, journal={J}}\n",
+        );
+        let source = dir.write(
+            "in.typ",
+            "A @smith2020[] B @smith2020[*x*]\n\n#bibliography(\"refs.bib\")\n",
+        );
+
+        let output = typst_file_to_latex_with_options(
+            &std::fs::read_to_string(&source).expect("source should be readable"),
+            &source,
+            &T2LOptions::default(),
+        );
+        assert!(
+            output.contains(r"A \cite{smith2020}") && !output.contains(r"\cite[]"),
+            "an empty supplement must not become an empty postnote:\n{output}"
+        );
+        assert!(
+            output.contains(r"B \cite[\textbf{x}]{smith2020}"),
+            "a rich postnote keeps its markup:\n{output}"
         );
     }
 }

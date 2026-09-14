@@ -40,6 +40,9 @@ pub(crate) const REF_MARK_END: char = '\u{E013}';
 /// bibliography entry in the completed document.
 const AT_MARK_START: char = '\u{E014}';
 const AT_MARK_END: char = '\u{E015}';
+/// Separates the target from an explicit `@target[supplement]` body. A private
+/// use character, so it cannot occur in either half.
+const AT_SUPPLEMENT_SEP: char = '\u{E016}';
 
 /// The kind of element a label is attached to, and the LaTeX word Typst would
 /// have rendered for it.
@@ -66,8 +69,19 @@ pub(crate) fn mark_reference(rendered: &str) -> String {
 }
 
 /// Defer a bare Typst `@target` until document-level target resolution.
-pub(crate) fn mark_at_reference(target: &str) -> String {
-    format!("{AT_MARK_START}{target}{AT_MARK_END}")
+///
+/// `supplement` is the body of an explicit `@target[..]`, which in Typst
+/// REPLACES the word the reference would otherwise render. It has to travel
+/// with the target: for a bibliography entry it becomes `\cite`'s postnote, and
+/// for a label it becomes the word in front of `\ref` -- and it must suppress
+/// the automatic word, or the two would both appear.
+pub(crate) fn mark_at_reference(target: &str, supplement: Option<&str>) -> String {
+    match supplement {
+        Some(supplement) => {
+            format!("{AT_MARK_START}{target}{AT_SUPPLEMENT_SEP}{supplement}{AT_MARK_END}")
+        }
+        None => format!("{AT_MARK_START}{target}{AT_MARK_END}"),
+    }
 }
 
 /// Strip every reference sentinel without adding supplements. Used when the
@@ -145,24 +159,47 @@ fn resolve_at_references(
     index: &DocumentTargets,
     bibliography_keys: Option<&HashSet<String>>,
 ) -> String {
-    resolve_at_markers(latex, |target| {
+    resolve_at_markers(latex, |target, supplement| {
         if index.labels.contains(target)
             || !bibliography_keys.is_some_and(|keys| keys.contains(target))
         {
-            mark_reference(&reference_to_latex(&Reference::new(target.to_string())))
+            render_at_label(target, supplement)
         } else {
-            format!("\\cite{{{target}}}")
+            match supplement {
+                // `@key[]` asks for no supplement, which for a citation is
+                // simply no postnote -- not an empty `\cite[]{..}`.
+                Some(note) if !note.is_empty() => format!("\\cite[{note}]{{{target}}}"),
+                _ => format!("\\cite{{{target}}}"),
+            }
         }
     })
 }
 
 fn resolve_at_references_without_document(latex: &str) -> String {
-    resolve_at_markers(latex, |target| {
-        reference_to_latex(&Reference::new(target.to_string()))
-    })
+    resolve_at_markers(latex, render_at_label)
 }
 
-fn resolve_at_markers(latex: &str, resolve: impl Fn(&str) -> String) -> String {
+/// Render `@label` / `@label[supplement]` as a cross-reference.
+///
+/// An explicit supplement REPLACES the automatic word, so either explicit form
+/// is emitted unmarked: [`resolve_supplements_with_index`] rewrites only marked
+/// references, and marking these would put a second word in front
+/// ("Section p. 5 1").
+///
+/// `@label[]` is explicit and EMPTY -- Typst renders the bare number -- so it
+/// resolves to a bare `\ref{..}`, with neither a word of its own nor the
+/// automatic one.
+fn render_at_label(target: &str, supplement: Option<&str>) -> String {
+    let rendered = reference_to_latex(&Reference::new(target.to_string()));
+    match supplement {
+        Some("") => rendered,
+        // A tie keeps the word with its number, as in `Section~\ref{..}`.
+        Some(word) => format!("{word}~{rendered}"),
+        None => mark_reference(&rendered),
+    }
+}
+
+fn resolve_at_markers(latex: &str, resolve: impl Fn(&str, Option<&str>) -> String) -> String {
     let mut out = String::with_capacity(latex.len());
     let mut rest = latex;
 
@@ -171,13 +208,17 @@ fn resolve_at_markers(latex: &str, resolve: impl Fn(&str) -> String) -> String {
             break;
         };
         out.push_str(&rest[..start]);
-        let target = &rest[start + AT_MARK_START.len_utf8()..end];
-        out.push_str(&resolve(target));
+        let body = &rest[start + AT_MARK_START.len_utf8()..end];
+        let (target, supplement) = match body.split_once(AT_SUPPLEMENT_SEP) {
+            Some((target, supplement)) => (target, Some(supplement)),
+            None => (body, None),
+        };
+        out.push_str(&resolve(target, supplement));
         rest = &rest[end + AT_MARK_END.len_utf8()..];
     }
 
     out.push_str(rest);
-    out.replace([AT_MARK_START, AT_MARK_END], "")
+    out.replace([AT_MARK_START, AT_MARK_END, AT_SUPPLEMENT_SEP], "")
 }
 
 /// The label a rendered `\ref{..}`-style command points at.
