@@ -356,10 +356,9 @@ fn has_unescaped_alignment(content: &str) -> bool {
 /// Convert a markup node to LaTeX
 /// Convert an explicit `@target[supplement]` body to LaTeX, if it was written.
 ///
-/// A supplement is CONTENT, not a string: `@sec-one[*Custom*]` renders bold in
-/// Typst, so it goes through the normal markup conversion rather than being
-/// flattened to its source text. `Some("")` is preserved and meaningful -- it
-/// is `@label[]`, an explicit request for no supplement at all.
+/// A supplement is CONTENT, not a string: `@sec-one[*Custom*]` renders bold, so
+/// it goes through the normal markup conversion rather than being flattened to
+/// its source text. See [`ref_supplement_markup`] for why `Some("")` matters.
 pub fn convert_ref_supplement(node: &SyntaxNode) -> Option<String> {
     let markup = ref_supplement_markup(node)?;
     let mut inner = ConvertContext::new();
@@ -721,9 +720,8 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
 
         // Bare `@target` is ambiguous until the whole document is known: label or bib entry.
         SyntaxKind::Ref => {
-            // The target is the `RefMarker` alone. Reading the node's whole text
-            // swallowed an `@target[supplement]` body into the label, producing
-            // `\ref{sec-one[p. 5]}` -- a reference that resolves to nothing.
+            // The target is the `RefMarker` alone: reading the node's whole text
+            // swallowed a `[supplement]` body into the label.
             let target = node
                 .children()
                 .find(|c| c.kind() == SyntaxKind::RefMarker)

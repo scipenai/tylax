@@ -40,8 +40,7 @@ pub(crate) const REF_MARK_END: char = '\u{E013}';
 /// bibliography entry in the completed document.
 const AT_MARK_START: char = '\u{E014}';
 const AT_MARK_END: char = '\u{E015}';
-/// Separates the target from an explicit `@target[supplement]` body. A private
-/// use character, so it cannot occur in either half.
+/// Separates target from supplement. Private use, so neither half contains it.
 const AT_SUPPLEMENT_SEP: char = '\u{E016}';
 
 /// The kind of element a label is attached to, and the LaTeX word Typst would
@@ -70,11 +69,8 @@ pub(crate) fn mark_reference(rendered: &str) -> String {
 
 /// Defer a bare Typst `@target` until document-level target resolution.
 ///
-/// `supplement` is the body of an explicit `@target[..]`, which in Typst
-/// REPLACES the word the reference would otherwise render. It has to travel
-/// with the target: for a bibliography entry it becomes `\cite`'s postnote, and
-/// for a label it becomes the word in front of `\ref` -- and it must suppress
-/// the automatic word, or the two would both appear.
+/// The supplement travels with the target: `\cite`'s postnote for a
+/// bibliography entry, the word before `\ref` for a label.
 pub(crate) fn mark_at_reference(target: &str, supplement: Option<&str>) -> String {
     match supplement {
         Some(supplement) => {
@@ -181,19 +177,14 @@ fn resolve_at_references_without_document(latex: &str) -> String {
 
 /// Render `@label` / `@label[supplement]` as a cross-reference.
 ///
-/// An explicit supplement REPLACES the automatic word, so either explicit form
-/// is emitted unmarked: [`resolve_supplements_with_index`] rewrites only marked
-/// references, and marking these would put a second word in front
-/// ("Section p. 5 1").
-///
-/// `@label[]` is explicit and EMPTY -- Typst renders the bare number -- so it
-/// resolves to a bare `\ref{..}`, with neither a word of its own nor the
-/// automatic one.
+/// Either explicit form is emitted UNMARKED, since the supplement replaces the
+/// automatic word: [`resolve_supplements_with_index`] rewrites only marked
+/// references, and marking these would prepend a second word
+/// ("Section p. 5 1"). An empty one therefore leaves a bare `\ref{..}`.
 fn render_at_label(target: &str, supplement: Option<&str>) -> String {
     let rendered = reference_to_latex(&Reference::new(target.to_string()));
     match supplement {
         Some("") => rendered,
-        // A tie keeps the word with its number, as in `Section~\ref{..}`.
         Some(word) => format!("{word}~{rendered}"),
         None => mark_reference(&rendered),
     }

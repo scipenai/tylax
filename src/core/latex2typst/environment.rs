@@ -1054,11 +1054,10 @@ fn convert_bibliography(conv: &mut LatexConverter, node: &SyntaxNode, output: &m
     conv.state.push_env(EnvironmentContext::Bibliography);
 
     output.push_str("\n= References\n\n");
-    // The entries stay `#figure`s so `@key` has something numbered to resolve
-    // against, but a figure centres its caption on its own line -- which put
-    // the entry number alone above centred body text, nothing like a
-    // bibliography. Lay each one out as a left-aligned hanging-indent row:
-    // `it.caption.body` is the bare number, without the caption's own styling.
+    // Entries stay `#figure`s so `@key` has something numbered to resolve
+    // against, but a figure centres its caption on its own line. Lay each out as
+    // a left-aligned hanging-indent row; `it.caption.body` is the bare number,
+    // without the caption's own styling.
     output.push_str(
         "#show figure.where(kind: \"bib\"): it => block(width: 100%, above: 0.65em, below: 0.65em)[\n  \
          #grid(columns: (auto, 1fr), column-gutter: 0.65em, align: (right + top, left + top),\n    \

@@ -599,12 +599,10 @@ impl MiniEval {
             // Bare `@target` needs the document's complete label and
             // bibliography declarations to decide between `\\ref` and `\\cite`.
             // `ContentNode::Reference` is reserved for explicit `#ref(...)`.
-            // Evaluated content is written back out as TYPST SOURCE and
-            // converted on a second pass, so the reference is reproduced as
-            // written rather than resolved here. Emitting a marker containing
-            // already-converted LaTeX made the second pass escape it, turning
-            // `@x[*y*]` into `textbf\{y\}`; an explicit supplement is content
-            // and belongs to the markup converter, which handles it correctly.
+            // Evaluated content is written back out as TYPST SOURCE for a second
+            // pass, so the reference is reproduced as written. A marker carrying
+            // already-converted LaTeX was re-read as text and escaped, turning
+            // `@x[*y*]` into `textbf\{y\}`.
             ast::Expr::Ref(reference) => Ok(Value::Content(vec![ContentNode::RawSource(
                 reference.to_untyped().clone().into_text().to_string(),
             )])),

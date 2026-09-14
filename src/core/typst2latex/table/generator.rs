@@ -59,9 +59,9 @@ pub struct LatexTableGenerator {
     pub use_booktabs: bool,
     /// Whether the table has a header
     pub has_header: bool,
-    /// Whether to draw the default frame and row rules. Typst's `#table`
-    /// strokes by default and `#grid` does not, so one cell model serves both.
-    /// An explicit `hline` in the source still draws either way.
+    /// Whether to draw the default frame and row rules: Typst's `#table`
+    /// strokes and `#grid` does not, so one cell model serves both. An explicit
+    /// `hline` still draws either way.
     pub ruled: bool,
     /// Track if we're currently processing header rows
     in_header: bool,
@@ -92,8 +92,7 @@ impl LatexTableGenerator {
         }
     }
 
-    /// Drop the default frame and row rules, for `#grid`, which does not
-    /// stroke. Explicit `hline`s are unaffected.
+    /// Drop the default rules, for `#grid`. See [`Self::ruled`].
     pub fn without_rules(mut self) -> Self {
         self.ruled = false;
         self
