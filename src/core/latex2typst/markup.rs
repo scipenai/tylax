@@ -26,8 +26,8 @@ use super::utils::{protect_top_level_comma, sanitize_label, to_roman_numeral};
 use crate::features::images::ImageAttributes;
 use crate::features::refs::{
     citation_mode_from_latex_command, label_to_typst, reference_to_typst,
-    reference_to_typst_without_supplement, reference_type_from_latex_command, Citation,
-    CitationMode, CiteGroup, Reference, ReferenceType,
+    reference_to_typst_without_supplement, reference_type_from_latex_command, typst_label,
+    Citation, CitationMode, CiteGroup, Reference, ReferenceType,
 };
 
 fn has_split_optional_citation_start(cmd: &CmdItem) -> bool {
@@ -609,7 +609,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             if conv.state.is_inside(&EnvironmentContext::Equation)
                 || conv.state.is_inside(&EnvironmentContext::Align)
             {
-                let _ = write!(output, "#<{}> ", clean_label);
+                let _ = write!(output, "#{} ", typst_label(&clean_label));
             } else {
                 output.push_str(&label_to_typst(&clean_label));
             }
@@ -699,7 +699,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
 
             if let Some(label) = conv.get_optional_arg(&cmd, 0) {
                 let clean_label = sanitize_label(&label);
-                let _ = write!(output, "#link(<{}>)[{}]", clean_label, text);
+                let _ = write!(output, "#link({})[{}]", typst_label(&clean_label), text);
             } else {
                 output.push_str(&text);
             }
@@ -3077,7 +3077,7 @@ fn expand_user_macro(conv: &mut LatexConverter, cmd: &CmdItem, macro_def: &Macro
 
     // Convert the expanded macro
     let mut output = String::new();
-    let tree = mitex_parser::parse(&result, conv.spec.clone());
+    let tree = super::utils::parse_latex(&result, conv.spec.clone());
     conv.visit_node(&tree, &mut output);
     output
 }

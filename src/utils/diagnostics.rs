@@ -23,6 +23,7 @@ use mitex_spec_gen::DEFAULT_SPEC;
 use std::collections::HashSet;
 use std::fmt;
 
+use crate::core::latex2typst::parse_latex;
 use crate::data::maps::TEX_COMMAND_SPEC;
 use fxhash::FxHashMap;
 use lazy_static::lazy_static;
@@ -272,8 +273,9 @@ pub fn check_latex(input: &str) -> CheckResult {
     let masked = mask_literal_regions(input);
     let input = masked.as_str();
 
-    // Parse the input
-    let tree = mitex_parser::parse(input, MERGED_SPEC.clone());
+    // Parse the input. `parse_latex` braces a `\limits` used as a script, which is
+    // invalid LaTeX; offsets after one such brace drift by two bytes.
+    let tree = parse_latex(input, MERGED_SPEC.clone());
 
     // Calculate line offsets for position reporting
     let line_offsets = compute_line_offsets(input);

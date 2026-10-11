@@ -12,6 +12,8 @@ mod math;
 mod table;
 mod utils;
 
+pub(crate) use utils::parse_latex;
+
 pub use context::{
     ConversionMode, ConversionState, EnvironmentContext, L2TOptions, LatexConverter, PreambleMode,
     MERGED_SPEC,

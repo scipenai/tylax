@@ -2,7 +2,11 @@
 //!
 //! This module contains pure utility functions that don't depend on converter state.
 
+use std::borrow::Cow;
+
 use mitex_parser::syntax::{SyntaxElement, SyntaxKind, SyntaxNode};
+use mitex_parser::CommandSpec;
+use mitex_spec::ArgShape;
 
 // =============================================================================
 // Text Processing Utilities
@@ -79,6 +83,74 @@ pub fn restore_protected_commands(input: &str) -> String {
     result = result.replace("\u{E000}PDFTEX\u{E001}", "pdfTeX");
     result = result.replace("\u{E000}BIBTEX\u{E001}", "BibTeX");
     result
+}
+
+// =============================================================================
+// Parsing
+// =============================================================================
+
+/// Parse LaTeX with mitex-parser, avoiding input that makes it panic.
+///
+/// Every conversion path must parse through this, never `mitex_parser::parse` directly.
+pub fn parse_latex(input: &str, spec: CommandSpec) -> SyntaxNode {
+    let input = brace_script_wrapping_commands(input, &spec);
+    mitex_parser::parse(&input, spec)
+}
+
+/// Brace a command that wraps earlier items (`\limits`, `\over`) when it is the
+/// argument of `_` or `^`.
+///
+/// Temporary workaround for <https://github.com/mitex-rs/mitex/issues/225>:
+/// mitex-parser 0.2.4 panics on input such as `__\limits` and `__\over`, because
+/// a `Left1` or `InfixGreedy` command inside a script wraps from a checkpoint
+/// before the open script node. LaTeX rejects these commands as a script argument,
+/// so bracing them changes no valid input. Remove this once a fixed mitex-parser is
+/// released; the test `fuzz_regressions::mitex_limits_panic_still_upstream` fails
+/// when that happens.
+fn brace_script_wrapping_commands<'a>(input: &'a str, spec: &CommandSpec) -> Cow<'a, str> {
+    let bytes = input.as_bytes();
+    let mut result = String::new();
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        let name_end = (i + 1..bytes.len())
+            .find(|&j| !bytes[j].is_ascii_alphabetic())
+            .unwrap_or(bytes.len());
+        let wraps = spec
+            .get_cmd(&input[i + 1..name_end])
+            .is_some_and(|cmd| matches!(cmd.args, ArgShape::Left1 | ArgShape::InfixGreedy));
+        if wraps && follows_script_operator(bytes, i) {
+            result.push_str(&input[copied..i]);
+            result.push('{');
+            result.push_str(&input[i..name_end]);
+            result.push('}');
+            copied = name_end;
+        }
+        // A control symbol such as `\_` is one character after the backslash.
+        i = name_end.max(i + 2);
+    }
+    if copied == 0 {
+        return Cow::Borrowed(input);
+    }
+    result.push_str(&input[copied..]);
+    Cow::Owned(result)
+}
+
+/// Whether the last non-whitespace byte before `pos` is an unescaped `_` or `^`.
+fn follows_script_operator(bytes: &[u8], pos: usize) -> bool {
+    let Some(op) = bytes[..pos].iter().rposition(|b| !b.is_ascii_whitespace()) else {
+        return false;
+    };
+    let backslashes = bytes[..op]
+        .iter()
+        .rev()
+        .take_while(|&&b| b == b'\\')
+        .count();
+    matches!(bytes[op], b'_' | b'^') && backslashes % 2 == 0
 }
 
 // =============================================================================

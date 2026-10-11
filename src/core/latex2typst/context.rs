@@ -26,7 +26,7 @@ use super::{ConversionResult, ConversionWarning, WarningKind};
 
 use super::utils::{
     clean_whitespace, convert_caption_text, extract_arg_content, extract_arg_content_with_braces,
-    extract_curly_inner_content, protect_top_level_comma, protect_zero_arg_commands,
+    extract_curly_inner_content, parse_latex, protect_top_level_comma, protect_zero_arg_commands,
     restore_protected_commands, sanitize_label,
 };
 
@@ -1650,7 +1650,7 @@ impl LatexConverter {
         let expanded_input = self.preprocess_expansion(&protected_input, false);
 
         // Parse with mitex-parser
-        let tree = mitex_parser::parse(&expanded_input, self.spec.clone());
+        let tree = parse_latex(&expanded_input, self.spec.clone());
 
         // Convert AST to Typst with pre-allocated buffer
         let estimated_size = (expanded_input.len() as f64 * 1.5) as usize;
@@ -1695,7 +1695,7 @@ impl LatexConverter {
         let expanded_input = self.preprocess_expansion(input, true);
 
         // Parse
-        let tree = mitex_parser::parse(&expanded_input, self.spec.clone());
+        let tree = parse_latex(&expanded_input, self.spec.clone());
 
         // Convert with pre-allocated buffer
         let mut output = String::with_capacity(expanded_input.len().max(256));

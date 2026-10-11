@@ -200,17 +200,23 @@ lazy_static! {
 }
 
 /// Escape special LaTeX characters in text
+///
+/// One pass, so the braces of `\textbackslash{}` are not escaped in turn.
 pub fn escape_latex_text(text: &str) -> String {
-    text.replace('\\', "\\textbackslash{}")
-        .replace('&', "\\&")
-        .replace('%', "\\%")
-        .replace('$', "\\$")
-        .replace('#', "\\#")
-        .replace('_', "\\_")
-        .replace('{', "\\{")
-        .replace('}', "\\}")
-        .replace('~', "\\textasciitilde{}")
-        .replace('^', "\\textasciicircum{}")
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\textbackslash{}"),
+            '~' => escaped.push_str("\\textasciitilde{}"),
+            '^' => escaped.push_str("\\textasciicircum{}"),
+            '&' | '%' | '$' | '#' | '_' | '{' | '}' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }
 
 /// Check if a string is a known color name
@@ -1189,6 +1195,7 @@ mod tests {
         assert_eq!(escape_latex_text("50%"), "50\\%");
         assert_eq!(escape_latex_text("$100"), "\\$100");
         assert_eq!(escape_latex_text("a_b"), "a\\_b");
+        assert_eq!(escape_latex_text(r"a\b"), r"a\textbackslash{}b");
     }
 
     #[test]
