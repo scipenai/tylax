@@ -1,0 +1,8 @@
+target
+corpus
+artifacts
+coverage
+logs
+seeds/latex_math
+seeds/typst_math
+Cargo.lock
