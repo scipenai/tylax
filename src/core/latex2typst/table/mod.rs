@@ -35,3 +35,4 @@ mod tests;
 // Re-export public API
 pub use cell::CellAlign;
 pub use parser::parse_with_grid_parser;
+pub(crate) use parser::{FULL_RULE_MARKER, PARTIAL_RULE_MARKER};
