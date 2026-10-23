@@ -2,7 +2,7 @@
 //!
 //! This module handles LaTeX commands like \section, \textbf, \cite, etc.
 
-use mitex_parser::syntax::{CmdItem, SyntaxElement};
+use mitex_parser::syntax::{CmdItem, SyntaxElement, SyntaxKind, SyntaxNode};
 use rowan::ast::AstNode;
 use std::fmt::Write;
 
@@ -26,8 +26,8 @@ use super::utils::{protect_top_level_comma, sanitize_label, to_roman_numeral};
 use crate::features::images::ImageAttributes;
 use crate::features::refs::{
     citation_mode_from_latex_command, label_to_typst, reference_to_typst,
-    reference_to_typst_without_supplement, reference_type_from_latex_command, Citation,
-    CitationMode, CiteGroup, Reference, ReferenceType,
+    reference_to_typst_without_supplement, reference_type_from_latex_command, typst_label,
+    Citation, CitationMode, CiteGroup, Reference, ReferenceType,
 };
 
 fn has_split_optional_citation_start(cmd: &CmdItem) -> bool {
@@ -279,12 +279,11 @@ pub fn convert_command_sym(conv: &mut LatexConverter, elem: SyntaxElement, outpu
                 output.push('&');
                 return;
             }
-            "{" => {
-                output.push('{');
-                return;
-            }
-            "}" => {
-                output.push('}');
+            "{" | "}" => {
+                if conv.is_unpaired_delimiter(&SyntaxElement::Token(t.clone())) {
+                    output.push('\\');
+                }
+                output.push_str(cmd_name);
                 return;
             }
             "~" => {
@@ -311,6 +310,51 @@ pub fn convert_command_sym(conv: &mut LatexConverter, elem: SyntaxElement, outpu
             output.push(' ');
         }
     }
+}
+
+/// The delimiter after `\big` and its kin, as written.
+///
+/// The parser takes the delimiter as the command's argument. A `[` or `]`
+/// there is the bracket itself, so the usual argument getters, which skip
+/// optional `[…]` arguments and strip brackets, would lose it.
+fn sized_delimiter_arg(cmd: &CmdItem) -> Option<String> {
+    let text = sized_delimiter_clause(cmd)?.text().to_string();
+    let text = text.trim();
+    let text = text
+        .strip_prefix('{')
+        .and_then(|inner| inner.strip_suffix('}'))
+        .unwrap_or(text);
+    Some(text.trim().to_string())
+}
+
+/// The delimiter token or `\{` command that `\big` and its kin take.
+pub(super) fn sized_delimiter_token(cmd: &CmdItem) -> Option<SyntaxElement> {
+    sized_delimiter_clause(cmd)?
+        .children_with_tokens()
+        .find(|child| child.kind() != SyntaxKind::TokenWhiteSpace)
+}
+
+/// The argument clause that holds the delimiter of `\big` and its kin.
+fn sized_delimiter_clause(cmd: &CmdItem) -> Option<SyntaxNode> {
+    cmd.syntax()
+        .children()
+        .find(|child| child.kind() == SyntaxKind::ClauseArgument)
+}
+
+/// Whether the node is the base of a `_` or `^` script. The slash form of a
+/// fraction would give that script to the denominator alone (`a/b^(2)`), and a
+/// group without `lr` would give it to its last item.
+pub(super) fn is_script_base(node: &SyntaxNode) -> bool {
+    // A base parses as `ItemAttachComponent[ ClauseArgument[ node ], marker, script ]`.
+    let Some(argument) = node.parent() else {
+        return false;
+    };
+    let Some(attach) = argument.parent() else {
+        return false;
+    };
+    argument.kind() == SyntaxKind::ClauseArgument
+        && attach.kind() == SyntaxKind::ItemAttachComponent
+        && attach.first_child().as_ref() == Some(&argument)
 }
 
 /// Look up a symbol in various symbol tables
@@ -609,7 +653,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             if conv.state.is_inside(&EnvironmentContext::Equation)
                 || conv.state.is_inside(&EnvironmentContext::Align)
             {
-                let _ = write!(output, "#<{}> ", clean_label);
+                let _ = write!(output, "#{} ", typst_label(&clean_label));
             } else {
                 output.push_str(&label_to_typst(&clean_label));
             }
@@ -699,7 +743,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
 
             if let Some(label) = conv.get_optional_arg(&cmd, 0) {
                 let clean_label = sanitize_label(&label);
-                let _ = write!(output, "#link(<{}>)[{}]", clean_label, text);
+                let _ = write!(output, "#link({})[{}]", typst_label(&clean_label), text);
             } else {
                 output.push_str(&text);
             }
@@ -2012,8 +2056,12 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             }
         }
         "@" => output.push_str("\\@"),
-        "{" => output.push('{'),
-        "}" => output.push('}'),
+        "{" | "}" => {
+            if conv.is_unpaired_delimiter(&elem) {
+                output.push('\\');
+            }
+            output.push_str(base_name);
+        }
 
         // Accents in text mode
         "`" => {
@@ -2128,8 +2176,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "coprod" => output.push_str("product.co "),
 
         // Delimiters
-        "left" | "right" | "bigl" | "bigr" | "Bigl" | "Bigr" | "biggl" | "biggr" | "Biggl"
-        | "Biggr" | "middle" => {
+        "left" | "right" | "middle" => {
             // These are handled by ItemLR
         }
 
@@ -2188,7 +2235,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "substack" => {
             // \substack{a \\ b} -> directly output content
-            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_content(&cmd, 0) {
                 output.push_str(&arg);
             }
         }
@@ -2469,7 +2516,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             }
         }
         "mathinner" => {
-            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_content(&cmd, 0) {
                 output.push_str(&arg);
                 output.push(' ');
             }
@@ -2477,7 +2524,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
 
         // Displaylines
         "displaylines" => {
-            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_content(&cmd, 0) {
                 output.push_str(&arg);
             }
         }
@@ -2585,10 +2632,8 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "degree" => output.push_str("degree "),
         "angle" => output.push_str("angle "),
         "ell" => output.push_str("ell "),
-        "hbar" => output.push_str("planck.reduce "),
         "Re" => output.push_str("Re "),
         "Im" => output.push_str("Im "),
-        "wp" => output.push_str("wp "),
         "aleph" => output.push_str("aleph "),
         "beth" => output.push_str("beth "),
         "gimel" => output.push_str("gimel "),
@@ -2621,7 +2666,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
 
         // Big delimiters - handled via data module
         _ if crate::data::symbols::is_big_delimiter_command(base_name) => {
-            if let Some(delim) = conv.get_required_arg(&cmd, 0) {
+            if let Some(delim) = sized_delimiter_arg(&cmd) {
                 if let Some(typst_delim) = crate::data::symbols::convert_delimiter(delim.trim()) {
                     match typst_delim {
                         // Keep size-command bars distinct until the pairing
@@ -2630,11 +2675,21 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                         "bar.v" => output.push_str(SIZED_BAR_SENTINEL),
                         "bar.v.double" => output.push_str(SIZED_DOUBLE_BAR_SENTINEL),
                         _ if !typst_delim.is_empty() => {
+                            if sized_delimiter_token(&cmd)
+                                .is_some_and(|token| conv.is_unpaired_delimiter(&token))
+                            {
+                                output.push('\\');
+                            }
                             output.push_str(typst_delim);
                             output.push(' ');
                         }
                         _ => {}
                     }
+                } else if delim.starts_with('\\') {
+                    // An arrow or other symbol: `\Bigg\downarrow`.
+                    let symbol = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
+                    output.push_str(symbol.trim());
+                    output.push(' ');
                 } else {
                     output.push_str(delim.trim());
                     output.push(' ');
@@ -2867,8 +2922,6 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             // Pass through unknown commands using AST-based processing
             // This preserves the behavior of convert_default_command from old version
             if conv.state.options.non_strict {
-                use mitex_parser::syntax::SyntaxKind;
-
                 if matches!(conv.state.mode, ConversionMode::Math) {
                     // In math mode, output as function call: \cmd{arg} -> cmd(arg)
                     let has_args = cmd
@@ -3077,8 +3130,8 @@ fn expand_user_macro(conv: &mut LatexConverter, cmd: &CmdItem, macro_def: &Macro
 
     // Convert the expanded macro
     let mut output = String::new();
-    let tree = mitex_parser::parse(&result, conv.spec.clone());
-    conv.visit_node(&tree, &mut output);
+    let tree = super::utils::parse_latex(&result, conv.spec.clone());
+    conv.visit_tree(&tree, &mut output);
     output
 }
 

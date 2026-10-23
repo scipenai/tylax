@@ -6,6 +6,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::features::images::escape_typst_string;
 use crate::features::refs::{citation_to_typst, Citation, CitationMode, CiteGroup, ReferenceType};
 use chrono::{NaiveDate, NaiveTime};
 use indexmap::IndexMap;
@@ -1451,6 +1452,9 @@ pub(crate) fn render_math_segments_to_typst_source(segments: &[MathSegment]) -> 
 }
 
 fn render_func_call_source(name: &str, args: &[Arg], prefix_hash: bool, in_math: bool) -> String {
+    // The arguments of a `#` call are code even inside math: `#box(a/b)` divides,
+    // so math content must stay `[$a/b$]`.
+    let in_math = in_math && !prefix_hash;
     let args_str: Vec<String> = args
         .iter()
         .map(|arg| match arg {
@@ -1665,7 +1669,7 @@ pub fn value_to_typst_arg(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Int(i) => i.to_string(),
         Value::Float(f) => format_float(*f),
-        Value::Str(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
+        Value::Str(s) => format!("\"{}\"", escape_typst_string(s)),
         Value::Length(l) => l.to_typst(),
         Value::Ratio(r) => format!("{}%", r * 100.0),
         Value::Angle(a) => format!("{}deg", a),
@@ -2063,6 +2067,7 @@ mod tests {
 
         assert_eq!(fixed, "#h(1cm)");
         assert_eq!(flex, "#h(1fr)");
-        assert_eq!(plain, "#h(foo)");
+        // The arguments of a `#` call are code, where bare `foo` is a variable.
+        assert_eq!(plain, "#h([foo])");
     }
 }

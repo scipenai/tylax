@@ -400,6 +400,11 @@ fn typst_to_latex_with_diagnostics_and_bibliography_keys(
         document_root = Some(root);
     }
 
+    warnings.extend(
+        ctx.warnings
+            .drain(..)
+            .map(|message| ConversionWarning::new(WarningKind::Other, message)),
+    );
     let mut output = ctx.finalize();
     output = match document_root.as_ref() {
         Some(root) => supplement::resolve_references(root, &output, bibliography_keys),

@@ -8,7 +8,8 @@ use std::fmt::Write;
 
 use super::context::{ConversionMode, LatexConverter};
 use super::environment::{convert_array_with_delim, convert_matrix_with_delim};
-use super::utils::protect_top_level_comma;
+use super::utils::{brackets_balanced, protect_top_level_comma, scan_brackets};
+use crate::data::symbols;
 
 /// Convert a math formula ($..$ or $$..$$)
 pub fn convert_formula(conv: &mut LatexConverter, elem: SyntaxElement, output: &mut String) {
@@ -215,6 +216,7 @@ pub fn convert_lr(conv: &mut LatexConverter, elem: SyntaxElement, output: &mut S
             _ => {}
         }
     }
+    let body_children = children.get(body_start..body_end).unwrap_or_default();
 
     // Check for common optimizations (matching pairs that don't need lr())
     // Also handle mismatched or missing delimiters gracefully
@@ -302,53 +304,21 @@ pub fn convert_lr(conv: &mut LatexConverter, elem: SyntaxElement, output: &mut S
         }
     }
 
-    // Check for norm: \left\| ... \right\| -> norm(...)
-    if left_delim.as_deref() == Some("bar.v.double")
-        && right_delim.as_deref() == Some("bar.v.double")
-    {
-        // Collect content first to check for commas
+    // \left| ... \right| -> abs(...) and \left\| ... \right\| -> norm(...)
+    let bar_function = match (left_delim.as_deref(), right_delim.as_deref()) {
+        (Some("bar.v"), Some("bar.v")) => Some(("bar.v", "abs")),
+        (Some("bar.v.double"), Some("bar.v.double")) => Some(("bar.v.double", "norm")),
+        _ => None,
+    };
+    if let Some((bar, function)) = bar_function {
         let mut content = String::new();
-        for child in children.iter().take(body_end).skip(body_start) {
-            match child {
-                SyntaxElement::Token(t) if t.text() == "." => {}
-                SyntaxElement::Token(t) if t.text().starts_with("\\right") => {}
-                _ => conv.visit_element(child.clone(), &mut content),
-            }
-        }
-        // Wrap in {} if content contains comma to prevent parsing as function args
-        output.push_str("norm(");
-        if content.contains(',') {
-            output.push('{');
-            output.push_str(content.trim());
-            output.push('}');
+        visit_lr_body(conv, body_children, &mut content);
+        if is_delimited_matrix(&content) {
+            let _ = write!(output, "lr({bar} {} {bar}) ", content.trim());
         } else {
-            output.push_str(&content);
+            // A top-level comma would split the argument.
+            let _ = write!(output, "{function}({}) ", protect_top_level_comma(&content));
         }
-        output.push_str(") ");
-        return;
-    }
-
-    // Check for abs: \left| ... \right| -> abs(...)
-    if left_delim.as_deref() == Some("bar.v") && right_delim.as_deref() == Some("bar.v") {
-        // Collect content first to check for commas
-        let mut content = String::new();
-        for child in children.iter().take(body_end).skip(body_start) {
-            match child {
-                SyntaxElement::Token(t) if t.text() == "." => {}
-                SyntaxElement::Token(t) if t.text().starts_with("\\right") => {}
-                _ => conv.visit_element(child.clone(), &mut content),
-            }
-        }
-        // Wrap in {} if content contains comma to prevent parsing as function args
-        output.push_str("abs(");
-        if content.contains(',') {
-            output.push('{');
-            output.push_str(content.trim());
-            output.push('}');
-        } else {
-            output.push_str(&content);
-        }
-        output.push_str(") ");
         return;
     }
 
@@ -363,13 +333,7 @@ pub fn convert_lr(conv: &mut LatexConverter, elem: SyntaxElement, output: &mut S
         }
 
         // Output body content
-        for child in children.iter().take(body_end).skip(body_start) {
-            match child {
-                SyntaxElement::Token(t) if t.text() == "." => {}
-                SyntaxElement::Token(t) if t.text().starts_with("\\right") => {}
-                _ => conv.visit_element(child.clone(), output),
-            }
-        }
+        visit_lr_body(conv, body_children, output);
 
         // Output right delimiter if present
         if let Some(ref delim) = right_delim {
@@ -381,41 +345,73 @@ pub fn convert_lr(conv: &mut LatexConverter, elem: SyntaxElement, output: &mut S
         return;
     }
 
-    // Output with or without lr()
-    if use_lr {
-        output.push_str("lr(");
-    }
-
-    // Output left delimiter
-    if let Some(ref delim) = left_delim {
-        if delim != "." && !delim.is_empty() {
-            output.push_str(delim);
-            output.push(' ');
-        }
-    }
-
     // Output body content
-    for child in children.iter().take(body_end).skip(body_start) {
-        match child {
-            SyntaxElement::Token(t) if t.text() == "." => {}
-            SyntaxElement::Token(t) if t.text().starts_with("\\right") => {}
-            _ => conv.visit_element(child.clone(), output),
+    let mut body = String::new();
+    visit_lr_body(conv, body_children, &mut body);
+
+    let delimiters = |name_brackets: bool| {
+        [&left_delim, &right_delim].map(|delim| {
+            let delim = delim.as_deref().filter(|d| *d != "." && !d.is_empty());
+            match delim {
+                Some(d) if name_brackets => bracket_delimiter_name(d).unwrap_or(d),
+                _ => delim.unwrap_or_default(),
+            }
+        })
+    };
+    let join = |[left, right]: [&str; 2]| {
+        let mut inner = String::new();
+        if !left.is_empty() {
+            inner.push_str(left);
+            inner.push(' ');
         }
+        inner.push_str(&body);
+        if !right.is_empty() {
+            inner.push(' ');
+            inner.push_str(right);
+        }
+        inner
+    };
+    let mut inner = join(delimiters(false));
+    // `lr({ ...)` is left for `fix_left_brace_cases`, which makes it `cases`.
+    let brace_cases = left_delim.as_deref() == Some("{") && right_delim.as_deref() == Some(".");
+    if use_lr && !brace_cases {
+        // Typst closes an opening bracket with any closing one, so a bracket
+        // delimiter that does not balance opens a group or ends the call:
+        // `\left( a \right.` gave `lr(( a)`. Spell such delimiters by name.
+        if !brackets_balanced(&inner, &[]) {
+            inner = join(delimiters(true));
+        }
+        // A comma outside every group would split the argument of `lr`.
+        inner = protect_top_level_comma(&inner);
     }
 
-    // Output right delimiter with space before for clarity
-    if let Some(ref delim) = right_delim {
-        if delim != "." && !delim.is_empty() {
-            output.push(' ');
-            output.push_str(delim);
-        }
-    }
-
-    if use_lr {
-        output.push_str(") ");
+    // `lr` takes a bracket at either edge of its content as its own delimiter,
+    // so `\left. \left[ n \right] \right.` would scale `[` and `]` as the outer
+    // pair. With no delimiter on either side, the content alone renders the same,
+    // unless it carries a script.
+    let null_pair = left_delim.as_deref() == Some(".") && right_delim.as_deref() == Some(".");
+    if null_pair && edge_is_bracket(&body) && !super::markup::is_script_base(&node) {
+        output.push_str(body.trim());
+        output.push(' ');
+    } else if use_lr {
+        let _ = write!(output, "lr({}) ", inner);
     } else {
+        output.push_str(&inner);
         output.push(' ');
     }
+}
+
+/// Whether converted math starts or ends with something `lr` would take as a delimiter.
+fn edge_is_bracket(body: &str) -> bool {
+    let body = body.trim();
+    body.starts_with(['(', '[', '{', '|', '‖'])
+        || body.ends_with([')', ']', '}', '|', '‖'])
+        || ["bar.v", "chevron.l", "floor.l", "ceil.l"]
+            .iter()
+            .any(|open| body.starts_with(open))
+        || ["bar.v", "bar.v.double", "chevron.r", "floor.r", "ceil.r"]
+            .iter()
+            .any(|close| body.ends_with(close))
 }
 
 enum LrMatrixKind {
@@ -561,6 +557,27 @@ fn emit_nested_lr_matrix_like(
     output.push(' ');
     output.push_str(outer_delim);
     output.push_str(") ");
+}
+
+/// Whether converted math is a single delimited matrix, `mat(delim: "(", …)`.
+/// Bars round one keep the `lr` form that `\left| \begin{pmatrix}` gets, so
+/// `\left| \left( \begin{matrix} … \right) \right|` reads back the same.
+fn is_delimited_matrix(content: &str) -> bool {
+    let content = content.trim();
+    if !content.starts_with("mat(delim: \"") {
+        return false;
+    }
+    // The call must close at the very end, so `mat(…) x` does not count.
+    let call = &content["mat".len()..];
+    let mut close = None;
+    scan_brackets(call, |offset, ch, depth| {
+        let closes_call = depth == 1 && matches!(ch, ')' | ']' | '}');
+        if closes_call {
+            close = Some(offset);
+        }
+        !closes_call
+    });
+    close == Some(call.len() - 1)
 }
 
 /// Convert subscript/superscript attachment
@@ -748,26 +765,50 @@ fn extract_delimiter_from_text(text: &str) -> &str {
     }
 }
 
+/// The Typst symbol name of a bracket delimiter.
+fn bracket_delimiter_name(delim: &str) -> Option<&'static str> {
+    match delim {
+        "(" => Some("paren.l"),
+        ")" => Some("paren.r"),
+        "[" => Some("bracket.l"),
+        "]" => Some("bracket.r"),
+        "{" => Some("brace.l"),
+        "}" => Some("brace.r"),
+        _ => None,
+    }
+}
+
+/// Visit the content between `\left` and `\right`.
+///
+/// It goes through `visit_elements`, so a `\displaystyle` inside is scoped
+/// as in any other group; one element at a time it fell through to the bare
+/// identifier `display`.
+fn visit_lr_body(conv: &mut LatexConverter, body: &[SyntaxElement], output: &mut String) {
+    let body: Vec<SyntaxElement> = body
+        .iter()
+        .filter(|child| match child {
+            SyntaxElement::Token(t) => t.text() != "." && !t.text().starts_with("\\right"),
+            SyntaxElement::Node(_) => true,
+        })
+        .cloned()
+        .collect();
+    conv.visit_elements(&body, output);
+}
+
 /// Convert a LaTeX delimiter to Typst equivalent
 fn convert_delimiter(delim: &str) -> String {
-    match delim.trim() {
-        "." => ".".to_string(), // Empty delimiter
-        "(" => "(".to_string(),
-        ")" => ")".to_string(),
-        "[" => "[".to_string(),
-        "]" => "]".to_string(),
-        "\\{" | "\\lbrace" => "{".to_string(),
-        "\\}" | "\\rbrace" => "}".to_string(),
-        "|" | "\\vert" | "\\lvert" | "\\rvert" => "bar.v".to_string(),
-        "\\|" | "\\Vert" | "\\lVert" | "\\rVert" => "bar.v.double".to_string(),
-        "\\langle" => "chevron.l".to_string(),
-        "\\rangle" => "chevron.r".to_string(),
-        "\\lfloor" => "floor.l".to_string(),
-        "\\rfloor" => "floor.r".to_string(),
-        "\\lceil" => "ceil.l".to_string(),
-        "\\rceil" => "ceil.r".to_string(),
-        "\\lgroup" => "paren.l.flat".to_string(),
-        "\\rgroup" => "paren.r.flat".to_string(),
-        other => other.to_string(),
+    let delim = delim.trim();
+    match delim {
+        "." => ".", // Empty delimiter
+        "\\uparrow" => "arrow.t",
+        "\\downarrow" => "arrow.b",
+        "\\updownarrow" => "arrow.t.b",
+        "\\Uparrow" => "arrow.t.double",
+        "\\Downarrow" => "arrow.b.double",
+        "\\Updownarrow" => "arrow.t.b.double",
+        "\\lgroup" => "paren.l.flat",
+        "\\rgroup" => "paren.r.flat",
+        _ => symbols::convert_delimiter(delim).unwrap_or(delim),
     }
+    .to_string()
 }

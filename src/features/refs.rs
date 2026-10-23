@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use crate::features::images::escape_typst_string;
+
 /// Which bibliography backend a document uses, decided from conversion events
 /// (a rendered `thebibliography` and/or external `\bibliography`-family
 /// commands) rather than by scanning the produced Typst. Governs how deferred
@@ -625,7 +627,7 @@ pub fn citation_to_typst(group: &CiteGroup) -> String {
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let mut one = format!("#cite(<{}>", c.key);
+            let mut one = format!("#cite({}", typst_label(&c.key));
 
             // Form is per-citation; biblatex multi-key groups share one mode.
             match c.mode {
@@ -658,8 +660,21 @@ pub fn citation_to_typst(group: &CiteGroup) -> String {
 
 /// Check if a citation key is simple (can use @key syntax)
 fn is_simple_key(key: &str) -> bool {
-    key.chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    typst_syntax::is_valid_label_literal_id(key)
+        && key
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+}
+
+/// A Typst expression for the label `key`: the literal `<key>` when Typst's
+/// label syntax allows the key, else `label("key")`, which takes any string.
+/// LaTeX keys may contain characters such as `~` or `=` that `<..>` rejects.
+pub fn typst_label(key: &str) -> String {
+    if typst_syntax::is_valid_label_literal_id(key) {
+        format!("<{}>", key)
+    } else {
+        format!("label(\"{}\")", escape_typst_string(key))
+    }
 }
 
 /// Render a reference that must show only its number, with no supplement word.
@@ -678,7 +693,7 @@ fn is_simple_key(key: &str) -> bool {
 /// are author-chosen, so prefixing (`eq-`) would point at a label the document
 /// never defines (issue #43).
 pub fn reference_to_typst_without_supplement(reference: &Reference) -> String {
-    format!("#ref(<{}>, supplement: none)", reference.target)
+    format!("#ref({}, supplement: none)", typst_label(&reference.target))
 }
 
 /// Convert reference to Typst
@@ -688,7 +703,7 @@ pub fn reference_to_typst(reference: &Reference) -> String {
             let target = if is_simple_key(&reference.target) {
                 format!("@{}", reference.target)
             } else {
-                format!("#ref(<{}>)", reference.target)
+                format!("#ref({})", typst_label(&reference.target))
             };
             format!("#locate(loc => {{{}.page()}})", target)
         }
@@ -696,15 +711,21 @@ pub fn reference_to_typst(reference: &Reference) -> String {
             if is_simple_key(&reference.target) {
                 format!("@{}", reference.target)
             } else {
-                format!("#ref(<{}>)", reference.target)
+                format!("#ref({})", typst_label(&reference.target))
             }
         }
     }
 }
 
-/// Convert label to Typst
+/// Convert label to Typst. In markup, `#label("..")` attaches to the preceding
+/// element just as `<..>` does.
 pub fn label_to_typst(id: &str) -> String {
-    format!("<{}>", id)
+    let label = typst_label(id);
+    if label.starts_with('<') {
+        label
+    } else {
+        format!("#{}", label)
+    }
 }
 
 // ============================================================================

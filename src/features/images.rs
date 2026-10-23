@@ -303,7 +303,7 @@ fn split_keyvals(s: &str) -> Vec<String> {
 }
 
 /// Escape string for Typst
-fn escape_typst_string(s: &str) -> String {
+pub(crate) fn escape_typst_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
@@ -408,7 +408,10 @@ impl Figure {
 
         // Label
         if let Some(ref label) = self.label {
-            result.push_str(&format!(" <{}>", label));
+            result.push_str(&format!(
+                " {}",
+                crate::features::refs::label_to_typst(label)
+            ));
         }
 
         result

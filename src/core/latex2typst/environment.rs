@@ -11,6 +11,7 @@ use super::table::{parse_with_grid_parser, CellAlign};
 use super::utils::sanitize_label;
 use super::{ConversionWarning, WarningKind};
 use crate::data::constants::{CodeBlockOptions, TheoremStyle, LANGUAGE_MAP, THEOREM_TYPES};
+use crate::features::refs::label_to_typst;
 
 /// Split a cleaned Typst math body into row strings.
 ///
@@ -26,37 +27,58 @@ fn split_math_rows(cleaned: &str) -> Vec<String> {
         .collect()
 }
 
-/// Split a single inline `#<label>` marker out of a math row.
+/// Find the first inline label marker in math: `#<label>`, or `#label("..")` for
+/// a key that `<..>` cannot hold. Returns its byte range and the label name.
+fn find_inline_label(s: &str) -> Option<(usize, usize, String)> {
+    let literal = s.find("#<").and_then(|start| {
+        let rel_end = s[start + 2..].find('>')?;
+        let end = start + 2 + rel_end;
+        Some((start, end + 1, s[start + 2..end].to_string()))
+    });
+    let call = s.find("#label(\"").and_then(|start| {
+        let open = start + "#label(\"".len();
+        let mut label = String::new();
+        let mut chars = s[open..].char_indices();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '\\' => label.extend(chars.next().map(|(_, escaped)| escaped)),
+                '"' => {
+                    let close = open + i + 1;
+                    return s[close..]
+                        .starts_with(')')
+                        .then(|| (start, close + 1, label));
+                }
+                _ => label.push(c),
+            }
+        }
+        None
+    });
+    match (literal, call) {
+        (Some(a), Some(b)) => Some(if a.0 < b.0 { a } else { b }),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Split a single inline label marker out of a math row.
 ///
 /// Returns the row text with the marker removed and, if present, the label name.
 fn take_row_label(row: &str) -> (String, Option<String>) {
-    if let Some(start) = row.find("#<") {
-        if let Some(rel_end) = row[start + 2..].find('>') {
-            let end = start + 2 + rel_end;
-            let label = row[start + 2..end].to_string();
-            let mut body = String::with_capacity(row.len());
-            body.push_str(&row[..start]);
-            body.push_str(&row[end + 1..]);
-            return (body, Some(label));
-        }
+    if let Some((start, end, label)) = find_inline_label(row) {
+        let mut body = String::with_capacity(row.len());
+        body.push_str(&row[..start]);
+        body.push_str(&row[end..]);
+        return (body, Some(label));
     }
     (row.to_string(), None)
 }
 
-/// Remove every inline `#<label>` marker from a math body.
+/// Remove every inline label marker from a math body.
 fn strip_inline_labels(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
-    while let Some(start) = rest.find("#<") {
+    while let Some((start, end, _)) = find_inline_label(rest) {
         out.push_str(&rest[..start]);
-        match rest[start + 2..].find('>') {
-            Some(rel_end) => rest = &rest[start + 2 + rel_end + 1..],
-            None => {
-                // Unterminated marker: keep the remainder verbatim.
-                out.push_str(&rest[start..]);
-                return out;
-            }
-        }
+        rest = &rest[end..];
     }
     out.push_str(rest);
     out
@@ -81,7 +103,7 @@ fn emit_labelled_math_rows(conv: &mut LatexConverter, output: &mut String, clean
         output.push_str("$ ");
         output.push_str(strip_inline_labels(cleaned).trim());
         output.push_str(" $");
-        let _ = writeln!(output, " <{}>", sanitize_label(&labels[0]));
+        let _ = writeln!(output, " {}", label_to_typst(&sanitize_label(&labels[0])));
         return true;
     }
 
@@ -100,7 +122,7 @@ fn emit_labelled_math_rows(conv: &mut LatexConverter, output: &mut String, clean
         output.push_str(body);
         output.push_str(" $");
         if let Some(label) = label {
-            let _ = write!(output, " <{}>", sanitize_label(&label));
+            let _ = write!(output, " {}", label_to_typst(&sanitize_label(&label)));
         }
         output.push('\n');
     }
@@ -429,7 +451,7 @@ fn convert_figure(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut Str
     output.push(')');
 
     if !label_text.is_empty() {
-        let _ = write!(output, " <{}>", sanitize_label(&label_text));
+        let _ = write!(output, " {}", label_to_typst(&sanitize_label(&label_text)));
     }
 
     output.push('\n');
@@ -491,7 +513,7 @@ fn convert_table(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut Stri
     output.push_str("\n] ");
 
     if !label_text.is_empty() {
-        let _ = write!(output, "<{}>", sanitize_label(&label_text));
+        let _ = write!(output, "{}", label_to_typst(&sanitize_label(&label_text)));
     }
 
     output.push('\n');
@@ -611,7 +633,7 @@ fn convert_equation(
         output.push_str(" $");
 
         if !label.is_empty() {
-            let _ = write!(output, " <{}>", sanitize_label(&label));
+            let _ = write!(output, " {}", label_to_typst(&sanitize_label(&label)));
         }
     }
 
@@ -891,7 +913,7 @@ fn convert_lstlisting(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut
         let _ = writeln!(output, "  caption: [{}]", caption);
         output.push(')');
         if let Some(ref label) = options.label {
-            let _ = write!(output, " <{}>", sanitize_label(label));
+            let _ = write!(output, " {}", label_to_typst(&sanitize_label(label)));
         }
         output.push('\n');
     } else {
@@ -929,7 +951,7 @@ fn convert_minted(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut Str
         let _ = writeln!(output, "  caption: [{}]", caption);
         output.push(')');
         if let Some(ref label) = options.label {
-            let _ = write!(output, " <{}>", sanitize_label(label));
+            let _ = write!(output, " {}", label_to_typst(&sanitize_label(label)));
         }
         output.push('\n');
     } else {
@@ -1101,7 +1123,11 @@ fn convert_thebibliography_content(
             if in_item {
                 output.push_str("] ");
                 if !current_label.is_empty() {
-                    let _ = write!(output, "<{}>", sanitize_label(&current_label));
+                    let _ = write!(
+                        output,
+                        "{}",
+                        label_to_typst(&sanitize_label(&current_label))
+                    );
                 }
                 output.push('\n');
             }
@@ -1141,7 +1167,11 @@ fn convert_thebibliography_content(
     if in_item {
         output.push_str("] ");
         if !current_label.is_empty() {
-            let _ = write!(output, "<{}>", sanitize_label(&current_label));
+            let _ = write!(
+                output,
+                "{}",
+                label_to_typst(&sanitize_label(&current_label))
+            );
         }
         output.push('\n');
     }

@@ -1,6 +1,6 @@
-use super::context::{ConvertContext, EnvironmentContext, TokenType};
+use super::context::{ConvertContext, EnvironmentContext, T2LOptions, TokenType};
 use super::math_ir::{
-    normalize_math_ir, MathCaseRow, MathCommand, MathEnvironment, MathIr, MathSpacing,
+    normalize_math_ir, ArrayLayout, MathCommand, MathEnvironment, MathIr, MathSpacing,
     MathStyleMode,
 };
 
@@ -24,7 +24,7 @@ pub fn emit_math_ir(ir: &MathIr, ctx: &mut ConvertContext) {
             close,
         } => emit_delimited(open, content, close, ctx),
         MathIr::Apply { callee, args } => emit_apply(callee, args, ctx),
-        MathIr::Limits(content) => emit_math_ir(content, ctx),
+        MathIr::Limits(content) => emit_limits(content, ctx),
         MathIr::Style { mode, content } => emit_style(mode, content, ctx),
         MathIr::Attachment { .. } => emit_attachment(ir, ctx),
         MathIr::Script {
@@ -32,7 +32,15 @@ pub fn emit_math_ir(ir: &MathIr, ctx: &mut ConvertContext) {
             sub,
             sup,
             primes,
-        } => emit_script(base, *primes, sub.as_deref(), sup.as_deref(), ctx),
+            sup_first,
+        } => emit_script(
+            base,
+            *primes,
+            sub.as_deref(),
+            sup.as_deref(),
+            *sup_first,
+            ctx,
+        ),
         MathIr::Command(command) => emit_command(command, ctx),
         MathIr::Environment(environment) => emit_environment(environment, ctx),
         MathIr::RawLiteral(text) => emit_raw_literal(text, ctx),
@@ -52,12 +60,18 @@ fn emit_apply(callee: &MathIr, args: &[MathIr], ctx: &mut ConvertContext) {
     ctx.last_token = TokenType::CloseParen;
 }
 
-pub fn emit_math_ir_to_string(ir: &MathIr, template: &ConvertContext) -> String {
+/// Render math IR in a context of its own, such as an equation inside a text
+/// argument, which is built outside an emitting context.
+pub fn render_math_ir(ir: &MathIr, options: &T2LOptions) -> String {
     let mut nested = ConvertContext::new();
-    nested.options = template.options.clone();
+    nested.options = options.clone();
     nested.in_math = true;
     emit_math_ir(ir, &mut nested);
     nested.finalize()
+}
+
+pub fn emit_math_ir_to_string(ir: &MathIr, template: &ConvertContext) -> String {
+    render_math_ir(ir, &template.options)
 }
 
 fn emit_symbol(symbol: &str, ctx: &mut ConvertContext) {
@@ -140,6 +154,16 @@ fn emit_style(mode: &MathStyleMode, content: &MathIr, ctx: &mut ConvertContext) 
                 ctx.last_token = TokenType::Command;
             }
         }
+        // A group ends the switch, so no restoring switch is needed.
+        MathStyleMode::Script | MathStyleMode::ScriptScript => {
+            ctx.push(if *mode == MathStyleMode::Script {
+                r"{\scriptstyle "
+            } else {
+                r"{\scriptscriptstyle "
+            });
+            emit_math_ir(content, ctx);
+            ctx.push("}");
+        }
     }
     ctx.last_token = TokenType::Command;
 }
@@ -197,30 +221,133 @@ fn emit_attachment(attachment: &MathIr, ctx: &mut ConvertContext) {
     ctx.last_token = TokenType::Command;
 }
 
+/// Large operators that take `\limits` in LaTeX.
+const MATHOP_SYMBOLS: &[&str] = &[
+    r"\sum",
+    r"\prod",
+    r"\coprod",
+    r"\int",
+    r"\iint",
+    r"\iiint",
+    r"\oint",
+    r"\bigcup",
+    r"\bigcap",
+    r"\bigsqcup",
+    r"\biguplus",
+    r"\bigvee",
+    r"\bigwedge",
+    r"\bigoplus",
+    r"\bigotimes",
+    r"\bigodot",
+    r"\lim",
+    r"\limsup",
+    r"\liminf",
+    r"\max",
+    r"\min",
+    r"\sup",
+    r"\inf",
+    r"\det",
+    r"\gcd",
+    r"\Pr",
+];
+
+fn is_mathop(ir: &MathIr) -> bool {
+    match ir {
+        MathIr::Symbol(symbol) => MATHOP_SYMBOLS.contains(&symbol.as_str()),
+        MathIr::Command(command) => command.latex == r"\operatorname",
+        MathIr::Delimited { open, .. } => open.starts_with(r"\mathop{"),
+        _ => false,
+    }
+}
+
+/// `limits(x)`: `\operatorname*` for a named operator, `\limits` after any
+/// other LaTeX operator. Other content is emitted as is, and `emit_script`
+/// stacks its scripts with `\overset` and `\underset`.
+fn emit_limits(content: &MathIr, ctx: &mut ConvertContext) {
+    match content {
+        MathIr::Command(command) if command.latex == r"\operatorname" => {
+            emit_command(
+                &MathCommand {
+                    latex: r"\operatorname*".to_string(),
+                    ..command.clone()
+                },
+                ctx,
+            );
+        }
+        _ if is_mathop(content) => {
+            emit_math_ir(content, ctx);
+            ctx.push(r"\limits");
+            ctx.last_token = TokenType::Command;
+        }
+        _ => emit_math_ir(content, ctx),
+    }
+}
+
+/// Scripts set above and below a base that is not a LaTeX operator, where
+/// `\limits` is an error: `limits(F)^(a)` → `\overset{a}{F}`.
+fn emit_stacked_scripts(
+    base: &MathIr,
+    sub: Option<&MathIr>,
+    sup: Option<&MathIr>,
+    ctx: &mut ConvertContext,
+) {
+    let mut stacked = emit_math_ir_to_string(base, ctx).trim().to_string();
+    if let Some(sup) = sup {
+        stacked = format!(
+            r"\overset{{{}}}{{{}}}",
+            render_script_fragment(sup, ctx),
+            stacked
+        );
+    }
+    if let Some(sub) = sub {
+        stacked = format!(
+            r"\underset{{{}}}{{{}}}",
+            render_script_fragment(sub, ctx),
+            stacked
+        );
+    }
+    ctx.push(&stacked);
+    ctx.last_token = TokenType::Command;
+}
+
 fn emit_script(
     base: &MathIr,
     primes: usize,
     sub: Option<&MathIr>,
     sup: Option<&MathIr>,
+    sup_first: bool,
     ctx: &mut ConvertContext,
 ) {
+    if let MathIr::Limits(content) = base {
+        if primes == 0 && !is_mathop(content) && (sub.is_some() || sup.is_some()) {
+            emit_stacked_scripts(content, sub, sup, ctx);
+            return;
+        }
+    }
+
     emit_math_ir(base, ctx);
 
     if primes > 0 {
+        // LaTeX rejects `'^2` as a double superscript; `{}'^2` is valid.
+        if base.is_empty() {
+            ctx.push("{}");
+        }
         ctx.push(&"'".repeat(primes));
         ctx.last_token = TokenType::Punctuation;
     }
 
-    if let Some(sub) = sub {
-        ctx.push("_");
-        ctx.last_token = TokenType::Operator;
-        emit_script_content_for_base(sub, Some(base), ctx);
-    }
-
-    if let Some(sup) = sup {
-        ctx.push("^");
-        ctx.last_token = TokenType::Operator;
-        emit_script_content_for_base(sup, Some(base), ctx);
+    // Keep the source order, so that `x^a_b` round-trips to the same Typst.
+    let scripts = if sup_first {
+        [("^", sup), ("_", sub)]
+    } else {
+        [("_", sub), ("^", sup)]
+    };
+    for (marker, script) in scripts {
+        if let Some(script) = script {
+            ctx.push(marker);
+            ctx.last_token = TokenType::Operator;
+            emit_script_content_for_base(script, Some(base), ctx);
+        }
     }
 }
 
@@ -433,6 +560,62 @@ fn emit_script_content(ir: &MathIr, ctx: &mut ConvertContext) {
     emit_rendered_script_content(&rendered, ctx);
 }
 
+/// A matrix with rules or a non-centred alignment, as an `array` inside the
+/// delimiters its environment name implies.
+fn emit_array(name: &str, rows: &[Vec<MathIr>], layout: &ArrayLayout, ctx: &mut ConvertContext) {
+    let (open, close) = match name {
+        "pmatrix" => ("(", ")"),
+        "bmatrix" => ("[", "]"),
+        "Bmatrix" => ("\\{", "\\}"),
+        "vmatrix" => ("|", "|"),
+        "Vmatrix" => ("\\|", "\\|"),
+        _ => ("", ""),
+    };
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    let mut spec = String::new();
+    for column in 1..=columns {
+        spec.push(layout.align);
+        if column < columns && layout.vlines.contains(&column) {
+            spec.push('|');
+        }
+    }
+    if !open.is_empty() {
+        ctx.push("\\left");
+        ctx.push(open);
+    }
+    ctx.push("\\begin{array}{");
+    ctx.push(&spec);
+    ctx.push("}\n");
+    emit_rows(rows, &layout.hlines, ctx);
+    ctx.push("\\end{array}");
+    if !close.is_empty() {
+        ctx.push("\\right");
+        ctx.push(close);
+    }
+    ctx.last_token = TokenType::Command;
+}
+
+/// The rows of a matrix, with `\hline` before the rows counted in `hlines`.
+fn emit_rows(rows: &[Vec<MathIr>], hlines: &[usize], ctx: &mut ConvertContext) {
+    for (row_index, row) in rows.iter().enumerate() {
+        ctx.push("  ");
+        if row_index > 0 && hlines.contains(&row_index) {
+            ctx.push("\\hline ");
+        }
+        for (cell_index, cell) in row.iter().enumerate() {
+            if cell_index > 0 {
+                ctx.push(" & ");
+            }
+            ctx.push(&emit_math_ir_to_string(cell, ctx));
+        }
+        if row_index + 1 < rows.len() {
+            ctx.push(" \\\\\n");
+        } else {
+            ctx.push("\n");
+        }
+    }
+}
+
 fn emit_command(command: &MathCommand, ctx: &mut ConvertContext) {
     ctx.push(&command.latex);
     if let Some(optional_arg) = &command.optional_arg {
@@ -443,7 +626,12 @@ fn emit_command(command: &MathCommand, ctx: &mut ConvertContext) {
 
     for arg in &command.args {
         ctx.push("{");
-        ctx.push(&emit_math_ir_to_string(arg, ctx));
+        match arg {
+            // Text is typeset as written, so its edge spaces stay:
+            // `x " and " y` → `x \text{ and } y`.
+            MathIr::RawLiteral(text) if command.latex == "\\text" => ctx.push(text),
+            _ => ctx.push(&emit_math_ir_to_string(arg, ctx)),
+        }
         ctx.push("}");
     }
 
@@ -452,24 +640,16 @@ fn emit_command(command: &MathCommand, ctx: &mut ConvertContext) {
 
 fn emit_environment(environment: &MathEnvironment, ctx: &mut ConvertContext) {
     match environment {
-        MathEnvironment::Matrix { name, rows } => {
+        MathEnvironment::Matrix {
+            name,
+            rows,
+            layout: Some(layout),
+        } => emit_array(name, rows, layout, ctx),
+        MathEnvironment::Matrix { name, rows, .. } => {
             ctx.push("\\begin{");
             ctx.push(name);
             ctx.push("}\n");
-            for (row_index, row) in rows.iter().enumerate() {
-                ctx.push("  ");
-                for (cell_index, cell) in row.iter().enumerate() {
-                    if cell_index > 0 {
-                        ctx.push(" & ");
-                    }
-                    ctx.push(&emit_math_ir_to_string(cell, ctx));
-                }
-                if row_index + 1 < rows.len() {
-                    ctx.push(" \\\\\n");
-                } else {
-                    ctx.push("\n");
-                }
-            }
+            emit_rows(rows, &[], ctx);
             ctx.push("\\end{");
             ctx.push(name);
             ctx.push("}");
@@ -478,7 +658,8 @@ fn emit_environment(environment: &MathEnvironment, ctx: &mut ConvertContext) {
         MathEnvironment::Cases { rows } => {
             ctx.push("\\begin{cases}\n");
             for (index, row) in rows.iter().enumerate() {
-                emit_case_row(row, ctx);
+                ctx.push("  ");
+                ctx.push(&emit_math_ir_to_string(row, ctx));
                 if index + 1 < rows.len() {
                     ctx.push(" \\\\\n");
                 } else {
@@ -488,15 +669,6 @@ fn emit_environment(environment: &MathEnvironment, ctx: &mut ConvertContext) {
             ctx.push("\\end{cases}");
             ctx.last_token = TokenType::Command;
         }
-    }
-}
-
-fn emit_case_row(row: &MathCaseRow, ctx: &mut ConvertContext) {
-    ctx.push("  ");
-    ctx.push(&emit_math_ir_to_string(&row.value, ctx));
-    if let Some(condition) = &row.condition {
-        ctx.push(" & ");
-        ctx.push(&emit_math_ir_to_string(condition, ctx));
     }
 }
 
