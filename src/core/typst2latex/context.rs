@@ -362,12 +362,16 @@ impl ConvertContext {
     /// Finalize and clean up the output
     pub fn finalize(self) -> String {
         // Clean up the output in-place where possible
-        let trimmed = self.output.trim();
+        let trimmed = trim_latex(&self.output);
 
         // Estimate final capacity (usually slightly smaller than input)
         let mut result = String::with_capacity(trimmed.len());
 
         let mut prev_char = None;
+        // Brace depth, and the depth inside a `\text{…}` argument, whose
+        // spaces are typeset and so are kept.
+        let mut depth = 0usize;
+        let mut text_depth = None;
 
         for ch in trimmed.chars() {
             // Handle double spaces
@@ -375,14 +379,37 @@ impl ConvertContext {
                 continue;
             }
 
+            // Inside a text argument, its closing brace included.
+            let in_text = text_depth.is_some();
+            if prev_char != Some('\\') {
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        if text_depth.is_none() && result.ends_with("\\text") {
+                            text_depth = Some(depth);
+                        }
+                    }
+                    '}' => {
+                        if text_depth == Some(depth) {
+                            text_depth = None;
+                        }
+                        depth = depth.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+            }
+
             // Handle spacing around braces in math mode
-            if self.options.math_only {
+            if self.options.math_only && !in_text {
                 if ch == ' ' && prev_char == Some('{') {
                     continue; // Skip space after {
                 }
                 if ch == '}' && prev_char == Some(' ') {
-                    // Remove trailing space before }
-                    if result.ends_with(' ') {
+                    // Remove trailing space before }, unless it is a control
+                    // space: `\mathtt{\ }`.
+                    if result.ends_with(' ')
+                        && !ends_with_command_backslash(&result[..result.len() - 1])
+                    {
                         result.pop();
                     }
                 }
@@ -405,6 +432,23 @@ impl Default for ConvertContext {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `s` trimmed, keeping the space of a control space, `\ `, at the end.
+pub(crate) fn trim_latex(s: &str) -> &str {
+    let s = s.trim_start();
+    let trimmed = s.trim_end();
+    if ends_with_command_backslash(trimmed) && trimmed.len() < s.len() {
+        &s[..trimmed.len() + 1]
+    } else {
+        trimmed
+    }
+}
+
+/// Whether `s` ends in a backslash that starts a command, rather than one
+/// that ends `\\`.
+pub(crate) fn ends_with_command_backslash(s: &str) -> bool {
+    (s.len() - s.trim_end_matches('\\').len()) % 2 == 1
 }
 
 #[cfg(test)]

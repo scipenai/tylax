@@ -2,7 +2,12 @@
 //!
 //! This module contains pure utility functions that don't depend on converter state.
 
+use std::borrow::Cow;
+use std::fmt::Write;
+
 use mitex_parser::syntax::{SyntaxElement, SyntaxKind, SyntaxNode};
+use mitex_parser::CommandSpec;
+use mitex_spec::ArgShape;
 
 // =============================================================================
 // Text Processing Utilities
@@ -79,6 +84,217 @@ pub fn restore_protected_commands(input: &str) -> String {
     result = result.replace("\u{E000}PDFTEX\u{E001}", "pdfTeX");
     result = result.replace("\u{E000}BIBTEX\u{E001}", "BibTeX");
     result
+}
+
+// =============================================================================
+// Parsing
+// =============================================================================
+
+/// Parse LaTeX with mitex-parser, avoiding input that makes it panic.
+///
+/// Every conversion path must parse through this, never `mitex_parser::parse` directly.
+pub fn parse_latex(input: &str, spec: CommandSpec) -> SyntaxNode {
+    let input = rewrite_primitive_skips(input);
+    let input = brace_sqrt_symbol(&input);
+    let input = brace_script_wrapping_commands(&input, &spec);
+    mitex_parser::parse(&input, spec)
+}
+
+/// Brace a symbol that follows `\sqrt`: TeX takes one token as the radicand,
+/// so `\sqrt(2\pi)` is the root of `(`, but mitex binds a symbol to nothing.
+fn brace_sqrt_symbol(input: &str) -> Cow<'_, str> {
+    if !input.contains("\\sqrt") {
+        return Cow::Borrowed(input);
+    }
+    let mut out = String::with_capacity(input.len() + 8);
+    let mut rest = input;
+    while let Some(at) = rest.find("\\sqrt") {
+        let after = &rest[at + "\\sqrt".len()..];
+        out.push_str(&rest[..at + "\\sqrt".len()]);
+        rest = after;
+        if after.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        let trimmed = after.trim_start();
+        let Some(symbol) = trimmed.chars().next() else {
+            continue;
+        };
+        if "()|<>.,;:!?+-=*/".contains(symbol) {
+            out.push('{');
+            out.push(symbol);
+            out.push('}');
+            rest = &trimmed[symbol.len_utf8()..];
+        }
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// TeX primitives whose dimension follows them unbraced.
+const PRIMITIVE_SKIPS: [&str; 4] = ["hskip", "kern", "mkern", "mskip"];
+
+/// Rewrite `\hskip 2pt`, `\kern-1em`, `\mkern 3mu` and `\mskip 4mu plus 2mu`
+/// as `\hspace{…}`.
+///
+/// mitex gives these primitives no argument, so their dimension became loose
+/// letters (`hskip 2 p t`). Stretch and shrink (`plus …`, `minus …`) are
+/// dropped, as `#h` has no glue. A skip with no dimension that parses is left
+/// alone.
+fn rewrite_primitive_skips(input: &str) -> Cow<'_, str> {
+    if !PRIMITIVE_SKIPS.iter().any(|name| input.contains(name)) {
+        return Cow::Borrowed(input);
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(slash) = rest.find('\\') {
+        let (before, from_slash) = rest.split_at(slash);
+        out.push_str(before);
+        let name_len = from_slash[1..]
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(from_slash.len() - 1);
+        let name = &from_slash[1..1 + name_len];
+        let after = &from_slash[1 + name_len..];
+        if name_len > 0 && PRIMITIVE_SKIPS.contains(&name) {
+            if let Some((dimension, used)) = parse_glue(after) {
+                let _ = write!(out, "\\hspace{{{dimension}}}");
+                rest = &after[used..];
+                continue;
+            }
+        }
+        // A control symbol such as `\\` takes the next character too, so
+        // `\\hskip` stays a line break followed by text.
+        let take = if name_len > 0 {
+            1 + name_len
+        } else {
+            1 + from_slash[1..].chars().next().map_or(0, char::len_utf8)
+        };
+        out.push_str(&from_slash[..take]);
+        rest = &from_slash[take..];
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// Parse a TeX dimension, then any `plus`/`minus` glue, at the start of `s`.
+/// Returns the dimension with spaces removed and the bytes consumed.
+fn parse_glue(s: &str) -> Option<(String, usize)> {
+    let (dimension, mut used) = parse_tex_dimension(s, false)?;
+    for keyword in ["plus", "minus"] {
+        let rest = &s[used..];
+        let trimmed = rest.trim_start();
+        if let Some(after) = trimmed.strip_prefix(keyword) {
+            let skipped = rest.len() - after.len();
+            if let Some((_, glue_used)) = parse_tex_dimension(after, true) {
+                used += skipped + glue_used;
+            }
+        }
+    }
+    Some((dimension, used))
+}
+
+/// Parse `[sign] number unit` at the start of `s`, allowing TeX's spaces.
+/// `fil` units (`1fill`) are accepted only for glue.
+fn parse_tex_dimension(s: &str, allow_fil: bool) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let skip_spaces = |i: &mut usize| {
+        while *i < bytes.len() && bytes[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+    };
+    let mut dimension = String::new();
+    skip_spaces(&mut i);
+    while i < bytes.len() && matches!(bytes[i], b'+' | b'-') {
+        if bytes[i] == b'-' {
+            dimension.push('-');
+        }
+        i += 1;
+        skip_spaces(&mut i);
+    }
+    let number_start = i;
+    while i < bytes.len() && (bytes[i].is_ascii_digit() || matches!(bytes[i], b'.' | b',')) {
+        i += 1;
+    }
+    let number = s[number_start..i].replace(',', ".");
+    if !number.chars().any(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if number.starts_with('.') {
+        dimension.push('0');
+    }
+    dimension.push_str(&number);
+    skip_spaces(&mut i);
+    // A unit is two letters, so `1cmv` is `1cm` then `v`; glue also takes
+    // `fil`, `fill` and `filll`.
+    let rest = &s[i..];
+    let fil = ["filll", "fill", "fil"]
+        .into_iter()
+        .find(|unit| allow_fil && rest.starts_with(unit));
+    let unit = fil.or_else(|| {
+        [
+            "pt", "mm", "cm", "in", "em", "ex", "pc", "bp", "px", "mu", "dd", "cc", "sp",
+        ]
+        .into_iter()
+        .find(|unit| rest.starts_with(unit))
+    })?;
+    dimension.push_str(unit);
+    Some((dimension, i + unit.len()))
+}
+
+/// Brace a command that wraps earlier items (`\limits`, `\over`) when it is the
+/// argument of `_` or `^`.
+///
+/// Temporary workaround for <https://github.com/mitex-rs/mitex/issues/225>:
+/// mitex-parser 0.2.4 panics on input such as `__\limits` and `__\over`, because
+/// a `Left1` or `InfixGreedy` command inside a script wraps from a checkpoint
+/// before the open script node. LaTeX rejects these commands as a script argument,
+/// so bracing them changes no valid input. Remove this once a fixed mitex-parser is
+/// released; the test `fuzz_regressions::mitex_limits_panic_still_upstream` fails
+/// when that happens.
+fn brace_script_wrapping_commands<'a>(input: &'a str, spec: &CommandSpec) -> Cow<'a, str> {
+    let bytes = input.as_bytes();
+    let mut result = String::new();
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        let name_end = (i + 1..bytes.len())
+            .find(|&j| !bytes[j].is_ascii_alphabetic())
+            .unwrap_or(bytes.len());
+        let wraps = spec
+            .get_cmd(&input[i + 1..name_end])
+            .is_some_and(|cmd| matches!(cmd.args, ArgShape::Left1 | ArgShape::InfixGreedy));
+        if wraps && follows_script_operator(bytes, i) {
+            result.push_str(&input[copied..i]);
+            result.push('{');
+            result.push_str(&input[i..name_end]);
+            result.push('}');
+            copied = name_end;
+        }
+        // A control symbol such as `\_` is one character after the backslash.
+        i = name_end.max(i + 2);
+    }
+    if copied == 0 {
+        return Cow::Borrowed(input);
+    }
+    result.push_str(&input[copied..]);
+    Cow::Owned(result)
+}
+
+/// Whether the last non-whitespace byte before `pos` is an unescaped `_` or `^`.
+fn follows_script_operator(bytes: &[u8], pos: usize) -> bool {
+    let Some(op) = bytes[..pos].iter().rposition(|b| !b.is_ascii_whitespace()) else {
+        return false;
+    };
+    let backslashes = bytes[..op]
+        .iter()
+        .rev()
+        .take_while(|&&b| b == b'\\')
+        .count();
+    matches!(bytes[op], b'_' | b'^') && backslashes % 2 == 0
 }
 
 // =============================================================================
@@ -189,6 +405,12 @@ pub fn extract_node_text_with_braces(node: &SyntaxNode) -> String {
 
 /// Extract text content from an argument node
 pub fn extract_arg_content(node: &SyntaxNode) -> String {
+    extract_arg_content_untrimmed(node).trim().to_string()
+}
+
+/// `extract_arg_content` with the edge spaces kept, for text arguments, where
+/// they are typeset: `x\text{ if }y`.
+pub fn extract_arg_content_untrimmed(node: &SyntaxNode) -> String {
     let mut content = String::new();
     for child in node.children_with_tokens() {
         match child.kind() {
@@ -210,7 +432,7 @@ pub fn extract_arg_content(node: &SyntaxNode) -> String {
             }
         }
     }
-    content.trim().to_string()
+    content
 }
 
 /// Extract argument content preserving inner braces but stripping outermost
@@ -265,55 +487,77 @@ pub fn extract_curly_inner_content(node: &SyntaxNode) -> String {
     content
 }
 
-pub fn contains_top_level_separator(text: &str, separator: char) -> bool {
-    let mut paren_depth = 0usize;
-    let mut bracket_depth = 0usize;
-    let mut brace_depth = 0usize;
+/// Walk the brackets of Typst math `text`, skipping strings and escapes.
+///
+/// `visit` is given every other character, with its byte offset and the
+/// bracket depth before it, and stops the walk by returning `false`. Any of
+/// `)`, `]` and `}` closes any of `(`, `[` and `{`, as in Typst, and a closing
+/// bracket with nothing open leaves the depth at zero. Returns the depth at the
+/// end, or `None` if `visit` stopped the walk.
+pub fn scan_brackets(
+    text: &str,
+    mut visit: impl FnMut(usize, char, usize) -> bool,
+) -> Option<usize> {
+    let mut depth = 0usize;
     let mut in_string = false;
-    let mut escaped = false;
-
-    for ch in text.chars() {
-        if in_string {
-            match ch {
-                _ if escaped => escaped = false,
-                '\\' => escaped = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-
+    let mut chars = text.char_indices();
+    while let Some((offset, ch)) = chars.next() {
         match ch {
-            '"' => in_string = true,
-            '(' => paren_depth += 1,
-            ')' if paren_depth > 0 => paren_depth -= 1,
-            '[' => bracket_depth += 1,
-            ']' if bracket_depth > 0 => bracket_depth -= 1,
-            '{' => brace_depth += 1,
-            '}' if brace_depth > 0 => brace_depth -= 1,
+            '\\' => {
+                chars.next();
+                continue;
+            }
+            '"' => {
+                in_string = !in_string;
+                continue;
+            }
+            _ if in_string => continue,
             _ => {}
         }
-
-        if ch == separator && paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
-            return true;
+        if !visit(offset, ch, depth) {
+            return None;
+        }
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
         }
     }
-
-    false
+    Some(depth)
 }
 
-/// Protect content that contains a top-level comma by wrapping it in `{}`.
+/// Escape each top-level comma and semicolon in Typst math content as `\,`
+/// and `\;`.
 ///
 /// Typst function calls treat top-level commas as argument separators, so
-/// `sqrt(a, b)` is parsed as two arguments while `sqrt({a, b})` is a single
-/// content argument.
+/// `sqrt(a, b)` is parsed as two arguments while `sqrt(a\, b)` is one, and a
+/// semicolon makes the arguments an array. Wrapping the content in `{}` also
+/// groups it, but Typst math draws those braces. Commas inside strings, escapes
+/// and bracket pairs are left alone.
 pub fn protect_top_level_comma(content: &str) -> String {
     let trimmed = content.trim();
-    if contains_top_level_separator(trimmed, ',') {
-        format!("{{{}}}", trimmed)
-    } else {
-        trimmed.to_string()
-    }
+    let mut out = String::with_capacity(trimmed.len());
+    let mut copied = 0;
+    scan_brackets(trimmed, |offset, ch, depth| {
+        if depth == 0 && matches!(ch, ',' | ';') {
+            out.push_str(trimmed[copied..offset].trim_end());
+            out.push('\\');
+            out.push(ch);
+            copied = offset + 1;
+        }
+        true
+    });
+    out.push_str(&trimmed[copied..]);
+    out
+}
+
+/// Whether every bracket in Typst math `content` closes, and none of
+/// `separators` appears outside every bracket. Strings and escapes are skipped.
+pub fn brackets_balanced(content: &str, separators: &[char]) -> bool {
+    let balanced = scan_brackets(content, |_, ch, depth| {
+        depth > 0 || !(matches!(ch, ')' | ']' | '}') || separators.contains(&ch))
+    });
+    balanced == Some(0)
 }
 
 // =============================================================================

@@ -126,13 +126,13 @@ const GOLDEN: &[(&str, &str, &str)] = &[
     (
         "f597",
         r"k _ { \scriptscriptstyle  { A B } ^ { ' } } = t _ { 1 } + t _ { 0 } , k _ { \scriptscriptstyle  { B C } ^ { ' } } = t _ { 2 } + t _ { 0 }",
-        "k_(A B^(')) = t_(1) + t_(0), k_(B C^(')) = t_(2) + t_(0)",
+        "k_(sscript(A B^('))) = t_(1) + t_(0), k_(sscript(B C^('))) = t_(2) + t_(0)",
     ),
-    // `\scriptscriptstyle` has no Typst equivalent: content kept, marker dropped.
+    // `\scriptscriptstyle` is Typst's `sscript`.
     (
         "f457",
         r"a _ { \scriptscriptstyle 1 } = d",
-        "a_(1) = d",
+        "a_(sscript(1)) = d",
     ),
 ];
 

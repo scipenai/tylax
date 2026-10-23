@@ -19,10 +19,12 @@
 
 use mitex_parser::syntax::{SyntaxElement, SyntaxKind, SyntaxNode};
 use mitex_parser::CommandSpec;
+use mitex_spec::{ArgPattern, ArgShape};
 use mitex_spec_gen::DEFAULT_SPEC;
 use std::collections::HashSet;
 use std::fmt;
 
+use crate::core::latex2typst::parse_latex;
 use crate::data::maps::TEX_COMMAND_SPEC;
 use fxhash::FxHashMap;
 use lazy_static::lazy_static;
@@ -272,8 +274,9 @@ pub fn check_latex(input: &str) -> CheckResult {
     let masked = mask_literal_regions(input);
     let input = masked.as_str();
 
-    // Parse the input
-    let tree = mitex_parser::parse(input, MERGED_SPEC.clone());
+    // Parse the input. `parse_latex` braces a `\limits` used as a script, which is
+    // invalid LaTeX; offsets after one such brace drift by two bytes.
+    let tree = parse_latex(input, MERGED_SPEC.clone());
 
     // Calculate line offsets for position reporting
     let line_offsets = compute_line_offsets(input);
@@ -419,6 +422,18 @@ fn check_node(
                 }
             }
 
+            kind @ (SyntaxKind::ItemAttachComponent | SyntaxKind::ItemLR) => {
+                if let SyntaxElement::Node(n) = &child {
+                    let check = if kind == SyntaxKind::ItemLR {
+                        check_left_right
+                    } else {
+                        check_attachment
+                    };
+                    check(n, line_offsets, result);
+                    check_node(n, source, line_offsets, declared, result);
+                }
+            }
+
             _ => {
                 // Recurse into child nodes
                 if let SyntaxElement::Node(n) = child {
@@ -478,8 +493,108 @@ fn check_command(
         }
     }
 
+    // A command that takes required arguments but finds none to bind, as in
+    // `\frac{a}` or `\text_a`, is a LaTeX error.
+    if let Some(ArgShape::Right {
+        pattern: ArgPattern::FixedLenTerm { len },
+    }) = MERGED_SPEC.get_cmd(cmd_name).map(|shape| &shape.args)
+    {
+        let bound = node
+            .children()
+            .filter(|child| child.kind() == SyntaxKind::ClauseArgument)
+            .count();
+        if bound < usize::from(*len) {
+            result.add(
+                Diagnostic::new(
+                    DiagnosticLevel::Error,
+                    format!(
+                        "command '\\{}' takes {} argument(s) but has {}",
+                        cmd_name, len, bound
+                    ),
+                )
+                .with_location(line, col)
+                .with_source(format!("\\{}", cmd_name)),
+            );
+        }
+    }
+
     // Recurse into children
     check_node(node, source, line_offsets, declared, result);
+}
+
+/// Check a `_` or `^` script for a missing argument, and for a second script of
+/// the same kind on one base (`x_a_b`, `x_a^b_c`), which LaTeX rejects.
+fn check_attachment(node: &SyntaxNode, line_offsets: &[usize], result: &mut CheckResult) {
+    let is_trivia = |kind: SyntaxKind| {
+        matches!(
+            kind,
+            SyntaxKind::TokenWhiteSpace | SyntaxKind::TokenLineBreak
+        )
+    };
+    let marker_of = |node: &SyntaxNode| {
+        node.children_with_tokens()
+            .map(|child| child.kind())
+            .find(|kind| matches!(kind, SyntaxKind::TokenUnderscore | SyntaxKind::TokenCaret))
+    };
+    let Some(marker) = marker_of(node) else {
+        return;
+    };
+    let offset: usize = node.text_range().start().into();
+    let (line, col) = offset_to_location(offset, line_offsets);
+    let name = if marker == SyntaxKind::TokenUnderscore {
+        "subscript"
+    } else {
+        "superscript"
+    };
+
+    let script_missing = node
+        .children_with_tokens()
+        .map(|child| child.kind())
+        .filter(|kind| !is_trivia(*kind))
+        .last()
+        == Some(marker);
+    if script_missing {
+        result.add(
+            Diagnostic::new(DiagnosticLevel::Error, format!("{name} has no argument"))
+                .with_location(line, col),
+        );
+    }
+
+    // The base of `x_a_b` is the attachment `x_a`; follow such bases down.
+    let mut base = node.first_child();
+    while let Some(argument) = base.filter(|n| n.kind() == SyntaxKind::ClauseArgument) {
+        let Some(inner) = argument
+            .first_child()
+            .filter(|n| n.kind() == SyntaxKind::ItemAttachComponent)
+        else {
+            break;
+        };
+        if marker_of(&inner) == Some(marker) {
+            result.add(
+                Diagnostic::new(DiagnosticLevel::Error, format!("double {name}"))
+                    .with_location(line, col)
+                    .with_suggestion("Brace the first script's base and script: {x_a}_b"),
+            );
+            break;
+        }
+        base = inner.first_child();
+    }
+}
+
+/// Check that a `\left` has its `\right`.
+fn check_left_right(node: &SyntaxNode, line_offsets: &[usize], result: &mut CheckResult) {
+    let has_right = node
+        .children()
+        .filter(|child| child.kind() == SyntaxKind::ClauseLR)
+        .any(|clause| clause.text().to_string().starts_with("\\right"));
+    if !has_right {
+        let offset: usize = node.text_range().start().into();
+        let (line, col) = offset_to_location(offset, line_offsets);
+        result.add(
+            Diagnostic::new(DiagnosticLevel::Error, "\\left has no matching \\right")
+                .with_location(line, col),
+        );
+    }
 }
 
 /// Check an environment node for issues
@@ -528,9 +643,15 @@ fn check_brace_balance(input: &str, result: &mut CheckResult) {
     // `check_latex` has already blanked the literal regions, so a brace inside a
     // comment, a `\verb` span or a verbatim body never reaches here.
     let line_offsets = compute_line_offsets(input);
+    // `\{` and `\}` are literal braces; `\\{` is a line break, then a group.
+    let mut escaped = false;
 
     for (offset, c) in input.char_indices() {
+        if std::mem::take(&mut escaped) {
+            continue;
+        }
         match c {
+            '\\' => escaped = true,
             '{' => {
                 if depth == 0 {
                     let (line, _) = offset_to_location(offset, &line_offsets);
@@ -938,6 +1059,41 @@ mod tests {
     fn test_unbalanced_braces() {
         let result = check_latex(r"\frac{1}{2");
         assert!(result.has_errors(), "Should fail for unbalanced braces");
+    }
+
+    #[test]
+    fn test_escaped_braces_are_not_counted() {
+        assert!(!check_latex(r"\left\{ a \right.").has_errors());
+        assert!(!check_latex(r"\{ a").has_errors());
+        // A line break `\\` does not escape the brace after it.
+        assert!(check_latex(r"a \\{ b").has_errors());
+    }
+
+    #[test]
+    fn test_structural_math_errors() {
+        for invalid in [
+            r"x^",
+            r"\text_a b",
+            r"\frac{a}",
+            r"x_a_b",
+            r"x^a^b",
+            r"x_a^b_c",
+            r"\left( a",
+        ] {
+            assert!(check_latex(invalid).has_errors(), "{invalid}");
+        }
+        for valid in [
+            r"x^{}",
+            r"x_a^b",
+            r"{x_a}_b",
+            r"\frac12",
+            r"\left( a \right.",
+            r"\sqrt[3]{x}",
+            r"\sum\limits_{i}^{n}",
+            r"x'^2",
+        ] {
+            assert!(!check_latex(valid).has_errors(), "{valid}");
+        }
     }
 
     #[test]

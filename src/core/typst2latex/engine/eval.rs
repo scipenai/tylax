@@ -18,8 +18,8 @@ use super::scope::Scopes;
 use super::value::{
     bibliography_content_value, citation_content_value, label_content_value,
     normalize_ref_target_text, reference_content_value, Alignment, Arguments, Closure, ContentNode,
-    Direction, EvalError, EvalErrorKind, EvalResult, HorizAlign, MathSegment, Selector, ShowRule,
-    SourceSpan, Value, VertAlign,
+    Direction, EvalError, EvalErrorKind, EvalResult, HorizAlign, Length, LengthUnit, MathSegment,
+    Selector, ShowRule, SourceSpan, Value, VertAlign,
 };
 use super::vfs::{NoopVfs, VirtualFileSystem};
 
@@ -400,6 +400,7 @@ impl MiniEval {
             | ast::Expr::Int(_)
             | ast::Expr::Float(_)
             | ast::Expr::Str(_) => self.eval_literal(expr),
+            ast::Expr::Numeric(numeric) => Ok(eval_numeric(numeric)),
 
             // ================================================================
             // Identifiers
@@ -511,7 +512,7 @@ impl MiniEval {
 
     /// Passthrough expression as raw source (for unevaluated expressions).
     fn passthrough_expr(&self, expr: &ast::Expr) -> EvalResult<Value> {
-        let source = expr.to_untyped().text().to_string();
+        let source = expr.to_untyped().clone().into_text().to_string();
         Ok(Value::Content(vec![ContentNode::RawSource(source)]))
     }
 
@@ -2161,6 +2162,7 @@ impl MiniEval {
                     // Check for expression after hash
                     if i + 1 < children.len() {
                         let expr_node = &children[i + 1];
+                        let source = || format!("#{}", SyntaxNode::clone(expr_node).into_text());
                         match expr_node.kind() {
                             // Simple identifier: #n
                             Ident => {
@@ -2182,12 +2184,7 @@ impl MiniEval {
                                             Ok(value) => {
                                                 result.push(MathSegment::Evaluated(value));
                                             }
-                                            Err(_) => {
-                                                push_source(
-                                                    &mut result,
-                                                    &format!("#{}", expr_node.text()),
-                                                );
-                                            }
+                                            Err(_) => push_source(&mut result, &source()),
                                         }
                                         break;
                                     }
@@ -2198,7 +2195,7 @@ impl MiniEval {
                                         .children()
                                         .any(|inner| inner.cast::<ast::Expr>().is_some())
                                     {
-                                        push_source(&mut result, &format!("#{}", expr_node.text()));
+                                        push_source(&mut result, &source());
                                     }
                                 }
                                 i += 2; // Skip both Hash and Parenthesized
@@ -2211,22 +2208,20 @@ impl MiniEval {
                                         Ok(value) => {
                                             result.push(MathSegment::Evaluated(value));
                                         }
-                                        Err(_) => {
-                                            push_source(
-                                                &mut result,
-                                                &format!("#{}", expr_node.text()),
-                                            );
-                                        }
+                                        Err(_) => push_source(&mut result, &source()),
                                     }
                                 } else {
-                                    push_source(&mut result, &format!("#{}", expr_node.text()));
+                                    push_source(&mut result, &source());
                                 }
                                 i += 2;
                                 continue;
                             }
                             _ => {
-                                // Unknown expression type after hash, keep as is
-                                push_source(&mut result, "#");
+                                // Unknown expression type after hash: keep its
+                                // source whole, as `#context { … }`.
+                                push_source(&mut result, &source());
+                                i += 2;
+                                continue;
                             }
                         }
                     } else {
@@ -2399,6 +2394,23 @@ pub fn expand_macros_with_warnings(source: &str) -> EvalResult<ExpandResult> {
         nodes: normalized_nodes,
         warnings,
     })
+}
+
+/// A numeric literal (`2cm`, `-1em` after negation, `50%`, `45deg`, `1fr`) as a
+/// value, so arithmetic and unary minus work on it.
+fn eval_numeric(numeric: ast::Numeric) -> Value {
+    let (value, unit) = numeric.get();
+    match unit {
+        ast::Unit::Pt => Value::Length(Length::exact(value, LengthUnit::Pt)),
+        ast::Unit::Mm => Value::Length(Length::exact(value, LengthUnit::Mm)),
+        ast::Unit::Cm => Value::Length(Length::exact(value, LengthUnit::Cm)),
+        ast::Unit::In => Value::Length(Length::exact(value, LengthUnit::In)),
+        ast::Unit::Em => Value::Length(Length::exact(value, LengthUnit::Em)),
+        ast::Unit::Deg => Value::Angle(value),
+        ast::Unit::Rad => Value::Angle(value.to_degrees()),
+        ast::Unit::Fr => Value::Fraction(value),
+        ast::Unit::Percent => Value::Ratio(value / 100.0),
+    }
 }
 
 #[cfg(test)]

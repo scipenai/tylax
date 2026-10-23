@@ -25,9 +25,10 @@ use super::engine::{ArgumentErrorType, EngineWarning};
 use super::{ConversionResult, ConversionWarning, WarningKind};
 
 use super::utils::{
-    clean_whitespace, convert_caption_text, extract_arg_content, extract_arg_content_with_braces,
-    extract_curly_inner_content, protect_top_level_comma, protect_zero_arg_commands,
-    restore_protected_commands, sanitize_label,
+    brackets_balanced, clean_whitespace, convert_caption_text, extract_arg_content,
+    extract_arg_content_untrimmed, extract_arg_content_with_braces, extract_curly_inner_content,
+    parse_latex, protect_top_level_comma, protect_zero_arg_commands, restore_protected_commands,
+    sanitize_label, scan_brackets,
 };
 
 /// Marker for a `\big`-style vertical delimiter, paired during math cleanup.
@@ -531,6 +532,9 @@ pub struct LatexConverter {
 
     /// Repairs the math cleanup applied to `_`/`^` attachments.
     pub(crate) attachment_repairs: AttachmentRepairs,
+    /// Start offsets of the delimiters that do not pair within their sequence
+    /// of siblings in the tree being visited (see [`unpaired_delimiters`]).
+    pub(crate) unpaired_delimiters: HashSet<u32>,
 }
 
 /// A `ClauseArgument` is a *required* argument iff it does not carry an
@@ -556,6 +560,71 @@ fn is_required_clause(child: &SyntaxNode) -> bool {
             child.first_token().map(|t| t.kind()),
             Some(SyntaxKind::TokenLBracket)
         )
+}
+
+/// Trim math output, dropping line breaks at its end.
+///
+/// A trailing `\\` draws nothing in LaTeX, but its Typst `\` would escape the
+/// closing `$`: `$a\\$` gave `$a \$`.
+fn strip_trailing_line_breaks(math: &str) -> &str {
+    let mut math = math.trim();
+    while ends_with_line_break(math) {
+        math = math[..math.len() - 1].trim_end();
+    }
+    math
+}
+
+/// Whether converted Typst ends in a `\` line break. `\\` is an escaped
+/// backslash, so only an odd run of backslashes ends in one.
+fn ends_with_line_break(typst: &str) -> bool {
+    (typst.len() - typst.trim_end_matches('\\').len()) % 2 == 1
+}
+
+/// Where the parenthesised scripts at the end of `output` begin, if any.
+///
+/// For `j_(1)` this is the index of `_`, and for `x_(a)^(b)` the index of the
+/// first `_`. A call such as `f(x)` has no script.
+fn trailing_scripts_start(output: &str) -> Option<usize> {
+    let mut end = output.len();
+    let mut start = None;
+    while output[..end].ends_with(')') {
+        let mut depth = 0usize;
+        let mut open = None;
+        for (index, c) in output[..end].char_indices().rev() {
+            match c {
+                ')' => depth += 1,
+                '(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        open = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let open = open?;
+        let marker = open.checked_sub(1)?;
+        if !matches!(output.as_bytes()[marker], b'_' | b'^') || output[..marker].ends_with('\\') {
+            break;
+        }
+        start = Some(marker);
+        end = marker;
+    }
+    start.filter(|&index| index > 0)
+}
+
+/// Trim a converted argument, keeping the space after a trailing `\` line break.
+///
+/// Without that space the `\` would escape whatever closes the argument, so
+/// `\hl{\\}` would give `#highlight[\]`.
+fn trim_converted_arg(output: &str) -> String {
+    let trimmed = output.trim();
+    if ends_with_line_break(trimmed) {
+        format!("{trimmed} ")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn slash_is_between_mathy(elem: SyntaxElement) -> bool {
@@ -758,9 +827,11 @@ fn resolve_sized_delimiter_pair(
         let after_open = &remaining[open + marker.len()..];
 
         // A blank line cannot occur inside one math expression, so these are not a pair.
-        let close = after_open
-            .find(marker)
-            .filter(|&offset| !contains_paragraph_break(&after_open[..offset]));
+        let inside_call = scan_brackets(&output, |_, _, _| true) != Some(0);
+        let close = after_open.find(marker).filter(|&offset| {
+            !contains_paragraph_break(&after_open[..offset])
+                && is_one_operand(&after_open[..offset], inside_call)
+        });
 
         let Some(close) = close else {
             output.push_str(fallback);
@@ -779,6 +850,19 @@ fn resolve_sized_delimiter_pair(
 
     output.push_str(remaining);
     output
+}
+
+/// Whether two bars around `text` can enclose it: it is balanced, and does not
+/// cross a cell or row (`&`, `;`). Inside a call a bare `,` separates
+/// arguments too. Otherwise the bars belong to different cells or arguments,
+/// as in `\frac{a\big|_b}{c\big|_d}`.
+fn is_one_operand(text: &str, inside_call: bool) -> bool {
+    let separators: &[char] = if inside_call {
+        &['&', ';', ',']
+    } else {
+        &['&', ';']
+    };
+    brackets_balanced(text, separators)
 }
 
 /// Repairs the math cleanup applied to `_`/`^` attachments, so the converter
@@ -806,8 +890,8 @@ pub(crate) struct AttachmentRepairs {
 }
 
 impl AttachmentRepairs {
-    /// An empty `""` base was inserted before a script Typst would reject.
-    fn note_empty_base(&self) {
+    /// An empty `zws` base was inserted before a script Typst would reject.
+    pub(crate) fn note_empty_base(&self) {
         self.empty_bases.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
@@ -1251,28 +1335,62 @@ fn is_latex_comment_position(input: &str, position: usize) -> bool {
     false
 }
 
+/// Split converted math at its Typst line breaks: a `\` before a space or the
+/// end. Before anything else it is an escape, as in `\(`.
+fn split_line_breaks(body: &str) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            row.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some(next) if !next.is_whitespace() => {
+                row.push(c);
+                row.push(*next);
+                chars.next();
+            }
+            _ => rows.push(std::mem::take(&mut row).trim().to_string()),
+        }
+    }
+    rows.push(row.trim().to_string());
+    rows
+}
+
 /// String fallback that turns an already-converted `\left\{ ... \right.` body
 /// into `cases(...)` arguments, for shapes the AST path (see math.rs
 /// `classify_lr_cases_environment`) doesn't catch: `atop(a, b)`, a bare
-/// expression, or a leftover `mat(...)`. A row without an explicit `&` treats a
-/// top-level comma as a column hint; a row with `&` keeps commas as content.
+/// expression, or a leftover `mat(...)`. In a `mat` or `atop` row without an
+/// explicit `&`, a top-level comma separated columns, so it becomes `&`;
+/// anywhere else a comma is content, and is escaped.
 fn body_to_cases(body: &str) -> String {
     let body = body.trim();
 
-    let rows: Vec<String> = if let Some(inner) = strip_call(body, "mat") {
-        let inner = inner.trim();
-        // Drop a leading `delim: #none` keyword argument, if present.
-        let inner = inner
-            .strip_prefix("delim: #none,")
-            .or_else(|| inner.strip_prefix("delim: #none ,"))
-            .map(str::trim)
-            .unwrap_or(inner);
-        split_top_level(inner, ';')
+    let (rows, commas_are_columns) = if let Some(inner) = strip_call(body, "mat") {
+        // Drop the leading named arguments, `delim: #none, align: #left, `,
+        // which `cases` does not take.
+        let mut inner = inner.trim();
+        while let Some((name, rest)) = inner.split_once(':') {
+            let rest = rest.trim_start();
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphabetic()) {
+                break;
+            }
+            let Some(value) = split_top_level(rest, ',').into_iter().next() else {
+                break;
+            };
+            inner = rest[value.len()..]
+                .trim_start()
+                .trim_start_matches(',')
+                .trim();
+        }
+        (split_top_level(inner, ';'), true)
     } else if let Some(inner) = strip_call(body, "atop") {
-        split_top_level(inner, ',')
+        (split_top_level(inner, ','), true)
     } else {
         // aligned / plain body: rows are separated by Typst line breaks `\`.
-        body.split('\\').map(|r| r.trim().to_string()).collect()
+        (split_line_breaks(body), false)
     };
 
     let cells: Vec<String> = rows
@@ -1282,6 +1400,9 @@ fn body_to_cases(body: &str) -> String {
         .map(|r| {
             if r.contains('&') {
                 escape_top_level_case_commas(r)
+            } else if !commas_are_columns {
+                // `\left\{ a, b \right.`: a comma column dropped the comma.
+                protect_top_level_comma(r)
             } else {
                 split_top_level(r, ',')
                     .into_iter()
@@ -1304,7 +1425,7 @@ fn element_source_text(el: &SyntaxElement) -> String {
 }
 
 /// Whether `el` is a command with exactly `name` (without its leading slash).
-fn is_command_named(el: &SyntaxElement, name: &str) -> bool {
+pub(super) fn is_command_named(el: &SyntaxElement, name: &str) -> bool {
     let Some(node) = el.as_node() else {
         return false;
     };
@@ -1464,6 +1585,7 @@ impl LatexConverter {
             siunitx_arg_collector: None,
             pending_section: None,
             attachment_repairs: AttachmentRepairs::default(),
+            unpaired_delimiters: HashSet::new(),
         }
     }
 
@@ -1478,7 +1600,27 @@ impl LatexConverter {
             siunitx_arg_collector: None,
             pending_section: None,
             attachment_repairs: AttachmentRepairs::default(),
+            unpaired_delimiters: HashSet::new(),
         }
+    }
+
+    /// Visit a freshly parsed tree, with its unpaired delimiters marked.
+    pub(crate) fn visit_tree(&mut self, tree: &SyntaxNode, output: &mut String) {
+        let previous = std::mem::replace(
+            &mut self.unpaired_delimiters,
+            super::delimiters::unpaired_delimiters(tree),
+        );
+        self.visit_node(tree, output);
+        self.unpaired_delimiters = previous;
+    }
+
+    /// Whether `elem` is a delimiter in math that must be escaped because it
+    /// does not pair within its sequence.
+    pub(crate) fn is_unpaired_delimiter(&self, elem: &SyntaxElement) -> bool {
+        matches!(self.state.mode, ConversionMode::Math)
+            && self
+                .unpaired_delimiters
+                .contains(&u32::from(elem.text_range().start()))
     }
 
     /// Get a reference to the current options
@@ -1650,14 +1792,14 @@ impl LatexConverter {
         let expanded_input = self.preprocess_expansion(&protected_input, false);
 
         // Parse with mitex-parser
-        let tree = mitex_parser::parse(&expanded_input, self.spec.clone());
+        let tree = parse_latex(&expanded_input, self.spec.clone());
 
         // Convert AST to Typst with pre-allocated buffer
         let estimated_size = (expanded_input.len() as f64 * 1.5) as usize;
         let mut output = String::with_capacity(estimated_size.max(1024));
 
         // Walk the tree
-        self.visit_node(&tree, &mut output);
+        self.visit_tree(&tree, &mut output);
 
         // Pair the sized-delimiter sentinels only; full `postprocess_math` would corrupt prose.
         let output = self.resolve_sized_delimiter_pairs(&output);
@@ -1695,11 +1837,11 @@ impl LatexConverter {
         let expanded_input = self.preprocess_expansion(input, true);
 
         // Parse
-        let tree = mitex_parser::parse(&expanded_input, self.spec.clone());
+        let tree = parse_latex(&expanded_input, self.spec.clone());
 
         // Convert with pre-allocated buffer
         let mut output = String::with_capacity(expanded_input.len().max(256));
-        self.visit_node(&tree, &mut output);
+        self.visit_tree(&tree, &mut output);
 
         // Resolve citation markers BEFORE math cleanup, so `#cite(...)` is post-processed.
         let output = self.resolve_citations(&output);
@@ -1869,13 +2011,27 @@ impl LatexConverter {
             };
 
             if let Some(style) = style {
+                // An alignment cell is a TeX group, so the declaration ends at
+                // the next `&` or `\\`, not at the end of the environment.
+                let end = children[index + 1..]
+                    .iter()
+                    .position(|c| {
+                        matches!(
+                            c.kind(),
+                            SyntaxKind::ItemNewLine | SyntaxKind::TokenAmpersand
+                        )
+                    })
+                    .map_or(children.len(), |offset| index + 1 + offset);
                 let mut styled_content = String::new();
-                self.visit_elements(&children[index + 1..], &mut styled_content);
-                let styled_content = styled_content.trim();
+                self.visit_elements(&children[index + 1..end], &mut styled_content);
+                // The content is a call argument, so a top-level `,` or `;`
+                // must not split it: `\displaystyle m=0,u\ne0;`.
+                let styled_content = protect_top_level_comma(styled_content.trim());
                 if !styled_content.is_empty() {
                     let _ = write!(output, "{}({})", style, styled_content);
                 }
-                return;
+                index = end;
+                continue;
             }
 
             self.visit_element(child.clone(), output);
@@ -2213,15 +2369,7 @@ impl LatexConverter {
             }
 
             // Newline command \\
-            ItemNewLine => match self.state.current_env() {
-                EnvironmentContext::Matrix => output.push_str("zws ;"),
-                EnvironmentContext::Cases => output.push(','),
-                EnvironmentContext::Align | EnvironmentContext::Equation => {
-                    output.push_str(" \\ ");
-                }
-                EnvironmentContext::Tabular => output.push_str("|||ROW|||"),
-                _ => output.push_str("\\ "),
-            },
+            ItemNewLine => self.push_row_break(output),
 
             // Ampersand (column separator)
             TokenAmpersand => match self.state.current_env() {
@@ -2257,16 +2405,40 @@ impl LatexConverter {
                     output.push_str("\\^");
                 }
             }
-            TokenApostrophe => output.push('\''),
-            TokenComma => {
-                if matches!(self.state.current_env(), EnvironmentContext::Cases) {
+            TokenApostrophe => {
+                // Typst attaches primes only to the token right before them:
+                // `x '^(2)` is `x` followed by primes on an empty base.
+                if matches!(self.state.mode, ConversionMode::Math) {
+                    let base = output.trim_end();
+                    // Keep the space of a `\ ` line break, or `\'` becomes an escape.
+                    if !base.ends_with('\\') {
+                        output.truncate(base.len());
+                    }
+                    // In `j_(1)'` Typst primes the subscript, drawing "(1)′";
+                    // `j'_(1)` primes the base, as LaTeX's `j_1'` does.
+                    if let Some(start) = trailing_scripts_start(output) {
+                        let base_end = output[..start].trim_end().len();
+                        if base_end > 0 && !output[..base_end].ends_with('\\') {
+                            output.replace_range(base_end..start, "'");
+                            return;
+                        }
+                    }
+                }
+                output.push('\'');
+            }
+            // A comma in a `cases` row or a matrix cell would separate cells, and
+            // a semicolon would end the row.
+            TokenComma | TokenSemicolon => {
+                if matches!(
+                    self.state.current_env(),
+                    EnvironmentContext::Cases | EnvironmentContext::Matrix
+                ) {
                     while output.ends_with(char::is_whitespace) {
                         output.pop();
                     }
-                    output.push_str("\\,");
-                } else {
-                    output.push(',');
+                    output.push('\\');
                 }
+                output.push_str(&elem.to_string());
             }
             TokenSlash => {
                 if matches!(self.state.mode, ConversionMode::Math) || slash_is_between_mathy(elem) {
@@ -2291,20 +2463,18 @@ impl LatexConverter {
                 }
             }
             TokenAtSign => output.push('@'),
-            TokenSemicolon => output.push(';'),
-            TokenDitto => output.push('"'),
-            TokenLParen => output.push('('),
-            TokenRParen => output.push(')'),
-            // Brackets here are literal text: a real optional argument is consumed by the grammar.
-            TokenLBracket => {
-                if !self.state.in_preamble {
-                    output.push('[');
-                }
+            // A bare `"` would open a Typst string in math.
+            TokenDitto if matches!(self.state.mode, ConversionMode::Math) => {
+                output.push_str("\\\"")
             }
-            TokenRBracket => {
-                if !self.state.in_preamble {
-                    output.push(']');
+            TokenDitto => output.push('"'),
+            // Brackets here are literal text: a real optional argument is consumed by the grammar.
+            TokenLBracket | TokenRBracket if self.state.in_preamble => {}
+            TokenLParen | TokenRParen | TokenLBracket | TokenRBracket => {
+                if self.is_unpaired_delimiter(&elem) {
+                    output.push('\\');
                 }
+                output.push_str(&elem.to_string());
             }
 
             // Ignore these
@@ -2342,6 +2512,15 @@ impl LatexConverter {
             }
         }
         None
+    }
+
+    /// `get_required_arg` with the edge spaces kept, for a text argument.
+    pub fn get_required_text_arg(&self, cmd: &CmdItem, index: usize) -> Option<String> {
+        cmd.syntax()
+            .children()
+            .filter(is_required_clause)
+            .nth(index)
+            .map(|child| extract_arg_content_untrimmed(&child))
     }
 
     /// Get a required argument preserving inner braces
@@ -2405,7 +2584,7 @@ impl LatexConverter {
                     })
                     .collect();
                 self.visit_elements(&content, &mut output);
-                return Some(output.trim().to_string());
+                return Some(trim_converted_arg(&output));
             }
             optional_count += 1;
         }
@@ -2437,7 +2616,7 @@ impl LatexConverter {
                         })
                         .collect();
                     self.visit_elements(&content, &mut output);
-                    return Some(output.trim().to_string());
+                    return Some(trim_converted_arg(&output));
                 }
                 required_count += 1;
             }
@@ -2449,7 +2628,15 @@ impl LatexConverter {
     /// mode: accents and roots always take a math expression. On the document
     /// path `\overrightarrow{PC}` would otherwise emit `arrow(PC)`, a single
     /// Typst variable that fails to compile, not `arrow(P C)` (issue #35).
+    /// The result is a function argument, so a top-level comma is escaped:
+    /// `\frac{a , b}{c}` gave `frac(a, b, c)`.
     pub fn convert_required_math_arg(&mut self, cmd: &CmdItem, index: usize) -> Option<String> {
+        self.convert_required_math_content(cmd, index)
+            .map(|arg| protect_top_level_comma(&arg))
+    }
+
+    /// [`Self::convert_required_math_arg`] for content emitted outside a call.
+    pub fn convert_required_math_content(&mut self, cmd: &CmdItem, index: usize) -> Option<String> {
         let previous_mode = self.state.mode;
         self.state.mode = ConversionMode::Math;
         let converted = self.convert_required_arg(cmd, index);
@@ -2511,6 +2698,19 @@ impl LatexConverter {
     // Math post-processing
     // ============================================================
 
+    /// Write a `\\` (or plain TeX's `\cr`) row break for the current environment.
+    pub(crate) fn push_row_break(&self, output: &mut String) {
+        match self.state.current_env() {
+            EnvironmentContext::Matrix => output.push_str("zws ;"),
+            EnvironmentContext::Cases => output.push_str(", "),
+            EnvironmentContext::Align | EnvironmentContext::Equation => {
+                output.push_str(" \\ ");
+            }
+            EnvironmentContext::Tabular => output.push_str("|||ROW|||"),
+            _ => output.push_str("\\ "),
+        }
+    }
+
     /// Post-process math output
     pub fn postprocess_math(&self, input: String) -> String {
         let mut result = input;
@@ -2540,7 +2740,7 @@ impl LatexConverter {
         // (`(_(` and leading `^(` are literal). Typst rejects these otherwise.
         result = self.fix_baseless_attachment(&result);
 
-        result.trim().to_string()
+        strip_trailing_line_breaks(&result).to_string()
     }
 
     /// Clean up math spacing
@@ -2570,7 +2770,7 @@ impl LatexConverter {
         result = self.fix_left_brace_cases(&result);
         result = self.fix_baseless_attachment(&result);
 
-        result.trim().to_string()
+        strip_trailing_line_breaks(&result).to_string()
     }
 
     /// Turn matched `\big|`/`\big\|` pairs into `abs(...)`/`norm(...)`. Only
@@ -2678,7 +2878,8 @@ impl LatexConverter {
                 if let Some(pos) = result[i..].find(symbol) {
                     let abs_pos = i + pos;
                     if abs_pos > 0 {
-                        let prev_char = result.chars().nth(abs_pos - 1).unwrap_or(' ');
+                        // `abs_pos` is a byte offset: after a `†` it is not a char index.
+                        let prev_char = result[..abs_pos].chars().next_back().unwrap_or(' ');
                         // Insert space if previous char is not a letter, space, or opening paren/bracket
                         if !prev_char.is_alphabetic()
                             && prev_char != ' '
@@ -2691,7 +2892,7 @@ impl LatexConverter {
                             // Check that we're not in the middle of a word
                             // e.g., don't change "tangent" when looking for "angle"
                             let after_symbol = abs_pos + symbol.len();
-                            let next_char = result.chars().nth(after_symbol);
+                            let next_char = result[after_symbol..].chars().next();
                             let is_word_boundary =
                                 next_char.is_none_or(|c| !c.is_alphanumeric() && c != '.');
 
@@ -2763,7 +2964,8 @@ impl LatexConverter {
                     "Z" => "ZZ".to_string(),
                     "Q" => "QQ".to_string(),
                     "C" => "CC".to_string(),
-                    _ => format!("bb({})", clean_content),
+                    // Keep the spaces: `bb(A B)` is two letters, `bb(AB)` a variable.
+                    _ => format!("bb({})", content.trim()),
                 };
 
                 let total_end = start + 3 + end + 1;
@@ -2834,26 +3036,35 @@ impl LatexConverter {
         result
     }
 
-    /// Insert an empty base `""` before a `_(`/`^(` attachment that has no base
-    /// (at the start of the string or right after an opening `(`). Both are
-    /// positions where Typst would otherwise report an unexpected `_`/`^`.
+    /// Insert an empty base `zws` before a `_(`/`^(` attachment that has no base:
+    /// at the start of the string, or right after an unescaped opening
+    /// delimiter or argument separator (`\left[ ^{2}K` gave `[^(2)K`). These
+    /// are positions where Typst would otherwise report an unexpected `_`/`^`.
+    /// `zws` is also how `{}_a` converts, so T -> L -> T reads it back the same.
     fn insert_empty_attachment_base(&self, input: &str) -> String {
         let mut out = String::with_capacity(input.len() + 4);
-        let mut last_nonspace: Option<char> = None;
+        // The last non-space character, and whether a backslash escaped it.
+        let mut last_nonspace: Option<(char, bool)> = None;
+        let mut escaped = false;
         let mut chars = input.chars().peekable();
         while let Some(c) = chars.next() {
             if (c == '_' || c == '^')
+                && !escaped
                 && chars.peek() == Some(&'(')
-                && matches!(last_nonspace, None | Some('('))
+                && matches!(
+                    last_nonspace,
+                    None | Some(('(' | '[' | '{' | ',' | ';' | '&', false))
+                )
             {
                 self.attachment_repairs.note_empty_base();
-                out.push_str("\"\"");
-                last_nonspace = Some('"');
+                out.push_str("zws");
+                last_nonspace = Some(('s', false));
             }
             out.push(c);
             if !c.is_whitespace() {
-                last_nonspace = Some(c);
+                last_nonspace = Some((c, escaped));
             }
+            escaped = c == '\\' && !escaped;
         }
         out
     }
@@ -2949,8 +3160,14 @@ impl LatexConverter {
     /// Find matching closing parenthesis
     pub fn find_matching_paren(&self, s: &str) -> Option<usize> {
         let mut depth = 1;
+        let mut escaped = false;
         for (i, c) in s.char_indices() {
+            if std::mem::take(&mut escaped) {
+                continue;
+            }
             match c {
+                // `\(` and `\)` are content, not grouping.
+                '\\' => escaped = true,
                 '(' => depth += 1,
                 ')' => {
                     depth -= 1;
@@ -3197,6 +3414,8 @@ impl LatexConverter {
                 }
             }
         }
+        // A bracket that does not pair within its matrix cell or `cases` row
+        // is escaped by `unpaired_delimiters`: `{ ( } & { ) }` gave `mat((, ))`.
         self.visit_elements(&content, output);
     }
 
