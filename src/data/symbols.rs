@@ -801,6 +801,12 @@ lazy_static! {
         m.insert("\\rfloor", "floor.r");
         m.insert("\\lceil", "ceil.l");
         m.insert("\\rceil", "ceil.r");
+        // Angle brackets as plain characters, which LaTeX accepts as delimiters
+        m.insert("<", "chevron.l");
+        m.insert(">", "chevron.r");
+        // Slashes
+        m.insert("/", "slash");
+        m.insert("\\backslash", "backslash");
         // Invisible delimiter
         m.insert(".", "");
         m

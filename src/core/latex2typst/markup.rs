@@ -2,7 +2,7 @@
 //!
 //! This module handles LaTeX commands like \section, \textbf, \cite, etc.
 
-use mitex_parser::syntax::{CmdItem, SyntaxElement};
+use mitex_parser::syntax::{CmdItem, SyntaxElement, SyntaxKind, SyntaxNode};
 use rowan::ast::AstNode;
 use std::fmt::Write;
 
@@ -23,11 +23,12 @@ use super::context::{
     SIZED_DOUBLE_BAR_SENTINEL,
 };
 use super::utils::{protect_top_level_comma, sanitize_label, to_roman_numeral};
+use super::{ConversionWarning, WarningKind};
 use crate::features::images::ImageAttributes;
 use crate::features::refs::{
     citation_mode_from_latex_command, label_to_typst, reference_to_typst,
-    reference_to_typst_without_supplement, reference_type_from_latex_command, Citation,
-    CitationMode, CiteGroup, Reference, ReferenceType,
+    reference_to_typst_without_supplement, reference_type_from_latex_command, typst_label,
+    Citation, CitationMode, CiteGroup, Reference, ReferenceType,
 };
 
 fn has_split_optional_citation_start(cmd: &CmdItem) -> bool {
@@ -72,22 +73,74 @@ fn normalize_operator_name_text(text: &str) -> Option<String> {
         return None;
     }
 
-    let normalized: String = trimmed
-        .split_whitespace()
-        .filter(|part| !matches!(*part, "thin" | "med" | "thick" | "quad" | "wide"))
-        .collect();
+    let normalized = join_operator_name_words(trimmed);
 
-    if normalized.is_empty() {
+    if normalized.chars().all(is_operator_name_space) {
         return None;
     }
 
     if normalized
         .chars()
-        .all(|c| c.is_alphanumeric() || c == '.' || c == '\'')
+        .all(|c| c.is_alphanumeric() || c == '.' || c == '\'' || is_operator_name_space(c))
     {
         Some(normalized)
     } else {
         None
+    }
+}
+
+/// Converted `\operatorname` content as one name. Letters arrive spaced apart
+/// (`a r g thin m a x`), so a whole word `thin` is the spacing `\,`; it stays as
+/// its Unicode space, which T → L turns back into `\,`.
+fn join_operator_name_words(text: &str) -> String {
+    text.split_whitespace()
+        .filter_map(|word| match word {
+            "thin" => Some("\u{2009}"),
+            "med" => Some("\u{205F}"),
+            "thick" => Some("\u{2004}"),
+            "quad" | "wide" => None,
+            _ => Some(word),
+        })
+        .collect()
+}
+
+/// The Unicode spaces for `\,`, `\:` and `\;` in an operator name.
+fn is_operator_name_space(c: char) -> bool {
+    matches!(c, '\u{2009}' | '\u{205F}' | '\u{2004}')
+}
+
+/// Typst for `\operatorname` with raw argument `raw`, converted to `content`.
+/// A plain name becomes a string, `op("sn")`. Anything else stays math,
+/// `op(bb(chi))`: quoting converted math showed its Typst source as text.
+pub(crate) fn operator_name_call(raw: &str, content: &str) -> String {
+    let mut plain = raw.to_string();
+    for spacing in [r"\,", r"\;", r"\:", r"\>", r"\!", r"\ ", r"\_"] {
+        plain = plain.replace(spacing, "");
+    }
+    let name = if plain.contains(['\\', '_', '^', '{', '}', '$']) {
+        extract_wrapped_operator_name(content)
+    } else {
+        // Explicit operator commands opt into operator-name recovery.
+        Some(
+            extract_explicit_operator_name(content)
+                .unwrap_or_else(|| join_operator_name_words(content)),
+        )
+    };
+    match name {
+        // The name goes in a string, where math's `\_` is not a valid escape, and a
+        // space is written as an escape so that it shows: `op("arg\u{2009}max")`.
+        Some(name) => {
+            let mut quoted = String::new();
+            for c in name.replace("\\_", "_").chars() {
+                if is_operator_name_space(c) {
+                    let _ = write!(quoted, "\\u{{{:X}}}", c as u32);
+                } else {
+                    quoted.push(c);
+                }
+            }
+            format!("op(\"{}\")", quoted)
+        }
+        None => format!("op({})", protect_top_level_comma(content)),
     }
 }
 
@@ -123,6 +176,93 @@ fn extract_wrapped_operator_name(arg: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Codex symbols with a `.not` variant, checked against the Typst compiler.
+const NEGATABLE_SYMBOLS: &[&str] = &[
+    "approx",
+    "arrow",
+    "arrow.l",
+    "arrow.l.double",
+    "arrow.l.r",
+    "arrow.l.r.double",
+    "arrow.r",
+    "arrow.r.double",
+    "asymp",
+    "backslash",
+    "divides",
+    "eq",
+    "eq.triple",
+    "equiv",
+    "exists",
+    "forces",
+    "gt",
+    "gt.eq",
+    "gt.tilde",
+    "gt.tri",
+    "gt.tri.eq",
+    "in",
+    "in.rev",
+    "lt",
+    "lt.eq",
+    "lt.tilde",
+    "lt.tri",
+    "lt.tri.eq",
+    "parallel",
+    "prec",
+    "prec.eq",
+    "subset",
+    "subset.eq",
+    "subset.sq",
+    "subset.sq.eq",
+    "succ",
+    "succ.eq",
+    "supset",
+    "supset.eq",
+    "supset.sq",
+    "supset.sq.eq",
+    "tack.r",
+    "tilde",
+    "tilde.eq",
+    "tilde.equiv",
+];
+
+/// A required argument of a text command inside math, converted as text.
+fn convert_text_arg(conv: &mut LatexConverter, cmd: &CmdItem, index: usize) -> String {
+    let previous = conv.state.mode;
+    conv.state.mode = ConversionMode::Text;
+    let content = conv.convert_required_arg(cmd, index).unwrap_or_default();
+    conv.state.mode = previous;
+    content
+}
+
+/// `\text` content as a Typst string literal, or `None` when it holds inline math
+/// or a command that a string cannot express. Braces only group, and LaTeX's text
+/// escapes (`\%`, `\_`, …) become their character.
+fn latex_text_to_typst_string(raw: &str) -> Option<String> {
+    let mut text = String::new();
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            // TeX sets a run of spaces, newlines included, as one space.
+            _ if ch.is_whitespace() => {
+                if !text.ends_with(' ') {
+                    text.push(' ');
+                }
+            }
+            '$' => return None,
+            '{' | '}' => {}
+            '~' => text.push(' '),
+            '\\' => match chars.next()? {
+                escaped @ ('%' | '&' | '#' | '_' | '{' | '}' | '$') => text.push(escaped),
+                ' ' => text.push(' '),
+                _ => return None,
+            },
+            other => text.push(other),
+        }
+    }
+    let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+    Some(format!("\"{escaped}\""))
 }
 
 fn extract_plain_operator_name_from_raw(raw_arg: &str) -> Option<String> {
@@ -251,11 +391,9 @@ pub fn convert_command_sym(conv: &mut LatexConverter, elem: SyntaxElement, outpu
                 return;
             }
             "_" => {
-                if matches!(conv.state.mode, ConversionMode::Math) {
-                    output.push('_');
-                } else {
-                    output.push_str("\\_"); // _ causes emphasis in text
-                }
+                // Escaped in both modes: a bare `_` is a subscript in math and
+                // emphasis in text.
+                output.push_str("\\_");
                 return;
             }
             "*" => {
@@ -279,12 +417,11 @@ pub fn convert_command_sym(conv: &mut LatexConverter, elem: SyntaxElement, outpu
                 output.push('&');
                 return;
             }
-            "{" => {
-                output.push('{');
-                return;
-            }
-            "}" => {
-                output.push('}');
+            "{" | "}" => {
+                if conv.is_unpaired_delimiter(&SyntaxElement::Token(t.clone())) {
+                    output.push('\\');
+                }
+                output.push_str(cmd_name);
                 return;
             }
             "~" => {
@@ -307,9 +444,81 @@ pub fn convert_command_sym(conv: &mut LatexConverter, elem: SyntaxElement, outpu
             output.push(' ');
         } else {
             // Pass through unknown symbols
+            if matches!(conv.state.mode, ConversionMode::Math) {
+                warn_unknown_math_command(conv, cmd_name);
+            }
             output.push_str(cmd_name);
             output.push(' ');
         }
+    }
+}
+
+/// Warn once per name that an unknown math command passed through as a bare
+/// identifier. Typst knows no such name, so the output compiles only if the
+/// user defines it.
+fn warn_unknown_math_command(conv: &mut LatexConverter, name: &str) {
+    let message = format!("unknown command \\{name} in math, passed through as `{name}`");
+    if conv.state.warnings.contains(&message) {
+        return;
+    }
+    conv.state.warnings.push(message.clone());
+    conv.state.add_warning(ConversionWarning::new(
+        WarningKind::UnsupportedMacro,
+        message,
+    ));
+}
+
+/// The delimiter after `\big` and its kin, as written.
+///
+/// The parser takes the delimiter as the command's argument. A `[` or `]`
+/// there is the bracket itself, so the usual argument getters, which skip
+/// optional `[…]` arguments and strip brackets, would lose it.
+fn sized_delimiter_arg(cmd: &CmdItem) -> Option<String> {
+    let text = sized_delimiter_clause(cmd)?.text().to_string();
+    let text = text.trim();
+    let text = text
+        .strip_prefix('{')
+        .and_then(|inner| inner.strip_suffix('}'))
+        .unwrap_or(text);
+    Some(text.trim().to_string())
+}
+
+/// The delimiter token or `\{` command that `\big` and its kin take.
+pub(super) fn sized_delimiter_token(cmd: &CmdItem) -> Option<SyntaxElement> {
+    sized_delimiter_clause(cmd)?
+        .children_with_tokens()
+        .find(|child| child.kind() != SyntaxKind::TokenWhiteSpace)
+}
+
+/// The argument clause that holds the delimiter of `\big` and its kin.
+fn sized_delimiter_clause(cmd: &CmdItem) -> Option<SyntaxNode> {
+    cmd.syntax()
+        .children()
+        .find(|child| child.kind() == SyntaxKind::ClauseArgument)
+}
+
+/// Whether the node is the base of a `_` or `^` script. The slash form of a
+/// fraction would give that script to the denominator alone (`a/b^(2)`), and a
+/// group without `lr` would give it to its last item.
+pub(super) fn is_script_base(node: &SyntaxNode) -> bool {
+    // A base parses as `ItemAttachComponent[ ClauseArgument[ node ], marker, script ]`.
+    let Some(argument) = node.parent() else {
+        return false;
+    };
+    let Some(attach) = argument.parent() else {
+        return false;
+    };
+    argument.kind() == SyntaxKind::ClauseArgument
+        && attach.kind() == SyntaxKind::ItemAttachComponent
+        && attach.first_child().as_ref() == Some(&argument)
+}
+
+/// In math, end a name or an embedded call with a space: a following letter,
+/// digit or group would extend the name, and a following `(…)` or `[…]` would
+/// give the call more arguments.
+fn space_in_math(conv: &LatexConverter, output: &mut String) {
+    if matches!(conv.state.mode, ConversionMode::Math) {
+        output.push(' ');
     }
 }
 
@@ -498,6 +707,30 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         return;
     }
 
+    // Plain TeX font switches take the rest of their group as the argument. In
+    // math they select a math font, so convert them as the `\math..` commands.
+    let base_name = match base_name {
+        // `{\cos\tt}` would give `mono()`, a call with no body.
+        "bf" | "it" | "rm" | "sf" | "tt" | "cal" | "displaystyle" | "textstyle"
+            if matches!(conv.state.mode, ConversionMode::Math)
+                && conv
+                    .get_required_arg(&cmd, 0)
+                    .is_none_or(|arg| arg.trim().is_empty()) =>
+        {
+            return;
+        }
+        "bf" | "it" | "rm" | "sf" | "tt" if matches!(conv.state.mode, ConversionMode::Math) => {
+            match base_name {
+                "bf" => "mathbf",
+                "it" => "mathit",
+                "rm" => "mathrm",
+                "sf" => "mathsf",
+                _ => "mathtt",
+            }
+        }
+        _ => base_name,
+    };
+
     // Handle document commands
     match base_name {
         // Section commands - Part gets special formatting with Roman numerals
@@ -560,7 +793,51 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             let _ = write!(output, "\n_{}_\n", title);
         }
 
-        // Text formatting
+        // Text in math. Plain text becomes a string, which is plain text in
+        // math and survives as a call argument, where T -> L split `#text[a]`
+        // into `#` and `\text{[a]}`. `*…*`, `_…_` and backticks are not markup
+        // there, so the styled commands wrap the string in a math style.
+        "textbf" | "textit" | "emph" | "texttt" | "textsf" | "text" | "textrm" | "textup"
+        | "textnormal"
+            if matches!(conv.state.mode, ConversionMode::Math) =>
+        {
+            let (style, wrapper) = match base_name {
+                "textbf" => (Some("bold"), "#strong"),
+                "textit" | "emph" => (Some("italic"), "#emph"),
+                "texttt" => (Some("mono"), "#text"),
+                "textsf" => (Some("sans"), "#text"),
+                _ => (None, "#text"),
+            };
+            let arg = if style.is_some() {
+                conv.get_required_arg(&cmd, 0)
+            } else {
+                conv.get_required_text_arg(&cmd, 0)
+            };
+            match (arg.as_deref().and_then(latex_text_to_typst_string), style) {
+                (Some(string), Some(style)) => {
+                    let _ = write!(output, "{style}({string}) ");
+                }
+                (Some(string), None) => {
+                    let _ = write!(output, "{string} ");
+                }
+                // Text holding math or commands is converted as text and
+                // embedded as markup: `\hbox{$\frac12$}` gave `#text[$\frac12$]`,
+                // raw LaTeX.
+                _ if style.is_some() || arg.is_some() => {
+                    let content = convert_text_arg(conv, &cmd, 0);
+                    let _ = write!(output, "{wrapper}[{}] ", content.trim());
+                }
+                _ => {}
+            }
+        }
+        // In text, `\textsf`, `\rm` and `\sf` (math is handled above) select a
+        // font family that has no portable Typst name, so keep the text
+        // unstyled.
+        "textsf" | "rm" | "sf" => {
+            if let Some(content) = conv.convert_required_arg(&cmd, 0) {
+                output.push_str(&content);
+            }
+        }
         "textbf" | "bf" => {
             let content = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
             let _ = write!(output, "*{}*", content);
@@ -574,8 +851,16 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             let _ = write!(output, "`{}`", content);
         }
         "underline" => {
-            let content = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            let _ = write!(output, "#underline[{}]", content);
+            // In math, `#underline[…]` takes its argument as markup; T -> L then
+            // keeps the brackets, so each round trip added a pair.
+            if matches!(conv.state.mode, ConversionMode::Math) {
+                if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
+                    let _ = write!(output, "underline({}) ", arg);
+                }
+            } else {
+                let content = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+                let _ = write!(output, "#underline[{}]", content);
+            }
         }
         "textsc" | "sc" => {
             let content = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
@@ -589,14 +874,9 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             let content = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
             let _ = write!(output, "#sub[{}]", content);
         }
-        // Text in math - these commands output text in math mode
         "text" | "textrm" | "textup" | "textnormal" => {
             if let Some(arg) = conv.get_required_arg(&cmd, 0) {
-                if matches!(conv.state.mode, ConversionMode::Math) {
-                    let _ = write!(output, "#text[{}] ", arg);
-                } else {
-                    output.push_str(&arg);
-                }
+                output.push_str(&arg);
             }
         }
 
@@ -609,7 +889,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             if conv.state.is_inside(&EnvironmentContext::Equation)
                 || conv.state.is_inside(&EnvironmentContext::Align)
             {
-                let _ = write!(output, "#<{}> ", clean_label);
+                let _ = write!(output, "#{} ", typst_label(&clean_label));
             } else {
                 output.push_str(&label_to_typst(&clean_label));
             }
@@ -699,7 +979,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
 
             if let Some(label) = conv.get_optional_arg(&cmd, 0) {
                 let clean_label = sanitize_label(&label);
-                let _ = write!(output, "#link(<{}>)[{}]", clean_label, text);
+                let _ = write!(output, "#link({})[{}]", typst_label(&clean_label), text);
             } else {
                 output.push_str(&text);
             }
@@ -795,27 +1075,13 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
 
             // Try to get the argument (if parsed as part of the command)
             if let Some(content) = conv.convert_required_arg(&cmd, 0) {
-                // Explicit operator commands opt into operator-name recovery.
-                let clean_content =
-                    extract_explicit_operator_name(&content).unwrap_or_else(|| {
-                        content.chars().filter(|c| !c.is_whitespace()).collect()
-                    });
-                let normalized = normalize_operator_name_text(&clean_content)
-                    .unwrap_or_else(|| clean_content.clone());
-
-                let op_name = if normalized == "argmin" {
-                    "argmin"
-                } else if normalized == "argmax" {
-                    "argmax"
-                } else {
-                    &clean_content
-                };
-
+                let raw = conv.get_required_arg(&cmd, 0).unwrap_or_default();
+                let op = operator_name_call(&raw, &content);
                 // operatorname* implies limits, operatorname does not
                 if is_starred {
-                    let _ = write!(output, "limits(op(\"{}\")) ", op_name);
+                    let _ = write!(output, "limits({}) ", op);
                 } else {
-                    let _ = write!(output, "op(\"{}\") ", op_name);
+                    let _ = write!(output, "{} ", op);
                 }
             } else {
                 // Argument not captured, set pending state for next ItemCurly
@@ -823,55 +1089,76 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             }
         }
 
+        // Plain TeX infix fractions: the operands are the material before and
+        // after the command within its group.
+        "over" | "choose" | "atop" | "brack" | "brace" => {
+            let operand = |conv: &mut LatexConverter, index| {
+                let converted = conv.convert_required_math_arg(&cmd, index).unwrap_or_default();
+                let trimmed = converted.trim();
+                if trimmed.is_empty() {
+                    "zws".to_string()
+                } else {
+                    trimmed.to_string()
+                }
+            };
+            let (top, bottom) = (operand(conv, 0), operand(conv, 1));
+            let _ = match base_name {
+                "over" => write!(output, "frac({top}, {bottom})"),
+                "choose" => write!(output, "binom({top}, {bottom})"),
+                // Typst has no fraction without a rule. A one-column matrix
+                // stacks the operands the same way, with matrix row spacing.
+                "atop" => write!(output, "mat(delim: #none, {top}; {bottom})"),
+                "brack" => write!(output, "mat(delim: \"[\", {top}; {bottom})"),
+                _ => write!(output, "mat(delim: \"{{\", {top}; {bottom})"),
+            };
+        }
+        // Typst's `scripts` is the counterpart of `limits`.
+        "nolimits" => {
+            if let Some(base) = conv.convert_required_math_arg(&cmd, 0) {
+                if !base.trim().is_empty() {
+                    let _ = write!(output, "scripts({})", base.trim());
+                }
+            }
+        }
+
         // Math fractions. Numerator/denominator are math content, so render them
         // by the math rule even on the document/CLI path (issue #35): otherwise
         // `\frac{AB}{CD}` leaks `AB/CD` (uncompilable `unknown variable: AB`).
-        "frac" => {
+        "frac" | "dfrac" | "tfrac" | "cfrac" | "binom" | "dbinom" | "tbinom" => {
             let num = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             let den = conv.convert_required_math_arg(&cmd, 1).unwrap_or_default();
 
-            // Check if we can use slash notation
-            if conv.state.options.frac_to_slash
+            // `\frac` and `\tfrac` may use slash notation
+            if matches!(base_name, "frac" | "tfrac")
+                && conv.state.options.frac_to_slash
                 && conv.is_simple_term(&num)
                 && conv.is_simple_term(&den)
+                && !is_script_base(cmd.syntax())
             {
-                let _ = write!(output, "{}/{}", num.trim(), den.trim());
+                // The space keeps a following letter out of the denominator.
+                let _ = write!(output, "{}/{} ", num.trim(), den.trim());
             } else {
-                let _ = write!(output, "frac({}, {})", num.trim(), den.trim());
+                let function = if base_name.ends_with("binom") { "binom" } else { "frac" };
+                let call = format!("{function}({}, {})", num.trim(), den.trim());
+                let _ = match base_name {
+                    "dfrac" | "dbinom" => write!(output, "display({call})"),
+                    "tfrac" | "tbinom" => write!(output, "inline({call})"),
+                    _ => output.write_str(&call),
+                };
             }
-        }
-        "dfrac" => {
-            // dfrac always uses frac() for proper display style
-            let num = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
-            let den = conv.convert_required_math_arg(&cmd, 1).unwrap_or_default();
-            let _ = write!(output, "display(frac({}, {}))", num.trim(), den.trim());
-        }
-        "tfrac" => {
-            // tfrac might use slash if enabled and simple
-            let num = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
-            let den = conv.convert_required_math_arg(&cmd, 1).unwrap_or_default();
-
-            if conv.state.options.frac_to_slash
-                && conv.is_simple_term(&num)
-                && conv.is_simple_term(&den)
-            {
-                let _ = write!(output, "{}/{}", num.trim(), den.trim());
-            } else {
-                let _ = write!(output, "inline(frac({}, {}))", num.trim(), den.trim());
-            }
-        }
-        "cfrac" => {
-            let num = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
-            let den = conv.convert_required_math_arg(&cmd, 1).unwrap_or_default();
-            let _ = write!(output, "frac({}, {})", num.trim(), den.trim());
         }
 
         // Math roots
         "sqrt" => {
-            let opt = conv.get_optional_arg(&cmd, 0);
+            // The index is math too: `\sqrt[\alpha]{z}` gave `root(\ alpha, z)`.
+            let previous = conv.state.mode;
+            conv.state.mode = ConversionMode::Math;
+            let opt = conv.convert_optional_arg(&cmd, 0);
+            conv.state.mode = previous;
             let content = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
             let protected = protect_top_level_comma(&content);
             if let Some(n) = opt {
+                let n = protect_top_level_comma(&n);
                 let _ = write!(output, "root({}, {})", n, protected);
             } else {
                 let _ = write!(output, "sqrt({})", protected);
@@ -880,58 +1167,34 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
 
         // Math-only commands: their argument must render by the math rule even
         // on the markup path, or `\vec{PC}` leaks `arrow(PC)` (issue #35).
-        "hat" | "widehat" => {
+        "hat" | "widehat" | "tilde" | "widetilde" | "bar" | "overline" | "vec"
+        | "overrightarrow" | "overleftarrow" | "overleftrightarrow" | "dot" | "ddot"
+        | "dddot" | "ddddot" | "overbrace" | "underbrace" | "check" | "mathring"
+        | "acute" | "grave" | "breve" => {
             if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
-                let _ = write!(output, "hat({}) ", arg);
+                let accent = match base_name {
+                    "widehat" => "hat",
+                    "widetilde" => "tilde",
+                    "bar" => "overline",
+                    // Typst has no `overrightarrow`/`overleftarrow` accents; map
+                    // to the directional `arrow` variants (issue #35).
+                    "vec" | "overrightarrow" => "arrow",
+                    "overleftarrow" => "arrow.l",
+                    "overleftrightarrow" => "arrow.l.r",
+                    "ddot" => "dot.double",
+                    "dddot" => "dot.triple",
+                    "ddddot" => "dot.quad",
+                    // Typst names the háček `caron` and the ring `circle`; the
+                    // generic fallback wrote `check(H)`, which does not exist.
+                    "check" => "caron",
+                    "mathring" => "circle",
+                    other => other,
+                };
+                let _ = write!(output, "{accent}({arg}) ");
             }
         }
-        "tilde" | "widetilde" => {
-            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
-                let _ = write!(output, "tilde({}) ", arg);
-            }
-        }
-        "bar" | "overline" => {
-            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
-                let _ = write!(output, "overline({}) ", arg);
-            }
-        }
-        // Typst has no `overrightarrow`/`overleftarrow` accents; map to the
-        // directional `arrow` variants (issue #35).
-        "vec" | "overrightarrow" => {
-            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
-                let _ = write!(output, "arrow({}) ", arg);
-            }
-        }
-        "overleftarrow" => {
-            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
-                let _ = write!(output, "arrow.l({}) ", arg);
-            }
-        }
-        "overleftrightarrow" => {
-            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
-                let _ = write!(output, "arrow.l.r({}) ", arg);
-            }
-        }
-        "dot" => {
-            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
-                let _ = write!(output, "dot({}) ", arg);
-            }
-        }
-        "overbrace" => {
-            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
-                let _ = write!(output, "overbrace({}) ", arg);
-            }
-        }
-        "underbrace" => {
-            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
-                let _ = write!(output, "underbrace({}) ", arg);
-            }
-        }
-        "ddot" => {
-            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
-                let _ = write!(output, "dot.double({}) ", arg);
-            }
-        }
+        // Equation numbering is Typst's to decide.
+        "nonumber" | "notag" if matches!(conv.state.mode, ConversionMode::Math) => {}
         "mathbf" => {
             // \mathbf{x} -> upright(bold(x)) for proper bold upright. Argument is
             // math content, so render it by the math rule on every path (issue #35).
@@ -945,7 +1208,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 let _ = write!(output, "bold({}) ", content);
             }
         }
-        "mathit" => {
+        "mathit" | "mathnormal" => {
             if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let _ = write!(output, "italic({}) ", content);
             }
@@ -960,22 +1223,16 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 }
             }
         }
-        "rm" => {
-            // \rm is an old-style font switch (no braces)
-            if let Some(content) = conv.get_required_arg(&cmd, 0) {
-                let _ = write!(output, "upright({}) ", content);
-            }
-            // If no argument, just skip
-        }
-        // `\displaystyle`/`\textstyle` are scoped by `visit_elements`; these
-        // two script-size switches have no Typst equivalent, so just keep
-        // their contents rather than leaking an unknown identifier.
+        // `\displaystyle`/`\textstyle` are scoped by `visit_elements`. The
+        // parser gives the two script-size switches the rest of their group
+        // (up to `&` or `\\`) as an argument, which becomes `script(…)` or
+        // `sscript(…)`.
         "scriptstyle" | "scriptscriptstyle" => {
             if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
                 let trimmed = content.trim();
                 if !trimmed.is_empty() {
-                    output.push_str(trimmed);
-                    output.push(' ');
+                    let style = if base_name == "scriptstyle" { "script" } else { "sscript" };
+                    let _ = write!(output, "{style}({trimmed}) ");
                 }
             }
         }
@@ -993,14 +1250,16 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 }
             }
         }
-        "mathbb" => {
+        // amsfonts keeps `\Bbb` as an old name for `\mathbb`.
+        "mathbb" | "Bbb" => {
             if let Some(content) = conv.get_required_arg(&cmd, 0) {
                 let content = content.trim();
                 // Only use short forms for standard number sets that Typst supports as symbols
                 if ["R", "Z", "N", "C", "Q"].contains(&content) {
                     let c = content.chars().next().unwrap();
                     let _ = write!(output, "{}{} ", c, c);
-                } else {
+                } else if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
+                    // Converted, or `\mathbb{\chi}` gave `bb(\ chi)`.
                     let _ = write!(output, "bb({}) ", content);
                 }
             }
@@ -1972,14 +2231,20 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             } else {
                 output.push_str("infinity");
             }
+            space_in_math(conv, output);
         }
 
         // Special characters
+        "LaTeX" | "TeX" if matches!(conv.state.mode, ConversionMode::Math) => {
+            let _ = write!(output, "upright(\"{base_name}\") ");
+        }
         "LaTeX" => output.push_str("LaTeX"),
         "TeX" => output.push_str("TeX"),
         "today" => output.push_str("#datetime.today().display()"),
-        "cdots" => output.push_str("dots.h.c"),
-        "ldots" | "dots" => output.push_str("..."),
+        "cdots" | "ldots" | "dots" => {
+            output.push_str(if base_name == "cdots" { "dots.h.c" } else { "..." });
+            space_in_math(conv, output);
+        }
         "copyright" => output.push('©'),
         "trademark" | "texttrademark" => output.push('™'),
         "registered" | "textregistered" => output.push('®'),
@@ -1989,7 +2254,13 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "P" => output.push('¶'),
         "pounds" | "textsterling" => output.push('£'),
         "euro" => output.push('€'),
-        "textbackslash" => output.push('\\'),
+        "textbackslash" => {
+            if matches!(conv.state.mode, ConversionMode::Math) {
+                output.push_str("backslash ");
+            } else {
+                output.push_str("\\\\");
+            }
+        }
         "textasciitilde" => output.push('~'),
         "textasciicircum" => output.push('^'),
         "%" => output.push('%'),
@@ -1997,13 +2268,9 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         // Special characters that need escaping in Typst text mode
         "$" => output.push_str("\\$"),
         "#" => output.push_str("\\#"),
-        "_" => {
-            if matches!(conv.state.mode, ConversionMode::Math) {
-                output.push('_');
-            } else {
-                output.push_str("\\_");
-            }
-        }
+        // Escaped in both modes: a bare `_` is a subscript in math and
+        // emphasis in text.
+        "_" => output.push_str("\\_"),
         "*" => {
             if matches!(conv.state.mode, ConversionMode::Math) {
                 output.push('*');
@@ -2012,8 +2279,12 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             }
         }
         "@" => output.push_str("\\@"),
-        "{" => output.push('{'),
-        "}" => output.push('}'),
+        "{" | "}" => {
+            if conv.is_unpaired_delimiter(&elem) {
+                output.push('\\');
+            }
+            output.push_str(base_name);
+        }
 
         // Accents in text mode
         "`" => {
@@ -2128,8 +2399,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "coprod" => output.push_str("product.co "),
 
         // Delimiters
-        "left" | "right" | "bigl" | "bigr" | "Bigl" | "Bigr" | "biggl" | "biggr" | "Biggl"
-        | "Biggr" | "middle" => {
+        "left" | "right" | "middle" => {
             // These are handled by ItemLR
         }
 
@@ -2188,7 +2458,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "substack" => {
             // \substack{a \\ b} -> directly output content
-            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_content(&cmd, 0) {
                 output.push_str(&arg);
             }
         }
@@ -2469,7 +2739,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             }
         }
         "mathinner" => {
-            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_content(&cmd, 0) {
                 output.push_str(&arg);
                 output.push(' ');
             }
@@ -2477,7 +2747,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
 
         // Displaylines
         "displaylines" => {
-            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_content(&cmd, 0) {
                 output.push_str(&arg);
             }
         }
@@ -2585,10 +2855,8 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "degree" => output.push_str("degree "),
         "angle" => output.push_str("angle "),
         "ell" => output.push_str("ell "),
-        "hbar" => output.push_str("planck.reduce "),
         "Re" => output.push_str("Re "),
         "Im" => output.push_str("Im "),
-        "wp" => output.push_str("wp "),
         "aleph" => output.push_str("aleph "),
         "beth" => output.push_str("beth "),
         "gimel" => output.push_str("gimel "),
@@ -2621,7 +2889,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
 
         // Big delimiters - handled via data module
         _ if crate::data::symbols::is_big_delimiter_command(base_name) => {
-            if let Some(delim) = conv.get_required_arg(&cmd, 0) {
+            if let Some(delim) = sized_delimiter_arg(&cmd) {
                 if let Some(typst_delim) = crate::data::symbols::convert_delimiter(delim.trim()) {
                     match typst_delim {
                         // Keep size-command bars distinct until the pairing
@@ -2630,11 +2898,21 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                         "bar.v" => output.push_str(SIZED_BAR_SENTINEL),
                         "bar.v.double" => output.push_str(SIZED_DOUBLE_BAR_SENTINEL),
                         _ if !typst_delim.is_empty() => {
+                            if sized_delimiter_token(&cmd)
+                                .is_some_and(|token| conv.is_unpaired_delimiter(&token))
+                            {
+                                output.push('\\');
+                            }
                             output.push_str(typst_delim);
                             output.push(' ');
                         }
                         _ => {}
                     }
+                } else if delim.starts_with('\\') {
+                    // An arrow or other symbol: `\Bigg\downarrow`.
+                    let symbol = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
+                    output.push_str(symbol.trim());
+                    output.push(' ');
                 } else {
                     output.push_str(delim.trim());
                     output.push(' ');
@@ -2675,48 +2953,28 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             // or cancel(X) as fallback
             if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
                 let arg = arg.trim();
-                // Common negatable symbols
-                let negated = match arg {
-                    "=" | "eq" => "eq.not",
-                    "<" | "lt" => "lt.not",
-                    ">" | "gt" => "gt.not",
-                    "in" => "in.not",
-                    "subset" => "subset.not",
-                    "supset" => "supset.not",
-                    "equiv" => "equiv.not",
-                    "approx" => "approx.not",
-                    "sim" | "tilde.op" => "tilde.not",
-                    "parallel" => "parallel.not",
-                    "exists" => "exists.not",
-                    "ni" | "in.rev" => "in.rev.not",
-                    "mid" | "divides" => "divides.not",
-                    "prec" => "prec.not",
-                    "succ" => "succ.not",
-                    "subset.eq" => "subset.eq.not",
-                    "supset.eq" => "supset.eq.not",
-                    "lt.eq" => "lt.eq.not",
-                    "gt.eq" => "gt.eq.not",
-                    "arrow.l" => "arrow.l.not",
-                    "arrow.r" => "arrow.r.not",
-                    "arrow.l.double" => "arrow.l.double.not",
-                    "arrow.r.double" => "arrow.r.double.not",
-                    "tack.r" => "tack.r.not",
-                    "forces" => "forces.not",
-                    _ => {
-                        // Try appending .not for any symbol
-                        if arg.chars().all(|c| c.is_alphanumeric() || c == '.') {
-                            // Output as symbol.not
-                            let _ = write!(output, "{}.not ", arg);
-                            return;
-                        } else {
-                            // Fallback: use cancel
-                            let _ = write!(output, "cancel({}) ", arg);
-                            return;
-                        }
-                    }
+                // Converted names whose `.not` variant has another base
+                let arg = match arg {
+                    "=" => "eq",
+                    "<" => "lt",
+                    ">" => "gt",
+                    "sim" | "tilde.op" => "tilde",
+                    "ni" => "in.rev",
+                    "mid" => "divides",
+                    other => other,
                 };
-                output.push_str(negated);
-                output.push(' ');
+                // Only some symbols have a `.not` variant: `lt.double.not` and
+                // `partial.not` do not compile. Others are struck through, as
+                // `\not` draws them.
+                if NEGATABLE_SYMBOLS.contains(&arg) {
+                    let _ = write!(output, "{}.not ", arg);
+                } else if arg.is_empty() {
+                    // `\not\!\partial`: `\not` is a slash of zero width over
+                    // whatever follows.
+                    output.push_str("#box(width: 0pt, $slash$) ");
+                } else {
+                    let _ = write!(output, "cancel({}) ", arg);
+                }
             }
         }
 
@@ -2825,8 +3083,8 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         | "IEEEauthorblockN" | "IEEEauthorblockA" | "IEEEoverridecommandlockouts"
         | "IEEEaftertitletext" | "IEEEmembership" | "IEEEspecialpapernotice"
         | "markboth" | "markright" | "thanks" | "and"
-        // Additional formatting switches (excluding already handled: it, bf, tt, sc, rm)
-        | "em" | "sf" | "sl"
+        // Additional formatting switches (excluding already handled: it, bf, tt, sc, rm, sf)
+        | "em" | "sl"
         // Floats and placement
         | "suppressfloats" | "FloatBarrier" | "clearfloats"
         // Spacing (excluding already handled: smallskip, medskip, bigskip)
@@ -2867,9 +3125,8 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             // Pass through unknown commands using AST-based processing
             // This preserves the behavior of convert_default_command from old version
             if conv.state.options.non_strict {
-                use mitex_parser::syntax::SyntaxKind;
-
                 if matches!(conv.state.mode, ConversionMode::Math) {
+                    warn_unknown_math_command(conv, base_name);
                     // In math mode, output as function call: \cmd{arg} -> cmd(arg)
                     let has_args = cmd
                         .syntax()
@@ -2892,8 +3149,10 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                         }
                         output.push(')');
                     } else {
-                        // No arguments - just output the name as identifier
+                        // No arguments - just output the name as identifier. The
+                        // space keeps a following group out of the name.
                         output.push_str(base_name);
+                        output.push(' ');
                     }
                 } else {
                     // In text mode, output name as comment to avoid garbage text
@@ -3077,8 +3336,8 @@ fn expand_user_macro(conv: &mut LatexConverter, cmd: &CmdItem, macro_def: &Macro
 
     // Convert the expanded macro
     let mut output = String::new();
-    let tree = mitex_parser::parse(&result, conv.spec.clone());
-    conv.visit_node(&tree, &mut output);
+    let tree = super::utils::parse_latex(&result, conv.spec.clone());
+    conv.visit_tree(&tree, &mut output);
     output
 }
 
