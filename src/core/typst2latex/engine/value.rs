@@ -6,6 +6,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::features::images::escape_typst_string;
 use crate::features::refs::{citation_to_typst, Citation, CitationMode, CiteGroup, ReferenceType};
 use chrono::{NaiveDate, NaiveTime};
 use indexmap::IndexMap;
@@ -1665,7 +1666,7 @@ pub fn value_to_typst_arg(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Int(i) => i.to_string(),
         Value::Float(f) => format_float(*f),
-        Value::Str(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
+        Value::Str(s) => format!("\"{}\"", escape_typst_string(s)),
         Value::Length(l) => l.to_typst(),
         Value::Ratio(r) => format!("{}%", r * 100.0),
         Value::Angle(a) => format!("{}deg", a),

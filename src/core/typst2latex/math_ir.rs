@@ -373,24 +373,34 @@ fn build_math_attach(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
         .filter(|child| child.kind() != SyntaxKind::Space)
         .collect();
 
-    let base_idx = children.iter().position(|child| {
-        child.kind() != SyntaxKind::Hat
-            && child.kind() != SyntaxKind::Underscore
-            && child.kind() != SyntaxKind::MathPrimes
-    });
-
-    let Some(base_idx) = base_idx else {
-        return MathIr::empty();
+    // The base is always the first child. Searching further picked a script operand
+    // as the base too, building it twice per level: `^'^'^'…` took exponential time.
+    // A leading `MathPrimes` (`'^2`) is primes on an empty base, since LaTeX rejects `'^2`.
+    let base_idx = match children.first() {
+        None => return MathIr::empty(),
+        Some(first)
+            if matches!(
+                first.kind(),
+                SyntaxKind::MathPrimes | SyntaxKind::Hat | SyntaxKind::Underscore
+            ) =>
+        {
+            None
+        }
+        Some(_) => Some(0),
     };
 
-    let base = Box::new(build_math_ir(children[base_idx], options));
+    let base = Box::new(
+        base_idx
+            .map(|index| build_math_ir(children[index], options))
+            .unwrap_or_else(MathIr::empty),
+    );
     let mut sub = None;
     let mut sup = None;
     let mut primes = 0usize;
 
     let mut index = 0;
     while index < children.len() {
-        if index == base_idx {
+        if Some(index) == base_idx {
             index += 1;
             continue;
         }

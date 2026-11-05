@@ -207,6 +207,10 @@ fn emit_script(
     emit_math_ir(base, ctx);
 
     if primes > 0 {
+        // LaTeX rejects `'^2` as a double superscript; `{}'^2` is valid.
+        if base.is_empty() {
+            ctx.push("{}");
+        }
         ctx.push(&"'".repeat(primes));
         ctx.last_token = TokenType::Punctuation;
     }

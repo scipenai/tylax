@@ -23,6 +23,8 @@ use mitex_spec_gen::DEFAULT_SPEC;
 use std::collections::HashSet;
 use std::fmt;
 
+use crate::core::latex2typst::lexical::{find_env_tag, inline_verb, literal_env};
+use crate::core::latex2typst::{parse_latex, SourceMap};
 use crate::data::maps::TEX_COMMAND_SPEC;
 use fxhash::FxHashMap;
 use lazy_static::lazy_static;
@@ -272,8 +274,8 @@ pub fn check_latex(input: &str) -> CheckResult {
     let masked = mask_literal_regions(input);
     let input = masked.as_str();
 
-    // Parse the input
-    let tree = mitex_parser::parse(input, MERGED_SPEC.clone());
+    // Recovery may insert braces; diagnostics always map back to the original source.
+    let parsed = parse_latex(input, MERGED_SPEC.clone());
 
     // Calculate line offsets for position reporting
     let line_offsets = compute_line_offsets(input);
@@ -283,7 +285,14 @@ pub fn check_latex(input: &str) -> CheckResult {
     let declared = collect_declared_packages(input);
 
     // Walk the AST looking for issues
-    check_node(&tree, input, &line_offsets, &declared, &mut result);
+    check_node(
+        &parsed.tree,
+        input,
+        &line_offsets,
+        &parsed.source_map,
+        &declared,
+        &mut result,
+    );
 
     // Check for unbalanced braces
     check_brace_balance(input, &mut result);
@@ -380,6 +389,7 @@ fn check_node(
     node: &SyntaxNode,
     source: &str,
     line_offsets: &[usize],
+    source_map: &SourceMap,
     declared: &HashSet<String>,
     result: &mut CheckResult,
 ) {
@@ -393,7 +403,8 @@ fn check_node(
                 };
 
                 let offset = child.text_range().start().into();
-                let (line, col) = offset_to_location(offset, line_offsets);
+                let (line, col) =
+                    offset_to_location(source_map.original_offset(offset), line_offsets);
 
                 result.add(
                     Diagnostic::new(
@@ -408,21 +419,21 @@ fn check_node(
             SyntaxKind::ItemCmd => {
                 // Check if command is supported
                 if let SyntaxElement::Node(cmd_node) = &child {
-                    check_command(cmd_node, source, line_offsets, declared, result);
+                    check_command(cmd_node, source, line_offsets, source_map, declared, result);
                 }
             }
 
             SyntaxKind::ItemEnv => {
                 // Check environment
                 if let SyntaxElement::Node(env_node) = &child {
-                    check_environment(env_node, source, line_offsets, declared, result);
+                    check_environment(env_node, source, line_offsets, source_map, declared, result);
                 }
             }
 
             _ => {
                 // Recurse into child nodes
                 if let SyntaxElement::Node(n) = child {
-                    check_node(&n, source, line_offsets, declared, result);
+                    check_node(&n, source, line_offsets, source_map, declared, result);
                 }
             }
         }
@@ -434,6 +445,7 @@ fn check_command(
     node: &SyntaxNode,
     source: &str,
     line_offsets: &[usize],
+    source_map: &SourceMap,
     declared: &HashSet<String>,
     result: &mut CheckResult,
 ) {
@@ -446,7 +458,7 @@ fn check_command(
         .trim_start_matches('\\');
 
     let offset: usize = node.text_range().start().into();
-    let (line, col) = offset_to_location(offset, line_offsets);
+    let (line, col) = offset_to_location(source_map.original_offset(offset), line_offsets);
 
     // Check if unsupported
     if UNSUPPORTED_COMMANDS.contains(cmd_name) {
@@ -479,7 +491,7 @@ fn check_command(
     }
 
     // Recurse into children
-    check_node(node, source, line_offsets, declared, result);
+    check_node(node, source, line_offsets, source_map, declared, result);
 }
 
 /// Check an environment node for issues
@@ -487,6 +499,7 @@ fn check_environment(
     node: &SyntaxNode,
     source: &str,
     line_offsets: &[usize],
+    source_map: &SourceMap,
     declared: &HashSet<String>,
     result: &mut CheckResult,
 ) {
@@ -507,7 +520,7 @@ fn check_environment(
     for (env_name, message) in problematic {
         if text.contains(&format!("\\begin{{{}}}", env_name)) {
             let offset: usize = node.text_range().start().into();
-            let (line, col) = offset_to_location(offset, line_offsets);
+            let (line, col) = offset_to_location(source_map.original_offset(offset), line_offsets);
 
             result.add(
                 Diagnostic::new(DiagnosticLevel::Warning, message)
@@ -518,7 +531,7 @@ fn check_environment(
     }
 
     // Recurse into children
-    check_node(node, source, line_offsets, declared, result);
+    check_node(node, source, line_offsets, source_map, declared, result);
 }
 
 /// Check for unbalanced braces
@@ -570,20 +583,6 @@ fn check_brace_balance(input: &str, result: &mut CheckResult) {
     }
 }
 
-/// Environments whose BODY is literal source for diagnostic purposes.
-///
-/// `alltt` is deliberately absent: it typesets verbatim-like, but commands
-/// inside it are still expanded, so its body is real LaTeX whose structure must
-/// keep being checked.
-const DIAGNOSTIC_LITERAL_ENVS: &[&str] = &[
-    "verbatim",
-    "verbatim*",
-    "Verbatim",
-    "Verbatim*",
-    "lstlisting",
-    "minted",
-];
-
 /// Blank what LaTeX never interprets — `%` comments, `\verb` spans, and
 /// verbatim-family BODIES — so the balance scanners cannot be fooled by literal
 /// text. The result keeps the exact byte length, so reported positions stay
@@ -606,6 +605,7 @@ fn mask_literal_regions(input: &str) -> String {
     }
 
     let mut i = 0usize;
+    let mut literal_header = 0..0;
     while i < bytes.len() {
         // Dispatch on the buffer being written, not the original bytes: an
         // already-blanked region must not be re-interpreted, or a `%` inside a
@@ -616,15 +616,22 @@ fn mask_literal_regions(input: &str) -> String {
             // consumes `\%` as a unit, so it never arrives.
             b'%' => {
                 let end = input[i..].find('\n').map_or(bytes.len(), |p| i + p);
-                blank(&mut out, i..end);
+                // Keep header comment boundaries; MiTeX needs blank trivia in tags.
+                let start = if literal_header.contains(&i) {
+                    i + 1
+                } else {
+                    i
+                };
+                blank(&mut out, start..end);
                 i = end;
             }
             b'\\' => {
-                if let Some(end) = inline_verb_end(input, i) {
-                    blank(&mut out, i..end);
-                    i = end;
-                } else if let Some(body) = literal_env_body(input, i) {
-                    blank(&mut out, body);
+                if let Some(verb) = inline_verb(input, i) {
+                    blank(&mut out, i..verb.end);
+                    i = verb.end;
+                } else if let Some(env) = literal_env(input, i) {
+                    literal_header = env.header;
+                    blank(&mut out, env.body);
                     // Resume just past the control word: the opening tag may
                     // carry its own `%` separator, which the branch above must
                     // still blank. Re-walking the blanked body is harmless.
@@ -642,171 +649,6 @@ fn mask_literal_regions(input: &str) -> String {
     }
 
     String::from_utf8(out).unwrap_or_else(|_| input.to_string())
-}
-
-/// End offset (exclusive) of an inline `\verb`/`\verb*` span starting at
-/// `start`, or `None` if this is not one (e.g. `\verbatim`, or an unterminated
-/// span, which is left for the normal checks to report).
-fn inline_verb_end(input: &str, start: usize) -> Option<usize> {
-    let after = input.get(start..)?.strip_prefix("\\verb")?;
-    let mut chars = after.char_indices();
-    let (_, first) = chars.next()?;
-    // A real inline `\verb` is never followed by a letter.
-    if first.is_ascii_alphabetic() {
-        return None;
-    }
-    let (delim_offset, delim) = if first == '*' {
-        chars.next()?
-    } else {
-        (0, first)
-    };
-    let content_start = start + "\\verb".len() + delim_offset + delim.len_utf8();
-    let close = input.get(content_start..)?.find(delim)?;
-    Some(content_start + close + delim.len_utf8())
-}
-
-/// A parsed `\begin`/`\end` tag: the environment name and the offset just past
-/// the closing `}` of its name group.
-struct EnvTag<'a> {
-    name: &'a str,
-    end: usize,
-}
-
-/// Advance past the whitespace and `%` comments TeX allows between a control
-/// word and its argument, so `\begin {verbatim}` and `\begin% note\n{verbatim}`
-/// parse exactly like `\begin{verbatim}`.
-fn skip_spaces_and_comments(input: &str, start: usize) -> usize {
-    let bytes = input.as_bytes();
-    let mut index = start;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'%' => {
-                index = input[index..]
-                    .find('\n')
-                    .map_or(bytes.len(), |p| index + p + 1);
-            }
-            byte if byte.is_ascii_whitespace() => index += 1,
-            _ => break,
-        }
-    }
-    index
-}
-
-/// Parse the `\begin`/`\end` tag at `start`. The single definition of the tag
-/// syntax, shared by the literal-region mask and the balance scanner.
-fn parse_env_tag<'a>(input: &'a str, start: usize, keyword: &str) -> Option<EnvTag<'a>> {
-    let after_keyword = input.get(start..)?.strip_prefix(keyword)?;
-    // A control word is not a prefix of a longer one: `\beginning`, `\endinput`.
-    if after_keyword
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic())
-    {
-        return None;
-    }
-    let argument = skip_spaces_and_comments(input, start + keyword.len());
-    let braced = input.get(argument..)?.strip_prefix('{')?;
-    let close = braced.find('}')?;
-    Some(EnvTag {
-        name: &braced[..close],
-        end: argument + '{'.len_utf8() + close + '}'.len_utf8(),
-    })
-}
-
-/// Find the next position at or after `from` that really parses as a `keyword`
-/// tag, skipping look-alikes such as `\beginning`.
-fn find_env_tag<'a>(input: &'a str, from: usize, keyword: &str) -> Option<(usize, EnvTag<'a>)> {
-    let mut search = from;
-    while let Some(relative) = input.get(search..)?.find(keyword) {
-        let at = search + relative;
-        if let Some(tag) = parse_env_tag(input, at, keyword) {
-            return Some((at, tag));
-        }
-        search = at + keyword.len();
-    }
-    None
-}
-
-/// Skip a literal environment's header arguments, returning `None` when the
-/// header is malformed — an incomplete `\begin{minted}{python` must stay
-/// unmasked so the brace and environment checks still report it.
-fn literal_env_header_end(input: &str, env: &str, after_tag: usize) -> Option<usize> {
-    // A bare newline ends the header: consuming it could reinterpret the first
-    // literal body line as an argument. A `%` comment is different in TeX: it
-    // consumes its newline while the header is still being scanned, so an
-    // optional or required header group may begin on the next physical line.
-    fn skip_header_trivia(input: &str, start: usize) -> usize {
-        let bytes = input.as_bytes();
-        let mut index = start;
-        loop {
-            while index < bytes.len() && matches!(bytes[index], b' ' | b'\t') {
-                index += 1;
-            }
-            if bytes.get(index) != Some(&b'%') {
-                return index;
-            }
-            index = input[index..]
-                .find('\n')
-                .map_or(input.len(), |newline| index + newline + 1);
-        }
-    }
-
-    // Delimited group that must be closed if it is opened at all.
-    fn skip_group(
-        input: &str,
-        start: usize,
-        open: char,
-        close: char,
-        required: bool,
-    ) -> Option<usize> {
-        let at = skip_header_trivia(input, start);
-        match input.get(at..)?.strip_prefix(open) {
-            Some(rest) => {
-                let end = rest.find(close)?;
-                Some(at + open.len_utf8() + end + close.len_utf8())
-            }
-            None if required => None,
-            None => Some(start),
-        }
-    }
-
-    let mut position = after_tag;
-    // fancyvrb, listings and minted all take an optional `[...]` option list.
-    if matches!(env, "Verbatim" | "Verbatim*" | "lstlisting" | "minted") {
-        position = skip_group(input, position, '[', ']', false)?;
-    }
-    // minted additionally requires `{<language>}`.
-    if env == "minted" {
-        position = skip_group(input, position, '{', '}', true)?;
-    }
-    Some(position)
-}
-
-/// Byte range of a verbatim-family environment's literal BODY. The `\begin` and
-/// `\end` tags are excluded, so an unclosed one is still reported; an
-/// unterminated block treats the remainder as literal but keeps its `\begin`.
-fn literal_env_body(input: &str, start: usize) -> Option<std::ops::Range<usize>> {
-    let tag = parse_env_tag(input, start, "\\begin")?;
-    if !DIAGNOSTIC_LITERAL_ENVS.contains(&tag.name) {
-        return None;
-    }
-    let body_start = literal_env_header_end(input, tag.name, tag.end)?;
-
-    // Locate the matching `\end`, tolerating the same separators as the opener.
-    let mut search = body_start;
-    loop {
-        match find_env_tag(input, search, "\\end") {
-            Some((at, end_tag)) => {
-                if end_tag.name == tag.name {
-                    return Some(body_start..at);
-                }
-                search = end_tag.end;
-            }
-            // Unterminated: the remainder is literal, but the `\begin` survives
-            // so the environment is still reported as unclosed.
-            None => return Some(body_start..input.len()),
-        }
-    }
 }
 
 /// Check for unbalanced environments

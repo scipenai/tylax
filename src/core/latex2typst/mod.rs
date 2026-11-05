@@ -12,6 +12,10 @@ mod math;
 mod table;
 mod utils;
 
+pub(crate) mod lexical;
+mod parse;
+pub(crate) use parse::{parse_latex, SourceMap};
+
 pub use context::{
     ConversionMode, ConversionState, EnvironmentContext, L2TOptions, LatexConverter, PreambleMode,
     MERGED_SPEC,

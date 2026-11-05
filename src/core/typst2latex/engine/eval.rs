@@ -1559,6 +1559,14 @@ impl MiniEval {
                 _ => {}
             }
 
+            // Keep oversized tables unevaluated until the emitter reports them.
+            if matches!(name, "table" | "grid") && super::super::table::exceeds_column_limit(args) {
+                let source = call.to_untyped().clone().into_text();
+                return Ok(Value::Content(vec![ContentNode::RawSource(format!(
+                    "#{source}"
+                ))]));
+            }
+
             // Try built-in functions
             let (pos_args, named_args) = self.eval_args(args)?;
             match call_builtin(name, pos_args, named_args, &self.vfs) {

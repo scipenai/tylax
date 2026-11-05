@@ -6,7 +6,10 @@ use super::context::{ConvertContext, EnvironmentContext, T2LOptions, TokenType};
 use super::engine::{render_math_segments_to_typst_source, ContentNode};
 use super::math::convert_math_node;
 use super::supplement::{mark_at_reference, mark_reference};
-use super::table::{LatexCell, LatexCellAlign, LatexHLine, LatexTableGenerator};
+use super::table::{
+    infer_table_columns, is_empty_spread, is_none_value, table_rule, LatexCell, LatexCellAlign,
+    LatexHLine, LatexTableGenerator, MAX_TABLE_COLUMNS,
+};
 use super::utils::{
     count_heading_markers, escape_latex_text, extract_length_value, format_latex_color_command,
     get_raw_text_with_lang, get_simple_text, get_string_content, is_display_math,
@@ -21,7 +24,7 @@ use crate::features::refs::{
     CiteGroup, Reference,
 };
 use crate::tikz::{convert_cetz_to_tikz, is_cetz_code};
-use typst_syntax::{SyntaxKind, SyntaxNode};
+use typst_syntax::{ast, SyntaxKind, SyntaxNode};
 
 /// Languages supported by the listings package (case-insensitive check)
 /// This is a subset of commonly used languages that listings supports by default
@@ -359,11 +362,11 @@ fn has_unescaped_alignment(content: &str) -> bool {
 /// A supplement is CONTENT, not a string: `@sec-one[*Custom*]` renders bold, so
 /// it goes through the normal markup conversion rather than being flattened to
 /// its source text. See [`ref_supplement_markup`] for why `Some("")` matters.
-pub fn convert_ref_supplement(node: &SyntaxNode) -> Option<String> {
+pub fn convert_ref_supplement(node: &SyntaxNode, ctx: &mut ConvertContext) -> Option<String> {
     let markup = ref_supplement_markup(node)?;
     let mut inner = ConvertContext::new();
     convert_markup_node(&markup, &mut inner);
-    Some(inner.finalize().trim().to_string())
+    Some(inner.finish_into(ctx))
 }
 
 pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
@@ -729,7 +732,7 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
                 .unwrap_or_else(|| get_simple_text(node));
             let label = target.trim_start_matches('@').trim();
 
-            let supplement = convert_ref_supplement(node);
+            let supplement = convert_ref_supplement(node, ctx);
 
             if !label.is_empty() {
                 ctx.push(&mark_at_reference(label, supplement.as_deref()));
@@ -1412,34 +1415,33 @@ fn get_func_call_name(node: &SyntaxNode) -> String {
 /// Convert a Typst table to LaTeX using the state-aware table generator
 fn convert_table_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, ruled: bool) {
     let args = FuncArgs::from_func_call(children);
-    let mut columns: usize = 0;
+    let column_value = args.named_text("columns");
+    let inferred_columns = column_value.and_then(infer_table_columns);
+    let unresolved_columns = column_value.is_some() && inferred_columns.is_none();
+    let mut columns = inferred_columns.unwrap_or(0);
     let mut col_aligns: Vec<LatexCellAlign> = Vec::new();
     let mut cells: Vec<LatexCell> = Vec::new();
     let mut hlines: Vec<(usize, LatexHLine)> = Vec::new(); // (cell_index, hline)
     let mut in_header = false;
     let mut header_end_idx: Option<usize> = None;
+    let mut cells_complete = true;
+    // Cell warnings apply only if their table is actually rendered.
+    let warnings_before_cells = ctx.warnings.len();
 
     if let Some(args_node) = children.get(1) {
+        cells_complete = !args_node.erroneous();
         for child in args_node.children() {
+            if let Some((rule, call)) = table_rule(child) {
+                if rule == "hline" {
+                    hlines.push((cells.len(), LatexHLine::from_typst_ast(call)));
+                }
+                continue;
+            }
             match child.kind() {
                 SyntaxKind::Named => {
                     if let Some(arg) = args.arg_for_node(child) {
-                        match arg.name.as_deref() {
-                            Some("columns") => {
-                                if let Some(n) = infer_table_columns(&arg.value) {
-                                    columns = n;
-                                }
-                                if columns == 0 {
-                                    let auto_count = arg.value.matches("auto").count();
-                                    if auto_count > 0 {
-                                        columns = auto_count;
-                                    }
-                                }
-                            }
-                            Some("align") => {
-                                col_aligns = parse_typst_align(&arg.value);
-                            }
-                            _ => {}
+                        if let Some("align") = arg.name.as_deref() {
+                            col_aligns = parse_typst_align(&arg.value);
                         }
                     }
                 }
@@ -1449,7 +1451,7 @@ fn convert_table_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, ru
                     let mut cell_ctx = ConvertContext::new();
                     cell_ctx.push_env(EnvironmentContext::Table);
                     convert_markup_node(child, &mut cell_ctx);
-                    let content = cell_ctx.finalize();
+                    let content = cell_ctx.finish_into(ctx);
                     let mut cell = LatexCell::new(content);
                     cell.is_header = in_header;
                     cells.push(cell);
@@ -1463,6 +1465,9 @@ fn convert_table_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, ru
                             // Process header cells - can contain table.cell() or plain content
                             if let Some(func_args) = func_children.get(1) {
                                 for header_child in func_args.children() {
+                                    if table_rule(header_child).is_some() {
+                                        continue;
+                                    }
                                     match header_child.kind() {
                                         SyntaxKind::ContentBlock
                                         | SyntaxKind::Markup
@@ -1471,7 +1476,7 @@ fn convert_table_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, ru
                                             let mut cell_ctx = ConvertContext::new();
                                             cell_ctx.push_env(EnvironmentContext::Table);
                                             convert_markup_node(header_child, &mut cell_ctx);
-                                            let content = cell_ctx.finalize();
+                                            let content = cell_ctx.finish_into(ctx);
                                             let mut cell = LatexCell::new(content);
                                             cell.is_header = true;
                                             cells.push(cell);
@@ -1484,12 +1489,16 @@ fn convert_table_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, ru
                                                 let inner_func_name =
                                                     get_func_call_name(inner_func_children[0]);
                                                 if inner_func_name.contains("cell") {
-                                                    let mut cell = LatexCell::from_typst_cell_ast(
-                                                        header_child,
-                                                        ctx,
-                                                    );
-                                                    cell.is_header = true;
-                                                    cells.push(cell);
+                                                    let (cell, complete) =
+                                                        LatexCell::from_typst_cell_ast(
+                                                            header_child,
+                                                            ctx,
+                                                        );
+                                                    cells_complete &= complete;
+                                                    if let Some(mut cell) = cell {
+                                                        cell.is_header = true;
+                                                        cells.push(cell);
+                                                    }
                                                 } else {
                                                     // Other function call (e.g., text(...))
                                                     let mut cell_ctx = ConvertContext::new();
@@ -1498,24 +1507,46 @@ fn convert_table_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, ru
                                                         header_child,
                                                         &mut cell_ctx,
                                                     );
-                                                    let content = cell_ctx.finalize();
+                                                    let content = cell_ctx.finish_into(ctx);
                                                     if !content.is_empty() {
                                                         let mut cell = LatexCell::new(content);
                                                         cell.is_header = true;
                                                         cells.push(cell);
+                                                    } else {
+                                                        cells_complete = false;
                                                     }
                                                 }
+                                            } else {
+                                                cells_complete = false;
                                             }
+                                        }
+                                        _ if is_none_value(header_child) => {
+                                            let mut cell = LatexCell::new(String::new());
+                                            cell.is_header = true;
+                                            cells.push(cell);
+                                        }
+                                        _ if is_empty_spread(header_child) => {}
+                                        _ if matches!(
+                                            header_child.cast::<ast::Arg>(),
+                                            Some(ast::Arg::Pos(_) | ast::Arg::Spread(_))
+                                        ) =>
+                                        {
+                                            cells_complete = false;
                                         }
                                         _ => {}
                                     }
                                 }
+                            } else {
+                                cells_complete = false;
                             }
                             header_end_idx = Some(cells.len());
                             in_header = false;
                         } else if func_name.contains("cell") {
-                            let cell = LatexCell::from_typst_cell_ast(child, ctx);
-                            cells.push(cell);
+                            let (cell, complete) = LatexCell::from_typst_cell_ast(child, ctx);
+                            cells_complete &= complete;
+                            if let Some(cell) = cell {
+                                cells.push(cell);
+                            }
                         } else if func_name.contains("hline") {
                             let hline = LatexHLine::from_typst_ast(child);
                             hlines.push((cells.len(), hline));
@@ -1553,23 +1584,31 @@ fn convert_table_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, ru
                                     let mut cell_ctx = ConvertContext::new();
                                     cell_ctx.push_env(EnvironmentContext::Table);
                                     convert_markup_node(&content_arg, &mut cell_ctx);
-                                    let content = cell_ctx.finalize();
+                                    let content = cell_ctx.finish_into(ctx);
 
                                     let mut cell = LatexCell::new(content);
                                     cell.align = Some(alignment);
                                     cells.push(cell);
+                                } else {
+                                    cells_complete = false;
                                 }
+                            } else {
+                                cells_complete = false;
                             }
                         } else {
                             // Regular cell (other function call)
                             let mut cell_ctx = ConvertContext::new();
                             cell_ctx.push_env(EnvironmentContext::Table);
                             convert_markup_node(child, &mut cell_ctx);
-                            let content = cell_ctx.finalize();
+                            let content = cell_ctx.finish_into(ctx);
                             if !content.is_empty() {
                                 cells.push(LatexCell::new(content));
+                            } else {
+                                cells_complete = false;
                             }
                         }
+                    } else {
+                        cells_complete = false;
                     }
                 }
                 // Handle string arguments as table cells (from MiniEval expansion)
@@ -1577,9 +1616,7 @@ fn convert_table_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, ru
                     let text = child.text().to_string();
                     // Remove quotes from string literal
                     let content = text.trim_matches('"').to_string();
-                    if !content.is_empty() {
-                        cells.push(LatexCell::new(content));
-                    }
+                    cells.push(LatexCell::new(content));
                 }
                 // Handle other expression types as table cells
                 SyntaxKind::Int | SyntaxKind::Float | SyntaxKind::Bool => {
@@ -1588,6 +1625,11 @@ fn convert_table_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, ru
                         cells.push(LatexCell::new(content));
                     }
                 }
+                _ if is_none_value(child) => cells.push(LatexCell::new(String::new())),
+                _ if is_empty_spread(child) => {}
+                _ if child.cast::<ast::Arg>().is_some() => {
+                    cells_complete = false;
+                }
                 _ => {
                     // Ignore punctuation / structural tokens
                 }
@@ -1595,13 +1637,44 @@ fn convert_table_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, ru
         }
     }
 
-    // Infer columns if not specified
-    if columns == 0 {
+    // Reuse the existing fallback only when no positional cells were dropped.
+    if columns == 0 && cells_complete {
         columns = if cells.len() >= 4 {
             (cells.len() as f64).sqrt().ceil() as usize
         } else {
             cells.len().max(1)
         };
+    }
+
+    if columns > MAX_TABLE_COLUMNS {
+        ctx.warnings.truncate(warnings_before_cells);
+        preserve_unconverted_layout(
+            &format!("column count {columns} exceeds the supported limit of {MAX_TABLE_COLUMNS}"),
+            children,
+            ctx,
+        );
+        return;
+    }
+
+    if !cells_complete && (inferred_columns.is_none() || cells.is_empty()) {
+        ctx.warnings.truncate(warnings_before_cells);
+        preserve_unconverted_layout("could not determine all table cells", children, ctx);
+        return;
+    }
+    if !cells_complete {
+        report_layout_warning(
+            "some table cells could not be converted; output may be incomplete or misaligned",
+            children,
+            ctx,
+        );
+    } else if unresolved_columns {
+        report_layout_warning(
+            &format!(
+                "could not determine column count; using an approximate {columns}-column layout"
+            ),
+            children,
+            ctx,
+        );
     }
 
     // Pad col_aligns to match column count
@@ -1698,54 +1771,34 @@ fn parse_typst_align(value: &str) -> Vec<LatexCellAlign> {
         .collect()
 }
 
-/// Infer number of table columns from Typst `columns:` value.
-/// Supports `columns: 3` and `columns: (auto, auto, auto)`-style specs.
-fn infer_table_columns(value: &str) -> Option<usize> {
-    let v = value.trim();
-    if v.is_empty() {
-        return None;
+/// Report to structured diagnostics and plain-string callers.
+fn report_layout_warning(reason: &str, children: &[&SyntaxNode], ctx: &mut ConvertContext) {
+    let name = children
+        .first()
+        .map(|node| get_func_call_name(node))
+        .unwrap_or_default();
+    let warning = format!("{name}: {reason}");
+    ctx.add_warning(warning.clone());
+    ctx.ensure_paragraph_break();
+    ctx.push_line(&format!("% Tylax: {warning}"));
+}
+
+/// Preserve source when a table cannot be converted safely.
+fn preserve_unconverted_layout(reason: &str, children: &[&SyntaxNode], ctx: &mut ConvertContext) {
+    report_layout_warning(
+        &format!("{reason}; layout not converted, Typst retained as comments below"),
+        children,
+        ctx,
+    );
+    let source: String = children
+        .iter()
+        .map(|node| (**node).clone().into_text().to_string())
+        .collect();
+    for (i, line) in source.split(['\n', '\r']).enumerate() {
+        ctx.push_line(&format!("% {}{line}", if i == 0 { "#" } else { "" }));
     }
-
-    // Try parsing as integer first
-    if let Ok(n) = v.parse::<usize>() {
-        return Some(n.max(1));
-    }
-
-    // Common Typst form: (auto, auto, auto, ...) or (1fr, 1fr, 1fr)
-    let inner = v
-        .trim_start_matches('(')
-        .trim_end_matches(')')
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .trim();
-
-    if inner.is_empty() {
-        return None;
-    }
-
-    // Count commas to determine number of items
-    let commas = inner.matches(',').count();
-    if commas > 0 {
-        return Some(commas + 1);
-    }
-
-    // Count occurrences of "auto" or "fr" as fallback
-    let auto_count = inner.matches("auto").count();
-    if auto_count > 0 {
-        return Some(auto_count);
-    }
-
-    let fr_count = inner.matches("fr").count();
-    if fr_count > 0 {
-        return Some(fr_count);
-    }
-
-    // Single column spec without commas
-    if !inner.is_empty() {
-        return Some(1);
-    }
-
-    None
+    // Keep a nested closing brace outside the final comment.
+    ctx.push_line("\\relax{}");
 }
 
 // ============================================================================
@@ -1777,7 +1830,7 @@ fn convert_figure_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
                                 }) {
                                     let mut cap_ctx = ConvertContext::new();
                                     convert_markup_node(value_node, &mut cap_ctx);
-                                    caption = Some(cap_ctx.finalize());
+                                    caption = Some(cap_ctx.finish_into(ctx));
                                 }
                             }
                             "label" | "supplement" => {
@@ -1806,7 +1859,7 @@ fn convert_figure_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
 
                     let mut content_ctx = ConvertContext::new();
                     convert_markup_node(child, &mut content_ctx);
-                    content = content_ctx.finalize();
+                    content = content_ctx.finish_into(ctx);
                 }
                 SyntaxKind::ContentBlock => {
                     // Peek inside content block to see if it contains a table
@@ -1826,7 +1879,7 @@ fn convert_figure_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
 
                     let mut content_ctx = ConvertContext::new();
                     convert_markup_node(child, &mut content_ctx);
-                    let c = content_ctx.finalize();
+                    let c = content_ctx.finish_into(ctx);
                     if !c.is_empty() {
                         content = c;
                     }
@@ -1892,7 +1945,7 @@ fn convert_link_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
             } else if child.kind() == SyntaxKind::ContentBlock {
                 let mut text_ctx = ConvertContext::new();
                 convert_markup_node(child, &mut text_ctx);
-                text = text_ctx.finalize();
+                text = text_ctx.finish_into(ctx);
             }
         }
     }
@@ -2036,10 +2089,7 @@ fn convert_theorem_to_latex(env_name: &str, children: &[&SyntaxNode], ctx: &mut 
 
 fn convert_columns_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
     let args = FuncArgs::from_func_call(children);
-    let num_cols = args
-        .named_text("columns")
-        .and_then(|value| infer_table_columns(value).or_else(|| value.parse::<usize>().ok()))
-        .unwrap_or(2);
+    let num_cols = args.named_usize("columns").map(|n| n.max(1)).unwrap_or(2);
 
     // Calculate column width
     let col_width = if num_cols > 0 {
@@ -2152,7 +2202,7 @@ fn convert_list_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, is_
                     let mut item_ctx = ConvertContext::new();
                     item_ctx.list_depth = ctx.list_depth;
                     convert_markup_node(child, &mut item_ctx);
-                    let item_text = item_ctx.finalize();
+                    let item_text = item_ctx.finish_into(ctx);
                     ctx.push(&item_text);
                     ctx.newline();
                 }
