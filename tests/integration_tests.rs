@@ -9886,8 +9886,8 @@ mod fuzz_regressions {
         assert!(deep.len() < 2_000, "200 levels gave {} bytes", deep.len());
     }
 
-    /// Tripwire for the temporary `brace_script_wrapping_commands` workaround: once a
-    /// mitex-parser release stops panicking here, delete the workaround and this test.
+    /// Tripwire for script recovery in latex2typst/parse.rs: once mitex-parser
+    /// stops panicking here, remove that recovery and this test.
     /// <https://github.com/mitex-rs/mitex/issues/225>
     #[test]
     fn mitex_limits_panic_still_upstream() {
@@ -9896,7 +9896,7 @@ mod fuzz_regressions {
         });
         assert!(
             parsed.is_err(),
-            "mitex-parser no longer panics on `__\\limits`: remove brace_script_wrapping_commands"
+            "mitex-parser no longer panics on `__\\limits`: remove script-wrapping recovery in latex2typst/parse.rs"
         );
     }
 

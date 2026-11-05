@@ -218,7 +218,7 @@ pub fn convert_environment(conv: &mut LatexConverter, elem: SyntaxElement, outpu
         }
 
         // Code/verbatim environments
-        "verbatim" | "verbatim*" | "Verbatim" => {
+        "verbatim" | "verbatim*" | "Verbatim" | "Verbatim*" => {
             convert_verbatim(conv, &node, output);
         }
         "lstlisting" => {

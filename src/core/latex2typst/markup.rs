@@ -3077,9 +3077,9 @@ fn expand_user_macro(conv: &mut LatexConverter, cmd: &CmdItem, macro_def: &Macro
 
     // Convert the expanded macro
     let mut output = String::new();
-    let tree = super::utils::parse_latex(&result, conv.spec.clone());
-    conv.visit_node(&tree, &mut output);
-    output
+    let parsed = super::parse_latex(&result, conv.spec.clone());
+    conv.visit_node(&parsed.tree, &mut output);
+    parsed.restore_literals(output)
 }
 
 /// Convert a LaTeX dimension to Typst
