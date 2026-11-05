@@ -9849,23 +9849,21 @@ mod fuzz_regressions {
 
     /// A huge `columns:` count sized allocations directly and exhausted memory.
     #[test]
-    fn huge_table_column_count_is_capped() {
+    fn huge_table_column_count_is_rejected() {
         let output = typst_to_latex(r"#table(columns: 66666666, [a])");
-        let spec = output
-            .lines()
-            .find(|line| line.starts_with(r"\begin{tabular}"))
-            .expect("table should convert to a tabular");
-        assert_eq!(spec.matches('c').count(), 1000, "column spec: {spec:.80}");
+        assert!(output.contains("column count 66666666"));
+        assert!(output.contains("% #table(columns: 66666666, [a])"));
+        assert!(!output.contains(r"\begin{tabular}"));
+        assert!(output.len() < 1000);
     }
 
     #[test]
-    fn huge_grid_column_count_is_capped() {
+    fn huge_grid_column_count_is_rejected() {
         let output = typst_to_latex(r"#grid(columns: 66666666, [a])");
-        assert!(
-            output.len() < 100_000,
-            "grid output is {} bytes",
-            output.len()
-        );
+        assert!(output.contains("column count 66666666"));
+        assert!(output.contains("% #grid(columns: 66666666, [a])"));
+        assert!(!output.contains(r"\begin{tabular}"));
+        assert!(output.len() < 1000);
     }
 
     /// A script whose base is `MathPrimes` built its operand twice per level, so

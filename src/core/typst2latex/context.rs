@@ -289,6 +289,12 @@ impl ConvertContext {
         self.warnings.push(msg.into());
     }
 
+    /// Finish a child conversion and forward its warnings.
+    pub(crate) fn finish_into(mut self, parent: &mut ConvertContext) -> String {
+        parent.warnings.append(&mut self.warnings);
+        self.finalize()
+    }
+
     /// Get list indentation string
     pub fn list_indent(&self) -> String {
         "  ".repeat(self.list_depth)
@@ -368,8 +374,23 @@ impl ConvertContext {
         let mut result = String::with_capacity(trimmed.len());
 
         let mut prev_char = None;
+        let mut in_comment = false;
+        let mut escaped = false;
 
         for ch in trimmed.chars() {
+            if ch == '%' && !escaped {
+                in_comment = true;
+            }
+            if matches!(ch, '\n' | '\r') {
+                in_comment = false;
+            }
+            escaped = ch == '\\' && !escaped;
+            // Preserve source retained in diagnostic comments.
+            if in_comment {
+                result.push(ch);
+                prev_char = Some(ch);
+                continue;
+            }
             // Handle double spaces
             if ch == ' ' && prev_char == Some(' ') {
                 continue;
