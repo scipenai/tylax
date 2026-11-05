@@ -76,6 +76,14 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("med".to_string()),
         }));
+        m.insert("Box".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("square".to_string()),
+        }));
+        m.insert("Complex".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("CC".to_string()),
+        }));
         m.insert("Delta".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("Delta".to_string()),
@@ -116,6 +124,10 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("arrow.r.double.long".to_string()),
         }));
+        m.insert("N".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("NN".to_string()),
+        }));
         m.insert("Omega".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("Omega".to_string()),
@@ -136,9 +148,17 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("Psi".to_string()),
         }));
+        m.insert("R".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("RR".to_string()),
+        }));
         m.insert("Re".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("Re".to_string()),
+        }));
+        m.insert("Reals".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("RR".to_string()),
         }));
         m.insert("Rightarrow".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -167,6 +187,10 @@ lazy_static! {
         m.insert("Xi".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("Xi".to_string()),
+        }));
+        m.insert("Z".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("ZZ".to_string()),
         }));
         m.insert("aleph".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -300,6 +324,10 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("dot.op".to_string()),
         }));
+        m.insert("cdotp".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("dot".to_string()),
+        }));
         m.insert("cdots".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("dots.c".to_string()),
@@ -315,6 +343,10 @@ lazy_static! {
         m.insert("clubsuit".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("suit.club".to_string()),
+        }));
+        m.insert("cnums".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("CC".to_string()),
         }));
         m.insert("cong".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -490,7 +522,7 @@ lazy_static! {
         }));
         m.insert("hbar".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("planck.reduce".to_string()),
+            alias: Some("planck".to_string()),
         }));
         m.insert("heartsuit".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -527,6 +559,10 @@ lazy_static! {
         m.insert("imath".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("dotless.i".to_string()),
+        }));
+        m.insert("impliedby".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("arrow.l.double.long".to_string()),
         }));
         m.insert("in".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -708,6 +744,10 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("nabla".to_string()),
         }));
+        m.insert("natnums".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("NN".to_string()),
+        }));
         m.insert("natural".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("natural".to_string()),
@@ -732,13 +772,29 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("exists.not".to_string()),
         }));
+        m.insert("ngeq".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("gt.eq.not".to_string()),
+        }));
         m.insert("ni".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("in.rev".to_string()),
         }));
+        m.insert("nleq".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("lt.eq.not".to_string()),
+        }));
         m.insert("notin".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("in.not".to_string()),
+        }));
+        m.insert("nsubseteq".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("subset.eq.not".to_string()),
+        }));
+        m.insert("nsupseteq".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("supset.eq.not".to_string()),
         }));
         m.insert("nu".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -783,6 +839,10 @@ lazy_static! {
         m.insert("otimes".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("times.o".to_string()),
+        }));
+        m.insert("owns".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("in.rev".to_string()),
         }));
         m.insert("parallel".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -848,6 +908,14 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("ceil.r".to_string()),
         }));
+        m.insert("real".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("Re".to_string()),
+        }));
+        m.insert("reals".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("RR".to_string()),
+        }));
         m.insert("rfloor".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("floor.r".to_string()),
@@ -912,6 +980,10 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("sinh".to_string()),
         }));
+        m.insert("smallint".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("integral".to_string()),
+        }));
         m.insert("smile".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("smile".to_string()),
@@ -922,7 +994,7 @@ lazy_static! {
         }));
         m.insert("sqcap".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("sect.sq".to_string()),
+            alias: Some("inter.sq".to_string()),
         }));
         m.insert("sqcup".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -960,6 +1032,14 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("subset.eq".to_string()),
         }));
+        m.insert("subsetneq".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("subset.neq".to_string()),
+        }));
+        m.insert("subsetneqq".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("⫋".to_string()),
+        }));
         m.insert("succ".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("succ".to_string()),
@@ -983,6 +1063,14 @@ lazy_static! {
         m.insert("supseteq".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("supset.eq".to_string()),
+        }));
+        m.insert("supsetneq".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("supset.neq".to_string()),
+        }));
+        m.insert("supsetneqq".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("⫌".to_string()),
         }));
         m.insert("surd".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -1038,11 +1126,11 @@ lazy_static! {
         }));
         m.insert("unlhd".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("triangle.l.eq".to_string()),
+            alias: Some("lt.tri.eq".to_string()),
         }));
         m.insert("unrhd".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("triangle.r.eq".to_string()),
+            alias: Some("gt.tri.eq".to_string()),
         }));
         m.insert("uparrow".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -1051,6 +1139,10 @@ lazy_static! {
         m.insert("updownarrow".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("arrow.t.b".to_string()),
+        }));
+        m.insert("uplus".to_string(), CommandSpecItem::Cmd(CmdShape {
+            args: ArgShape::Right { pattern: ArgPattern::None },
+            alias: Some("union.plus".to_string()),
         }));
         m.insert("upsilon".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -1146,7 +1238,7 @@ lazy_static! {
         }));
         m.insert("wp".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("weierstrass".to_string()),
+            alias: Some("℘".to_string()),
         }));
         m.insert("wr".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
@@ -1715,7 +1807,7 @@ pub static TYPST_TO_TEX: phf::Map<&'static str, &'static str> = phf_map! {
     ">=" => "geq",
     ">>" => "gg",
     ">>>" => "ggg",
-    "AA" => "forall",
+    "AA" => "\\mathbb{A}",
     "Alpha" => "A",
     "BB" => "\\mathbb{B}",
     "Beta" => "B",
@@ -1724,7 +1816,7 @@ pub static TYPST_TO_TEX: phf::Map<&'static str, &'static str> = phf_map! {
     "DD" => "\\mathbb{D}",
     "Delta" => "Delta",
     "Digamma" => "\\Digamma",
-    "EE" => "exists",
+    "EE" => "\\mathbb{E}",
     "Epsilon" => "E",
     "Eta" => "H",
     "FF" => "\\mathbb{F}",
@@ -1840,12 +1932,13 @@ pub static TYPST_TO_TEX: phf::Map<&'static str, &'static str> = phf_map! {
     "ast" => "ast",
     "ast.op" => "\\ast",
     "asymp" => "asymp",
-    "ballot" => "times",
-    "bar.v" => "|",
+    "ballot" => "square",
+    "bar.v" => "vert",
     "bar.v.double" => "\\|",
     "because" => "because",
     "beta" => "beta",
     "beth" => "beth",
+    "bot" => "bot",
     "bowtie" => "bowtie",
     "brace.l" => "\\{",
     "brace.r" => "\\}",
@@ -1868,7 +1961,7 @@ pub static TYPST_TO_TEX: phf::Map<&'static str, &'static str> = phf_map! {
     "circle.small" => "circ",
     "circle.stroked" => "\\circ",
     "circle.stroked.small" => "\\circ",
-    "circle.stroked.tiny" => "mathring",
+    "circle.stroked.tiny" => "circ",
     "circle.times" => "otimes",
     "colon" => "colon",
     "coloneq" => "coloneqq",
@@ -2026,7 +2119,7 @@ pub static TYPST_TO_TEX: phf::Map<&'static str, &'static str> = phf_map! {
     "macron" => "bar",
     "maltese" => "\\maltese",
     "max" => "max",
-    "med" => ":",
+    "med" => "\\:",
     "min" => "min",
     "minus" => "-",
     "minus.circle" => "\\ominus",
@@ -2044,7 +2137,7 @@ pub static TYPST_TO_TEX: phf::Map<&'static str, &'static str> = phf_map! {
     "oo" => "infty",
     "or" => "vee",
     "or.big" => "bigvee",
-    "paragraph" => "P",
+    "paragraph" => "\\P",
     "parallel" => "parallel",
     "parallel.not" => "nparallel",
     "paren.l" => "(",
@@ -2089,7 +2182,7 @@ pub static TYPST_TO_TEX: phf::Map<&'static str, &'static str> = phf_map! {
     "sect.big" => "bigcap",
     "sect.sq" => "sqcap",
     "sect.sq.big" => "bigsqcap",
-    "section" => "S",
+    "section" => "\\S",
     "sharp" => "sharp",
     "shell.l" => "\\lgroup",
     "shell.r" => "\\rgroup",
@@ -2097,6 +2190,7 @@ pub static TYPST_TO_TEX: phf::Map<&'static str, &'static str> = phf_map! {
     "sigma.alt" => "varsigma",
     "sin" => "sin",
     "sinh" => "sinh",
+    "slash" => "/",
     "slash.o" => "\\oslash",
     "smile" => "smile",
     "space" => "\\ ",
@@ -2117,7 +2211,7 @@ pub static TYPST_TO_TEX: phf::Map<&'static str, &'static str> = phf_map! {
     "square.times" => "boxtimes",
     "star" => "star",
     "star.filled" => "bigstar",
-    "star.op" => "*",
+    "star.op" => "star",
     "subset" => "subset",
     "subset.double" => "\\Subset",
     "subset.eq" => "subseteq",
@@ -2151,23 +2245,23 @@ pub static TYPST_TO_TEX: phf::Map<&'static str, &'static str> = phf_map! {
     "supset.neq" => "\\supsetneq",
     "supset.not" => "nsupset",
     "supset.sq" => "sqsupset",
-    "tack.b" => "bot",
+    "tack.b" => "top",
     "tack.l" => "dashv",
     "tack.l.double" => "Dashv",
     "tack.r" => "vdash",
     "tack.r.double" => "vDash",
     "tack.r.double.not" => "nvDash",
     "tack.r.not" => "nvdash",
-    "tack.t" => "top",
+    "tack.t" => "bot",
     "tan" => "tan",
     "tanh" => "tanh",
     "tau" => "tau",
     "therefore" => "therefore",
     "theta" => "theta",
     "theta.alt" => "vartheta",
-    "thick" => ";",
-    "thin" => ",",
-    "tilde" => "tilde",
+    "thick" => "\\;",
+    "thin" => "\\,",
+    "tilde" => "sim",
     "tilde.eq" => "simeq",
     "tilde.eq.not" => "nsimeq",
     "tilde.equiv" => "cong",
@@ -2182,6 +2276,7 @@ pub static TYPST_TO_TEX: phf::Map<&'static str, &'static str> = phf_map! {
     "times.o" => "\\otimes",
     "times.o.big" => "\\bigotimes",
     "times.square" => "\\boxtimes",
+    "top" => "top",
     "trademark" => "texttrademark",
     "triangle.b" => "bigtriangledown",
     "triangle.filled.b" => "\\blacktriangledown",
@@ -2190,9 +2285,10 @@ pub static TYPST_TO_TEX: phf::Map<&'static str, &'static str> = phf_map! {
     "triangle.filled.t" => "\\blacktriangle",
     "triangle.l" => "triangleleft",
     "triangle.r" => "triangleright",
-    "triangle.stroked.b" => "\\triangledown",
+    "triangle.stroked.b" => "bigtriangledown",
     "triangle.stroked.l" => "\\triangleleft",
     "triangle.stroked.r" => "\\triangleright",
+    "triangle.stroked.small.b" => "triangledown",
     "triangle.stroked.small.t" => "\\vartriangle",
     "triangle.stroked.t" => "\\triangle",
     "triangle.t" => "bigtriangleup",
@@ -2217,7 +2313,7 @@ pub static TYPST_TO_TEX: phf::Map<&'static str, &'static str> = phf_map! {
     "zeta" => "zeta",
     "|->" => "mapsto",
     "|=>" => "Mapsto",
-    "||" => "|",
+    "||" => "\\|",
     "~>" => "rightsquigarrow",
     "~~>" => "leadsto",
 };
