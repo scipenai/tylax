@@ -1,0 +1,24 @@
+\documentclass{article}
+\usepackage{amsmath}
+\newcommand{\R}{\mathbb{R}}
+\begin{document}
+\section{Intro}\label{sec:intro}
+Let $f\colon \R \to \R$ be given by
+\begin{equation}
+  f(x) = \frac{1}{1 + e^{-x}}. \label{eq:f}
+\end{equation}
+See \eqref{eq:f} and Section~\ref{sec:intro} \cite{knuth}.
+\begin{itemize}
+  \item First \textbf{bold} and \emph{emph}.
+  \item Second with \verb|\raw| text % a comment
+\end{itemize}
+\begin{table}[h]
+  \centering
+  \begin{tabular}{|l|c|}
+    \hline
+    a & b \\ \hline
+    $x^2$ & 1 \\
+  \end{tabular}
+  \caption{A table}
+\end{table}
+\end{document}

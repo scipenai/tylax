@@ -1,0 +1,7 @@
+\section{A}
+Text with $a_i$ and
+\begin{align*}
+  x &= 1 \\
+  y &= 2
+\end{align*}
+\begin{figure}\includegraphics[width=0.5\textwidth]{img.png}\caption{C}\end{figure}
