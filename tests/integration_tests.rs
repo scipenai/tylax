@@ -974,6 +974,66 @@ mod l2t_math {
     use super::*;
 
     #[test]
+    fn test_symbol_aliases_use_current_typst_names() {
+        for (input, expected) in [
+            (r"\Box", "square"),
+            (r"\Complex", "CC"),
+            (r"\N", "NN"),
+            (r"\R", "RR"),
+            (r"\Reals", "RR"),
+            (r"\Z", "ZZ"),
+            (r"\cdotp", "dot"),
+            (r"\cnums", "CC"),
+            (r"\hbar", "planck"),
+            (r"\impliedby", "arrow.l.double.long"),
+            (r"\natnums", "NN"),
+            (r"\ngeq", "gt.eq.not"),
+            (r"\nleq", "lt.eq.not"),
+            (r"\nsubseteq", "subset.eq.not"),
+            (r"\nsupseteq", "supset.eq.not"),
+            (r"\owns", "in.rev"),
+            (r"\real", "Re"),
+            (r"\reals", "RR"),
+            (r"\smallint", "integral"),
+            (r"\sqcap", "inter.sq"),
+            (r"\subsetneq", "subset.neq"),
+            (r"\subsetneqq", "⫋"),
+            (r"\supsetneq", "supset.neq"),
+            (r"\supsetneqq", "⫌"),
+            (r"\unlhd", "lt.tri.eq"),
+            (r"\unrhd", "gt.tri.eq"),
+            (r"\uplus", "union.plus"),
+            (r"\wp", "℘"),
+        ] {
+            for output in [
+                latex_to_typst(input),
+                latex_math_to_typst_with_diagnostics(input).output,
+            ] {
+                assert_eq!(output.trim(), expected, "{input}");
+            }
+        }
+
+        // Removed document special cases must use the table; user definitions still win.
+        let options = L2TOptions {
+            preamble: PreambleMode::None,
+            ..Default::default()
+        };
+        for (input, expected) in [
+            (r"\hbar", "planck"),
+            (r"\wp", "℘"),
+            (r"\newcommand{\R}{x} $\R$", "$x$"),
+            (r"\def\R{x} $\R$", "$x$"),
+        ] {
+            for output in [
+                latex_document_to_typst_with_options(input, &options),
+                tylax::latex_to_typst_with_diagnostics_options(input, options.clone()).output,
+            ] {
+                assert_eq!(output.trim(), expected, "{input}");
+            }
+        }
+    }
+
+    #[test]
     fn test_greek_letters() {
         // AST converter may output Unicode Greek letters (α, β, etc.) or text names
         let letters = [
@@ -9044,6 +9104,33 @@ Commutator: $\comm{x}{p} = i\hbar$
 mod t2l_symbol_mappings {
     use super::*;
 
+    #[test]
+    fn test_symbol_meanings_survive_conversion() {
+        // Generator agreement alone cannot catch a consistently wrong symbol.
+        for (input, expected) in [
+            ("AA", r"\mathbb{A}"),
+            ("EE", r"\mathbb{E}"),
+            ("ballot", r"\square"),
+            ("bar.v", r"\vert"),
+            ("bot", r"\bot"),
+            ("circle.stroked.tiny", r"\circ"),
+            ("slash", "/"),
+            ("star.op", r"\star"),
+            ("tack.t", r"\bot"),
+            ("tack.b", r"\top"),
+            ("tilde", r"\sim"),
+            ("top", r"\top"),
+            ("triangle.stroked.b", r"\bigtriangledown"),
+            ("triangle.stroked.small.b", r"\triangledown"),
+            ("||", r"\|"),
+            ("⫋", r"\subsetneqq"),
+            ("⫌", r"\supsetneqq"),
+        ] {
+            let output = assert_t2l_paths_match(&format!("${input}$"));
+            assert_eq!(output.trim(), format!("${expected}$"), "{input}");
+        }
+    }
+
     // --- Direct map lookup tests (verify data is present) ---
 
     #[test]
@@ -9187,15 +9274,20 @@ mod t2l_symbol_mappings {
     }
 
     #[test]
-    fn test_greek_uppercase_pipeline() {
-        // Single uppercase Greek letters - these are also valid identifiers
-        let result = typst_to_latex("$Alpha$");
-        // May produce "A" or "Alpha" depending on parser
-        assert!(
-            !result.is_empty(),
-            "Alpha should produce output, got: {}",
-            result
-        );
+    fn test_literal_symbols_keep_command_boundaries() {
+        // Literal characters lose the backslash; commands and their boundaries keep it.
+        for (input, expected) in [
+            ("Alpha", "A"),
+            ("alpha Alpha", r"\alpha A"),
+            ("paren.l a paren.r", "( a )"),
+            ("plus(a)", "+(a)"),
+            ("section", r"\S"),
+            ("paragraph", r"\P"),
+            ("thin med thick", r"\, \: \;"),
+        ] {
+            let output = assert_t2l_paths_match(&format!("${input}$"));
+            assert_eq!(output.trim(), format!("${expected}$"), "{input}");
+        }
     }
 
     // --- Overall coverage test ---
@@ -9835,23 +9927,21 @@ mod fuzz_regressions {
 
     /// A huge `columns:` count sized allocations directly and exhausted memory.
     #[test]
-    fn huge_table_column_count_is_capped() {
+    fn huge_table_column_count_is_rejected() {
         let output = typst_to_latex(r"#table(columns: 66666666, [a])");
-        let spec = output
-            .lines()
-            .find(|line| line.starts_with(r"\begin{tabular}"))
-            .expect("table should convert to a tabular");
-        assert_eq!(spec.matches('c').count(), 1000, "column spec: {spec:.80}");
+        assert!(output.contains("column count 66666666"));
+        assert!(output.contains("% #table(columns: 66666666, [a])"));
+        assert!(!output.contains(r"\begin{tabular}"));
+        assert!(output.len() < 1000);
     }
 
     #[test]
-    fn huge_grid_column_count_is_capped() {
+    fn huge_grid_column_count_is_rejected() {
         let output = typst_to_latex(r"#grid(columns: 66666666, [a])");
-        assert!(
-            output.len() < 100_000,
-            "grid output is {} bytes",
-            output.len()
-        );
+        assert!(output.contains("column count 66666666"));
+        assert!(output.contains("% #grid(columns: 66666666, [a])"));
+        assert!(!output.contains(r"\begin{tabular}"));
+        assert!(output.len() < 1000);
     }
 
     /// A script whose base is `MathPrimes` built its operand twice per level, so
@@ -9872,8 +9962,8 @@ mod fuzz_regressions {
         assert!(deep.len() < 2_000, "200 levels gave {} bytes", deep.len());
     }
 
-    /// Tripwire for the temporary `brace_script_wrapping_commands` workaround: once a
-    /// mitex-parser release stops panicking here, delete the workaround and this test.
+    /// Tripwire for script recovery in latex2typst/parse.rs: once mitex-parser
+    /// stops panicking here, remove that recovery and this test.
     /// <https://github.com/mitex-rs/mitex/issues/225>
     #[test]
     fn mitex_limits_panic_still_upstream() {
@@ -9882,7 +9972,7 @@ mod fuzz_regressions {
         });
         assert!(
             parsed.is_err(),
-            "mitex-parser no longer panics on `__\\limits`: remove brace_script_wrapping_commands"
+            "mitex-parser no longer panics on `__\\limits`: remove script-wrapping recovery in latex2typst/parse.rs"
         );
     }
 

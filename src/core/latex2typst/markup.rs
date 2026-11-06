@@ -2585,10 +2585,8 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "degree" => output.push_str("degree "),
         "angle" => output.push_str("angle "),
         "ell" => output.push_str("ell "),
-        "hbar" => output.push_str("planck.reduce "),
         "Re" => output.push_str("Re "),
         "Im" => output.push_str("Im "),
-        "wp" => output.push_str("wp "),
         "aleph" => output.push_str("aleph "),
         "beth" => output.push_str("beth "),
         "gimel" => output.push_str("gimel "),
@@ -3077,9 +3075,9 @@ fn expand_user_macro(conv: &mut LatexConverter, cmd: &CmdItem, macro_def: &Macro
 
     // Convert the expanded macro
     let mut output = String::new();
-    let tree = super::utils::parse_latex(&result, conv.spec.clone());
-    conv.visit_node(&tree, &mut output);
-    output
+    let parsed = super::parse_latex(&result, conv.spec.clone());
+    conv.visit_node(&parsed.tree, &mut output);
+    parsed.restore_literals(output)
 }
 
 /// Convert a LaTeX dimension to Typst

@@ -369,10 +369,6 @@ fn build_field_access(node: &SyntaxNode) -> MathIr {
         return MathIr::Symbol("\\|".to_string());
     }
 
-    if full_text_str == "bar.v" {
-        return MathIr::RawLiteral("|".to_string());
-    }
-
     MathIr::Ident(full_text)
 }
 
@@ -1518,8 +1514,11 @@ fn seq_or_single(items: Vec<MathIr>) -> MathIr {
     }
 }
 
+/// `TYPST_TO_TEX` values are a command name without its backslash (`alpha`), full
+/// LaTeX (`\mathbb{E}`), or one literal character (`|`, `~`, `A` for `Alpha`). A
+/// literal character must not gain a backslash: `\|` is a double bar and `\~` an accent.
 fn with_leading_backslash(tex: &str) -> String {
-    if tex.starts_with('\\') {
+    if tex.starts_with('\\') || tex.chars().count() == 1 {
         tex.to_string()
     } else {
         format!("\\{}", tex)

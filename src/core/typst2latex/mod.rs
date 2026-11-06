@@ -401,8 +401,8 @@ fn typst_to_latex_with_diagnostics_and_bibliography_keys(
     }
 
     warnings.extend(
-        ctx.warnings
-            .drain(..)
+        std::mem::take(&mut ctx.warnings)
+            .into_iter()
             .map(|message| ConversionWarning::new(WarningKind::Other, message)),
     );
     let mut output = ctx.finalize();

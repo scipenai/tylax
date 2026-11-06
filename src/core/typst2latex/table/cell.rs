@@ -1,7 +1,8 @@
 //! Cell types and alignment for LaTeX table generation
 
-use typst_syntax::SyntaxNode;
+use typst_syntax::{ast, SyntaxNode};
 
+use super::{is_empty_spread, is_none_value};
 use crate::core::typst2latex::context::{ConvertContext, EnvironmentContext};
 use crate::core::typst2latex::markup::convert_markup_node;
 use crate::core::typst2latex::utils::{
@@ -103,10 +104,15 @@ impl LatexCell {
     }
 
     /// Parse a table.cell(...) FuncCall node from Typst AST
-    pub fn from_typst_cell_ast(node: &SyntaxNode, ctx: &mut ConvertContext) -> Self {
+    /// Return any recovered cell and whether all body arguments were handled.
+    pub fn from_typst_cell_ast(
+        node: &SyntaxNode,
+        ctx: &mut ConvertContext,
+    ) -> (Option<Self>, bool) {
         use typst_syntax::SyntaxKind;
 
-        let mut content = String::new();
+        let mut content = None;
+        let mut complete = true;
         let mut colspan = 1usize;
         let mut rowspan = 1usize;
         let mut align = None;
@@ -116,11 +122,15 @@ impl LatexCell {
 
         for child in node.children() {
             if child.kind() == SyntaxKind::Args {
+                if child.erroneous() {
+                    complete = false;
+                }
                 for arg in child.children() {
                     match arg.kind() {
                         SyntaxKind::Named => {
                             if let Some(parsed) = args.arg_for_node(arg) {
                                 match parsed.name.as_deref() {
+                                    Some("body") => complete = false,
                                     Some("colspan") => {
                                         if let Some(n) = args.named_usize("colspan") {
                                             colspan = n;
@@ -146,18 +156,23 @@ impl LatexCell {
                             let mut cell_ctx = ConvertContext::new();
                             cell_ctx.push_env(EnvironmentContext::Table);
                             convert_markup_node(arg, &mut cell_ctx);
-                            content = cell_ctx.finalize();
+                            content = Some(cell_ctx.finish_into(ctx));
                         }
                         SyntaxKind::FuncCall => {
                             // Cell content can be a function call like text(...)[...]
                             let mut cell_ctx = ConvertContext::new();
                             cell_ctx.push_env(EnvironmentContext::Table);
                             convert_markup_node(arg, &mut cell_ctx);
-                            let func_content = cell_ctx.finalize();
+                            let func_content = cell_ctx.finish_into(ctx);
                             if !func_content.is_empty() {
-                                content = func_content;
+                                content = Some(func_content);
+                            } else {
+                                complete = false;
                             }
                         }
+                        _ if is_none_value(arg) => content = Some(String::new()),
+                        _ if is_empty_spread(arg) => {}
+                        _ if arg.cast::<ast::Arg>().is_some() => complete = false,
                         _ => {}
                     }
                 }
@@ -165,29 +180,32 @@ impl LatexCell {
         }
 
         // If no ContentBlock was found, try to get content from trailing content
-        if content.is_empty() {
+        if content.is_none() {
             let mut cell_ctx = ConvertContext::new();
             cell_ctx.push_env(EnvironmentContext::Table);
+            let mut found = false;
             for child in node.children() {
                 if child.kind() == SyntaxKind::ContentBlock {
+                    found = true;
                     convert_markup_node(child, &mut cell_ctx);
                 }
             }
-            content = cell_ctx.finalize();
+            let trailing = cell_ctx.finish_into(ctx);
+            if found {
+                content = Some(trailing);
+            }
         }
 
-        // Use the passed context for any additional processing
-        let _ = ctx;
-
-        LatexCell {
-            content,
+        let cell = (complete || content.is_some()).then(|| LatexCell {
+            content: content.unwrap_or_default(),
             rowspan,
             colspan,
             align,
             fill,
             is_header: false,
             is_placeholder: false,
-        }
+        });
+        (cell, complete)
     }
 
     /// Generate LaTeX code for this cell

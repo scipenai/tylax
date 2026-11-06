@@ -180,6 +180,8 @@ lazy_static! {
         m.insert('ℓ', "\\ell");
         m.insert('ℏ', "\\hbar");
         m.insert('℘', "\\wp");
+        m.insert('⫋', "\\subsetneqq");
+        m.insert('⫌', "\\supsetneqq");
         m.insert('ℑ', "\\Im");
         m.insert('ℜ', "\\Re");
         m.insert('ℵ', "\\aleph");
