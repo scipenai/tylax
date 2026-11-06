@@ -79,6 +79,7 @@ data-loading = ["dep:serde", "dep:serde_json", "dep:serde_yaml", "dep:csv", "dep
 
 [dev-dependencies]
 pretty_assertions = "1.4"
+serde_json = "1.0"
 
 [profile.release]
 opt-level = "s"
