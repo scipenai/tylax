@@ -671,6 +671,12 @@ fn split_top_level(s: &str, sep: char) -> Vec<String> {
     parts
 }
 
+/// Write a plain text-mode word. LaTeX's opening quote ligatures become quote
+/// characters, since a backtick opens raw text in Typst.
+fn push_text_word(text: &str, output: &mut String) {
+    output.push_str(&text.replace("``", "\u{201C}").replace('`', "\u{2018}"));
+}
+
 /// Escape commas at the top level of a `cases` row. Inside a row that already
 /// has explicit `&` columns, a comma is literal content, not another column or
 /// row separator. Nested function/group commas remain untouched.
@@ -2042,7 +2048,7 @@ impl LatexConverter {
                     if matches!(self.state.mode, ConversionMode::Math) {
                         push_math_atoms(text, output);
                     } else {
-                        output.push_str(text);
+                        push_text_word(text, output);
                     }
                 }
             }
@@ -2115,7 +2121,15 @@ impl LatexConverter {
                     output.push_str("\\^");
                 }
             }
-            TokenApostrophe => output.push('\''),
+            TokenApostrophe => {
+                // LaTeX's closing double quote is two apostrophes
+                if !matches!(self.state.mode, ConversionMode::Math) && output.ends_with('\'') {
+                    output.pop();
+                    output.push('\u{201D}');
+                } else {
+                    output.push('\'');
+                }
+            }
             TokenComma => {
                 if matches!(self.state.current_env(), EnvironmentContext::Cases) {
                     while output.ends_with(char::is_whitespace) {
@@ -2148,7 +2162,14 @@ impl LatexConverter {
                     output.push_str("\\*");
                 }
             }
-            TokenAtSign => output.push('@'),
+            TokenAtSign => {
+                // `@` starts a reference in Typst markup, as in jane@example.com
+                if matches!(self.state.mode, ConversionMode::Math) {
+                    output.push('@');
+                } else {
+                    output.push_str("\\@");
+                }
+            }
             TokenSemicolon => output.push(';'),
             TokenDitto => output.push('"'),
             TokenLParen => output.push('('),
