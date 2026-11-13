@@ -780,6 +780,12 @@ fn split_first_top_level_comma(s: &str) -> Option<(&str, &str)> {
     split_at.map(|idx| (s[..idx].trim(), s[idx + 1..].trim_start()))
 }
 
+/// Write a plain text-mode word. LaTeX's opening quote ligatures become quote
+/// characters, since a backtick opens raw text in Typst.
+fn push_text_word(text: &str, output: &mut String) {
+    output.push_str(&text.replace("``", "\u{201C}").replace('`', "\u{2018}"));
+}
+
 /// Escape commas at the top level of a `cases` row. Inside a row that already
 /// has explicit `&` columns, a comma is literal content, not another column or
 /// row separator. Nested function/group/string commas remain untouched.
@@ -2318,7 +2324,7 @@ impl LatexConverter {
                     } else if self.in_math_text_block {
                         push_escaped_typst_text(text, output);
                     } else {
-                        output.push_str(text);
+                        push_text_word(text, output);
                     }
                 }
             }
@@ -2410,9 +2416,17 @@ impl LatexConverter {
                             }
                         }
                     }
+                    self.trailing_script = None;
+                    output.push('\'');
+                } else if output.ends_with('\'') {
+                    // LaTeX's closing double quote is two apostrophes
+                    self.trailing_script = None;
+                    output.pop();
+                    output.push('\u{201D}');
+                } else {
+                    self.trailing_script = None;
+                    output.push('\'');
                 }
-                self.trailing_script = None;
-                output.push('\'');
             }
             // A comma in a `cases` row or a matrix cell would separate cells, and
             // a semicolon would end the row.
@@ -2460,10 +2474,11 @@ impl LatexConverter {
                 }
             }
             TokenAtSign => {
-                if self.in_math_text_block && matches!(self.state.mode, ConversionMode::Text) {
-                    output.push_str("\\@");
-                } else {
+                // `@` starts a reference in Typst markup, as in jane@example.com
+                if matches!(self.state.mode, ConversionMode::Math) {
                     output.push('@');
+                } else {
+                    output.push_str("\\@");
                 }
             }
             // A bare `"` would open a Typst string in math.

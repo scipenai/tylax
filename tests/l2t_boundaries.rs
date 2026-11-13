@@ -196,3 +196,16 @@ fn inline_literal_content_and_diagnostic_bounds_agree() {
         }
     }
 }
+
+#[test]
+fn text_quotes_and_at_signs_stay_text() {
+    let out = latex_document_to_typst(
+        "\\begin{document}He said ``hello'' to me. The `best' option. Contact jane@example.com.\\end{document}",
+    );
+    assert!(
+        out.contains("He said \u{201C}hello\u{201D} to me."),
+        "{out}"
+    );
+    assert!(out.contains("The \u{2018}best' option."), "{out}");
+    assert!(out.contains("jane\\@example.com"), "{out}");
+}
