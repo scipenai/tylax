@@ -363,6 +363,11 @@ impl MiniEval {
                     content: processed,
                 })
             }
+            ContentNode::TermItem { term, description } => {
+                let term = self.apply_show_rules(term)?;
+                let description = self.apply_show_rules(description)?;
+                Ok(ContentNode::TermItem { term, description })
+            }
             // Other nodes don't have children to process
             other => Ok(other),
         }
@@ -459,6 +464,7 @@ impl MiniEval {
             | ast::Expr::Heading(_)
             | ast::Expr::ListItem(_)
             | ast::Expr::EnumItem(_)
+            | ast::Expr::TermItem(_)
             | ast::Expr::Raw(_)
             | ast::Expr::Equation(_)
             | ast::Expr::Math(_)
@@ -567,6 +573,14 @@ impl MiniEval {
                 Ok(Value::Content(vec![ContentNode::EnumItem {
                     number: number.map(|n| n as i64),
                     content: body.into_content(),
+                }]))
+            }
+            ast::Expr::TermItem(item) => {
+                let term = self.eval_markup(item.term())?;
+                let description = self.eval_markup(item.description())?;
+                Ok(Value::Content(vec![ContentNode::TermItem {
+                    term: term.into_content(),
+                    description: description.into_content(),
                 }]))
             }
             ast::Expr::Raw(raw) => {
@@ -2316,7 +2330,7 @@ pub fn expand_macros(source: &str) -> EvalResult<String> {
 ///
 /// This function:
 /// 1. Removes consecutive Space nodes (keeps only one)
-/// 2. Removes Space nodes before ListItem/EnumItem (they should start at column 0)
+/// 2. Removes Space nodes before ListItem/EnumItem/TermItem (they should start at column 0)
 ///
 /// This prevents indentation accumulation in loops like `#for x in arr [- #x]`
 fn normalize_content_whitespace(nodes: Vec<ContentNode>) -> Vec<ContentNode> {
@@ -2332,7 +2346,9 @@ fn normalize_content_whitespace(nodes: Vec<ContentNode>) -> Vec<ContentNode> {
                     prev_was_space = true;
                 }
             }
-            ContentNode::ListItem(_) | ContentNode::EnumItem { .. } => {
+            ContentNode::ListItem(_)
+            | ContentNode::EnumItem { .. }
+            | ContentNode::TermItem { .. } => {
                 // Remove space before list items to ensure proper indentation
                 if prev_was_space && !result.is_empty() {
                     // Check if last element is Space and remove it
