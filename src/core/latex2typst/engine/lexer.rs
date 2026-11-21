@@ -7,6 +7,7 @@
 //! - Space normalization after control sequences
 //! - Parameter token parsing
 
+use super::input::BOUNDARY;
 use super::token::{TexToken, TokenList};
 
 /// The TeX Lexer that converts source text to tokens
@@ -14,6 +15,9 @@ pub struct Lexer<'a> {
     chars: std::iter::Peekable<std::str::CharIndices<'a>>,
     /// Track if we just emitted a control sequence (for space swallowing)
     after_cs: bool,
+    /// Mark where swallowed spaces separated a control word from an `@`
+    /// (see [`tokenize_marked`]).
+    mark_boundaries: bool,
     /// Phantom data to hold lifetime
     _marker: std::marker::PhantomData<&'a str>,
 }
@@ -24,6 +28,7 @@ impl<'a> Lexer<'a> {
         Lexer {
             chars: input.char_indices().peekable(),
             after_cs: false,
+            mark_boundaries: false,
             _marker: std::marker::PhantomData,
         }
     }
@@ -109,8 +114,11 @@ impl<'a> Lexer<'a> {
     fn next_token(&mut self) -> Option<TexToken> {
         // Handle space swallowing after control sequences
         if self.after_cs {
-            self.skip_whitespace();
+            let skipped = self.skip_whitespace();
             self.after_cs = false;
+            if skipped && self.mark_boundaries && self.peek_char() == Some('@') {
+                return Some(BOUNDARY);
+            }
         }
 
         let c = self.next_char()?;
@@ -243,6 +251,16 @@ impl<'a> Iterator for Lexer<'a> {
 /// Convenience function to tokenize a string
 pub fn tokenize(input: &str) -> TokenList {
     Lexer::new(input).tokenize()
+}
+
+/// Tokenize text for the expansion engine: as [`tokenize`], with a
+/// [`BOUNDARY`] wherever spaces after a control word come before an `@`, so
+/// that `\foo @bar` is never read as `\foo@bar` under `\makeatletter`. The
+/// engine drops the marks.
+pub(crate) fn tokenize_marked(input: &str) -> TokenList {
+    let mut lexer = Lexer::new(input);
+    lexer.mark_boundaries = true;
+    lexer.tokenize()
 }
 
 /// Convert a token list back to a string (detokenize)
