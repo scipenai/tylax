@@ -291,6 +291,8 @@ pub struct ConversionState {
     pub pending_reference: Option<PendingReference>,
     /// Suppress the next raw whitespace token after emitting a spacing-aware token.
     pub suppress_next_space: bool,
+    /// Escape literal `[` / `]` emitted inside `#text[...]` / `#strong[...]` blocks.
+    pub escape_text_brackets: bool,
     /// User-defined macros
     pub macros: HashMap<String, MacroDef>,
     /// Whether we're in preamble
@@ -575,6 +577,88 @@ fn strip_trailing_line_breaks(math: &str) -> &str {
     math
 }
 
+/// If `s` ends with `)`, return the byte index of its matching `(`.
+fn matching_open_paren(s: &str) -> Option<usize> {
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut matched = None;
+    for (index, c) in s.char_indices() {
+        if std::mem::take(&mut escaped) {
+            continue;
+        }
+        if in_string {
+            match c {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '"' => in_string = true,
+            '(' | '[' | '{' => stack.push((index, c)),
+            ')' | ']' | '}' => {
+                let popped = stack.pop();
+                if index + 1 == s.len() {
+                    matched = popped.filter(|&(_, open)| open == '(').map(|(pos, _)| pos);
+                }
+            }
+            _ => {}
+        }
+    }
+    matched
+}
+
+/// Whether a prime can attach directly to `base` in Typst math rather than to
+/// a binary operator, delimiter, or unescaped line-break backslash.
+fn can_attach_prime(base: &str) -> bool {
+    if base.is_empty() || ends_with_unescaped_backslash(base) {
+        return false;
+    }
+    let last = base.chars().next_back().unwrap();
+    let prefix = &base[..base.len() - last.len_utf8()];
+    if ends_with_unescaped_backslash(prefix) {
+        return true;
+    }
+    !matches!(
+        last,
+        '+' | '-'
+            | '='
+            | '<'
+            | '>'
+            | ','
+            | ';'
+            | '&'
+            | ':'
+            | '('
+            | '['
+            | '{'
+            | '^'
+            | '_'
+            | '/'
+            | '*'
+    )
+}
+
+/// Whether `prefix` ends inside an open Typst `"..."` string literal.
+fn is_inside_string(prefix: &str) -> bool {
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in prefix.chars() {
+        if std::mem::take(&mut escaped) {
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '"' => in_string = !in_string,
+            _ => {}
+        }
+    }
+    in_string
+}
+
 /// Where the parenthesised scripts at the end of `output` begin, if any.
 ///
 /// For `j_(1)` this is the index of `_`, and for `x_(a)^(b)` the index of the
@@ -583,24 +667,11 @@ fn trailing_scripts_start(output: &str) -> Option<usize> {
     let mut end = output.len();
     let mut start = None;
     while output[..end].ends_with(')') {
-        let mut depth = 0usize;
-        let mut open = None;
-        for (index, c) in output[..end].char_indices().rev() {
-            match c {
-                ')' => depth += 1,
-                '(' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        open = Some(index);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let open = open?;
+        let open = matching_open_paren(&output[..end])?;
         let marker = open.checked_sub(1)?;
-        if !matches!(output.as_bytes()[marker], b'_' | b'^') || output[..marker].ends_with('\\') {
+        if !matches!(output.as_bytes()[marker], b'_' | b'^')
+            || ends_with_unescaped_backslash(&output[..marker])
+        {
             break;
         }
         start = Some(marker);
@@ -806,6 +877,27 @@ fn render_sized_delimiter_operand(operand: &str, function: &str, matrix_delim: &
     format!("{}({})", function, protect_top_level_comma(operand))
 }
 
+fn fallback_for_following<'a>(fallback: &'a str, following: &str) -> &'a str {
+    if following.starts_with('\'') {
+        fallback.trim_end()
+    } else {
+        fallback
+    }
+}
+
+fn replace_unmatched_marker(input: &str, marker: &str, fallback: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+    while let Some(pos) = remaining.find(marker) {
+        output.push_str(&remaining[..pos]);
+        let after = &remaining[pos + marker.len()..];
+        output.push_str(fallback_for_following(fallback, after));
+        remaining = after;
+    }
+    output.push_str(remaining);
+    output
+}
+
 /// Pair the markers emitted for `\big`-style vertical delimiters, after
 /// rendering, where a delimiterless matrix is still distinguishable from a
 /// scalar operand. An unmatched marker is a legal one-sided delimiter.
@@ -818,7 +910,7 @@ fn resolve_sized_delimiter_pair(
 ) -> String {
     // Adjacent equal bars are ambiguous without a delimiter tree; keep the tokens.
     if markers_are_adjacent(input, marker) {
-        return input.replace(marker, fallback);
+        return replace_unmatched_marker(input, marker, fallback);
     }
 
     let mut scanner = BracketScanner::default();
@@ -839,8 +931,9 @@ fn resolve_sized_delimiter_pair(
         });
 
         let Some(close) = close else {
-            scanner.advance_math_stream(fallback);
-            output.push_str(fallback);
+            let emitted = fallback_for_following(fallback, after_open);
+            scanner.advance_math_stream(emitted);
+            output.push_str(emitted);
             // Keep scanning: a later pair in a following paragraph still resolves.
             remaining = after_open;
             continue;
@@ -2288,14 +2381,14 @@ impl LatexConverter {
                 if matches!(self.state.mode, ConversionMode::Math) {
                     let base = output.trim_end();
                     // Keep the space of a `\ ` line break, or `\'` becomes an escape.
-                    if !base.ends_with('\\') {
+                    if !ends_with_unescaped_backslash(base) {
                         output.truncate(base.len());
                     }
                     // In `j_(1)'` Typst primes the subscript, drawing "(1)′";
                     // `j'_(1)` primes the base, as LaTeX's `j_1'` does.
                     if let Some(start) = trailing_scripts_start(output) {
                         let base_end = output[..start].trim_end().len();
-                        if base_end > 0 && !output[..base_end].ends_with('\\') {
+                        if base_end > 0 && can_attach_prime(&output[..base_end]) {
                             output.replace_range(base_end..start, "'");
                             return;
                         }
@@ -2353,7 +2446,10 @@ impl LatexConverter {
             // Brackets here are literal text: a real optional argument is consumed by the grammar.
             TokenLBracket | TokenRBracket if self.state.in_preamble => {}
             TokenLParen | TokenRParen | TokenLBracket | TokenRBracket => {
-                if self.is_unpaired_delimiter(&elem) {
+                let escape_bracket = self.state.escape_text_brackets
+                    && matches!(self.state.mode, ConversionMode::Text)
+                    && matches!(elem.kind(), TokenLBracket | TokenRBracket);
+                if self.is_unpaired_delimiter(&elem) || escape_bracket {
                     output.push('\\');
                 }
                 output.push_str(&elem.to_string());
@@ -2876,6 +2972,10 @@ impl LatexConverter {
             let mut from = 0;
             while let Some(rel) = result[from..].find(&pat) {
                 let start = from + rel; // outer op
+                if is_inside_string(&result[..start]) {
+                    from = start + 2;
+                    continue;
+                }
                 let outer_open = start + 1; // outer '('
                 let inner_open = start + 3; // inner '('
                 let outer_end = self.find_matching_paren(&result[outer_open + 1..]);
@@ -2915,8 +3015,24 @@ impl LatexConverter {
         // The last non-space character, and whether a backslash escaped it.
         let mut last_nonspace: Option<(char, bool)> = None;
         let mut escaped = false;
+        let mut in_string = false;
         let mut chars = input.chars().peekable();
         while let Some(c) = chars.next() {
+            if in_string {
+                out.push(c);
+                if !escaped && c == '"' {
+                    in_string = false;
+                    last_nonspace = Some(('"', false));
+                }
+                escaped = c == '\\' && !escaped;
+                continue;
+            }
+            if !escaped && c == '"' {
+                in_string = true;
+                out.push(c);
+                last_nonspace = Some(('"', false));
+                continue;
+            }
             if (c == '_' || c == '^')
                 && !escaped
                 && chars.peek() == Some(&'(')

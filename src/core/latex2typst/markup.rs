@@ -229,10 +229,15 @@ const NEGATABLE_SYMBOLS: &[&str] = &[
 
 /// A required argument of a text command inside math, converted as text.
 fn convert_text_arg(conv: &mut LatexConverter, cmd: &CmdItem, index: usize) -> String {
-    let previous = conv.state.mode;
+    let previous_mode = conv.state.mode;
+    let previous_escape = conv.state.escape_text_brackets;
     conv.state.mode = ConversionMode::Text;
+    conv.state.escape_text_brackets = true;
+    conv.state.push_env(EnvironmentContext::None);
     let content = conv.convert_required_arg(cmd, index).unwrap_or_default();
-    conv.state.mode = previous;
+    conv.state.pop_env();
+    conv.state.mode = previous_mode;
+    conv.state.escape_text_brackets = previous_escape;
     content
 }
 
@@ -241,7 +246,7 @@ fn convert_text_arg(conv: &mut LatexConverter, cmd: &CmdItem, index: usize) -> S
 /// escapes (`\%`, `\_`, …) become their character.
 fn latex_text_to_typst_string(raw: &str) -> Option<String> {
     let mut text = String::new();
-    let mut chars = raw.chars();
+    let mut chars = raw.chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
             // TeX sets a run of spaces, newlines included, as one space.
@@ -251,6 +256,16 @@ fn latex_text_to_typst_string(raw: &str) -> Option<String> {
                 }
             }
             '$' => return None,
+            '%' => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+                while matches!(chars.peek(), Some(' ' | '\t')) {
+                    chars.next();
+                }
+            }
             '{' | '}' => {}
             '~' => text.push(' '),
             '\\' => match chars.next()? {
@@ -426,6 +441,10 @@ pub fn convert_command_sym(conv: &mut LatexConverter, elem: SyntaxElement, outpu
             }
             "~" => {
                 output.push('~');
+                return;
+            }
+            " " => {
+                output.push(' ');
                 return;
             }
             _ => {}
@@ -612,6 +631,12 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
 
     // Remove leading backslash for matching
     let base_name = cmd_str.trim_start_matches('\\');
+    if base_name.is_empty() || base_name == " " {
+        if !conv.state.in_preamble && base_name == " " {
+            output.push(' ');
+        }
+        return;
+    }
 
     // Handle preamble commands
     if conv.state.in_preamble {
@@ -826,11 +851,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 "textsf" => (Some("sans"), "#text"),
                 _ => (None, "#text"),
             };
-            let arg = if style.is_some() {
-                conv.get_required_arg(&cmd, 0)
-            } else {
-                conv.get_required_text_arg(&cmd, 0)
-            };
+            let arg = conv.get_required_text_arg(&cmd, 0);
             match (arg.as_deref().and_then(latex_text_to_typst_string), style) {
                 (Some(string), Some(style)) => {
                     let _ = write!(output, "{style}({string}) ");
@@ -843,7 +864,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 // raw LaTeX.
                 _ if style.is_some() || arg.is_some() => {
                     let content = convert_text_arg(conv, &cmd, 0);
-                    let _ = write!(output, "{wrapper}[{}] ", content.trim());
+                    let _ = write!(output, "{wrapper}[{content}] ");
                 }
                 _ => {}
             }
@@ -894,7 +915,16 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "text" | "textrm" | "textup" | "textnormal" => {
             if let Some(arg) = conv.get_required_arg(&cmd, 0) {
-                output.push_str(&arg);
+                if conv.state.escape_text_brackets {
+                    for c in arg.chars() {
+                        if matches!(c, '[' | ']') {
+                            output.push('\\');
+                        }
+                        output.push(c);
+                    }
+                } else {
+                    output.push_str(&arg);
+                }
             }
         }
 
@@ -1174,12 +1204,11 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             let opt = conv.convert_optional_arg(&cmd, 0);
             conv.state.mode = previous;
             let content = conv.convert_required_math_arg(&cmd, 0).unwrap_or_default();
-            let protected = protect_top_level_comma(&content);
             if let Some(n) = opt {
                 let n = protect_top_level_comma(&n);
-                let _ = write!(output, "root({}, {})", n, protected);
+                let _ = write!(output, "root({}, {})", n, content);
             } else {
-                let _ = write!(output, "sqrt({})", protected);
+                let _ = write!(output, "sqrt({})", content);
             }
         }
 
@@ -2971,7 +3000,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "not" => {
             // \not X -> X.not (for symbols that support it)
             // or cancel(X) as fallback
-            if let Some(arg) = conv.convert_required_arg(&cmd, 0) {
+            if let Some(arg) = conv.convert_required_math_arg(&cmd, 0) {
                 let arg = arg.trim();
                 // Converted names whose `.not` variant has another base
                 let arg = match arg {

@@ -10955,4 +10955,119 @@ mod corpus_tail_regressions {
             r"mat(delim: #none, x ; display(a \[b); c \] d)"
         );
     }
+
+    #[test]
+    fn text_blocks_in_math_escape_brackets_isolate_cases_and_keep_line_breaks() {
+        assert_eq!(latex_to_typst(r"\textbf{[ $x$}"), r"#strong[\[ $x$]");
+        assert_eq!(
+            latex_to_typst(r"\text{Intervals [ $x$}"),
+            r"#text[Intervals \[ $x$]"
+        );
+        assert_eq!(latex_to_typst(r"\text{a [b] $x$}"), r"#text[a \[b\] $x$]");
+        assert_eq!(latex_to_typst(r"\text{a $[b]$}"), r"#text[a $[b ]$]");
+        assert_eq!(latex_to_typst(r"\text{$x$ \\}"), r"#text[$x$ \ ]");
+        assert_eq!(
+            latex_to_typst(r"\begin{cases} a & \text{if $x > 0$, then $y$; else $z$} \end{cases}"),
+            "cases(a & #text[if $x > 0$, then $y$; else $z$])"
+        );
+        assert_eq!(latex_to_typst(r"x\textbf{ if }y"), r#"x bold(" if ") y"#);
+    }
+
+    #[test]
+    fn baseless_attachment_repair_ignores_typst_string_literals() {
+        let math_diag = latex_math_to_typst_with_diagnostics(r"\text{(_(x))}");
+        assert_eq!(math_diag.output.trim(), r#""(_(x))""#);
+        assert!(math_diag.warnings.is_empty(), "{:?}", math_diag.warnings);
+
+        let no_preamble = L2TOptions {
+            preamble: PreambleMode::None,
+            ..Default::default()
+        };
+        let doc_diag =
+            tylax::latex_to_typst_with_diagnostics_options(r"$\text{(_(x))}$", no_preamble);
+        assert_eq!(doc_diag.output.trim(), r#"$"(_(x))"$"#);
+        assert!(doc_diag.warnings.is_empty(), "{:?}", doc_diag.warnings);
+
+        let comma_diag = latex_math_to_typst_with_diagnostics(r"\text{a, _(b)}");
+        assert!(
+            !comma_diag.output.contains("zws"),
+            "got: {}",
+            comma_diag.output
+        );
+        assert_eq!(comma_diag.output.trim(), r#""a,_(b)""#);
+        assert!(comma_diag.warnings.is_empty(), "{:?}", comma_diag.warnings);
+        assert_eq!(latex_to_typst(r"\text{_(_(x))}"), r#""_(_(x))""#);
+    }
+
+    #[test]
+    fn sqrt_symbol_bracing_respects_tex_tokens_and_source_offsets() {
+        assert_eq!(
+            latex_to_typst(r"\begin{aligned} a\\sqrt(2) \end{aligned}"),
+            latex_to_typst(r"\begin{aligned} a\\ sqrt(2) \end{aligned}")
+        );
+        assert!(
+            latex_to_typst(r"a \\\sqrt(2)").contains(r"sqrt(\()"),
+            "got: {}",
+            latex_to_typst(r"a \\\sqrt(2)")
+        );
+
+        let no_preamble = L2TOptions {
+            preamble: PreambleMode::None,
+            ..Default::default()
+        };
+        let commented =
+            latex_document_to_typst_with_options("% \\sqrt(2)\n\\verb|\\sqrt(2)|", &no_preamble);
+        assert!(commented.contains(r"\sqrt(2)"), "got: {commented}");
+
+        let comment_diag = tylax::diagnostics::check_latex("% \\sqrt(2)\n\\catcode");
+        let comment_d = comment_diag
+            .diagnostics
+            .iter()
+            .find(|d| d.message.contains(r"\catcode"))
+            .expect("expected diagnostic for \\catcode");
+        assert_eq!((comment_d.line, comment_d.column), (Some(2), Some(1)));
+
+        let diag_src = "\\sqrt(2) + \\catcode";
+        let report = tylax::diagnostics::check_latex(diag_src);
+        let at = diag_src.find(r"\catcode").unwrap();
+        let d = report
+            .diagnostics
+            .iter()
+            .find(|d| d.message.contains(r"\catcode"))
+            .expect("expected diagnostic for \\catcode");
+        assert_eq!((d.line, d.column), (Some(1), Some(at + 1)));
+    }
+
+    #[test]
+    fn primes_handle_string_and_bracket_subscripts_and_non_attachable_bases() {
+        assert_eq!(latex_to_typst(r"f_{\text{a)b}}'"), r#"f'_("a)b")"#);
+        assert_eq!(latex_to_typst(r"f_{)}'"), r"f'_(\))");
+        assert_eq!(latex_to_typst(r"f_{[0,1)}'"), r"f'_([0,1))");
+        let plus_prime = latex_to_typst(r"a + _1'");
+        assert!(!plus_prime.contains("+'"), "got: {plus_prime}");
+        assert_eq!(plus_prime, "a +_(1)'");
+        assert_eq!(latex_to_typst(r"\left( _1' \right)"), "(zws_(1)')");
+        assert_eq!(latex_to_typst(r"\big|_1'"), "bar.v'_(1)");
+    }
+
+    #[test]
+    fn operator_control_space_comments_and_not_cleanup() {
+        let op = latex_to_typst_with_diagnostics(r"$\operatorname{a\ b}$");
+        assert!(op.warnings.is_empty(), "{:?}", op.warnings);
+        let sp = latex_math_to_typst_with_diagnostics(r"a\ b");
+        assert_eq!(sp.output.trim(), "a b");
+        assert!(sp.warnings.is_empty(), "{:?}", sp.warnings);
+        assert_eq!(
+            latex_to_typst("\\text{hello % comment\n world}"),
+            r#""hello world""#
+        );
+        assert_eq!(latex_to_typst(r"\not{a, b}"), r"cancel(a\, b)");
+
+        let no_preamble = L2TOptions {
+            preamble: PreambleMode::None,
+            ..Default::default()
+        };
+        let doc = latex_document_to_typst_with_options(r"\not{AB}", &no_preamble);
+        assert!(doc.contains("cancel(A B)"), "got: {doc}");
+    }
 }
