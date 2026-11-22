@@ -6,7 +6,7 @@ use mitex_parser::syntax::{CmdItem, EnvItem, FormulaItem, SyntaxElement, SyntaxK
 use rowan::ast::AstNode;
 use std::fmt::Write;
 
-use super::context::{ConversionMode, LatexConverter};
+use super::context::{ConversionMode, LatexConverter, TrailingScript};
 use super::environment::{convert_array_with_delim, convert_matrix_with_delim};
 use super::utils::{
     brackets_balanced, has_more_open_braces, protect_top_level_comma, scan_brackets,
@@ -61,6 +61,7 @@ pub fn convert_curly(conv: &mut LatexConverter, elem: SyntaxElement, output: &mu
             &mut conv.citations.pending,
             output,
         );
+        conv.trailing_script = None;
         return;
     }
 
@@ -68,6 +69,7 @@ pub fn convert_curly(conv: &mut LatexConverter, elem: SyntaxElement, output: &mu
     if let Some(op) = conv.state.pending_op.take() {
         // This group is the argument for a pending operator
         let mut content = String::new();
+        conv.trailing_script = None;
         // Extract content without braces
         for child in node.children_with_tokens() {
             match child.kind() {
@@ -88,6 +90,7 @@ pub fn convert_curly(conv: &mut LatexConverter, elem: SyntaxElement, output: &mu
         } else {
             output.push_str(&op_call);
         }
+        conv.trailing_script = None;
         return;
     }
 
@@ -121,12 +124,14 @@ pub fn convert_curly(conv: &mut LatexConverter, elem: SyntaxElement, output: &mu
         && starts_with_baseless_script(&content)
     {
         conv.attachment_repairs.note_empty_base();
+        conv.trailing_script = None;
         output.push_str("zws");
     }
     conv.visit_elements(&content, output);
     // Add zero-width space for empty groups in math mode
     if !has_content && matches!(conv.state.mode, ConversionMode::Math) {
         output.push_str("zws ");
+        conv.trailing_script = None;
     }
 }
 
@@ -614,22 +619,31 @@ pub fn convert_attachment(conv: &mut LatexConverter, elem: SyntaxElement, output
     // in (`underbrace(body, label)`) instead of emitting a literal script.
     if let Some(folded) = fold_brace_annotation(conv, &node) {
         output.push_str(&folded);
+        conv.trailing_script = None;
         return;
     }
 
     let mut is_script = false;
+    let mut script_start: Option<usize> = None;
 
     for child in node.children_with_tokens() {
         let kind = child.kind();
 
-        if kind == SyntaxKind::TokenUnderscore {
-            output.push('_');
-            is_script = true;
-            continue;
-        }
-
-        if kind == SyntaxKind::TokenCaret {
-            output.push('^');
+        if kind == SyntaxKind::TokenUnderscore || kind == SyntaxKind::TokenCaret {
+            let marker = if kind == SyntaxKind::TokenUnderscore {
+                '_'
+            } else {
+                '^'
+            };
+            if script_start.is_none() {
+                let trimmed_len = output.trim_end().len();
+                script_start = match conv.trailing_script {
+                    Some(prev) if prev.end == trimmed_len => Some(prev.start),
+                    _ => Some(output.len()),
+                };
+            }
+            conv.trailing_script = None;
+            output.push(marker);
             is_script = true;
             continue;
         }
@@ -645,10 +659,15 @@ pub fn convert_attachment(conv: &mut LatexConverter, elem: SyntaxElement, output
             // Always wrap attachment content in parentheses to ensure correct binding
             // e.g. sum_i=1 -> sum_(i=1) instead of sum_i = 1
             output.push('(');
+            conv.trailing_script = None;
             conv.visit_element(child, output);
             output.push(')');
             // No space after script to ensure tight binding of multiple scripts
             is_script = false;
+            conv.trailing_script = script_start.map(|start| TrailingScript {
+                start,
+                end: output.len(),
+            });
         } else {
             // This handles the base or other parts if any (though usually base is previous sibling)
             conv.visit_element(child, output);
@@ -732,7 +751,9 @@ fn fold_brace_annotation(conv: &mut LatexConverter, node: &SyntaxNode) -> Option
     let previous_mode = conv.state.mode;
     conv.state.mode = ConversionMode::Math;
     let mut label = String::new();
+    conv.trailing_script = None;
     conv.visit_element(script, &mut label);
+    conv.trailing_script = None;
     conv.state.mode = previous_mode;
 
     // Top-level commas in `body` were already escaped by `convert_required_math_arg`.

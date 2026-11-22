@@ -11048,6 +11048,26 @@ mod corpus_tail_regressions {
         assert_eq!(plus_prime, "a +_(1)'");
         assert_eq!(latex_to_typst(r"\left( _1' \right)"), "(zws_(1)')");
         assert_eq!(latex_to_typst(r"\big|_1'"), "bar.v'_(1)");
+        assert_eq!(latex_to_typst(r"j_1^2'"), "j'_(1)^(2)");
+        assert_eq!(latex_to_typst(r"x_{y_1}'"), "x'_(y_(1))");
+        assert_eq!(latex_to_typst(r"x_1'^2'"), "x''_(1)^(2)");
+        assert_eq!(latex_to_typst(r"\frac{x_1}{2}'"), "frac(x_(1), 2)'");
+        assert_eq!(latex_to_typst(r"(x_1)'"), "(x_(1))'");
+    }
+
+    #[test]
+    fn primed_scripts_scale_linearly() {
+        let many_primes = std::iter::repeat_n("x_1'", 4_000)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let started = std::time::Instant::now();
+        let out = latex_to_typst(&many_primes);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "expected linear-time prime handling, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(out.matches("x'_(1)").count(), 4_000);
     }
 
     #[test]

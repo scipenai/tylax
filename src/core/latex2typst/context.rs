@@ -522,6 +522,15 @@ impl ConversionState {
     }
 }
 
+/// Byte range of trailing parenthesized scripts (`_(...)` / `^(...)`) just
+/// emitted at the end of the active output buffer, so a following `'` moves
+/// onto the script's base in O(1) without rescanning `output`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TrailingScript {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
 /// The main AST-based converter
 pub struct LatexConverter {
     pub(crate) state: ConversionState,
@@ -538,6 +547,8 @@ pub struct LatexConverter {
     /// Start offsets of the delimiters that do not pair within their sequence
     /// of siblings in the tree being visited (see [`unpaired_delimiters`]).
     pub(crate) unpaired_delimiters: HashSet<u32>,
+    /// Byte range of trailing `_(...)`/`^(...)` scripts at the end of `output`.
+    pub(crate) trailing_script: Option<TrailingScript>,
 }
 
 /// A `ClauseArgument` is a *required* argument iff it does not carry an
@@ -577,40 +588,6 @@ fn strip_trailing_line_breaks(math: &str) -> &str {
     math
 }
 
-/// If `s` ends with `)`, return the byte index of its matching `(`.
-fn matching_open_paren(s: &str) -> Option<usize> {
-    let mut stack = Vec::new();
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut matched = None;
-    for (index, c) in s.char_indices() {
-        if std::mem::take(&mut escaped) {
-            continue;
-        }
-        if in_string {
-            match c {
-                '\\' => escaped = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match c {
-            '\\' => escaped = true,
-            '"' => in_string = true,
-            '(' | '[' | '{' => stack.push((index, c)),
-            ')' | ']' | '}' => {
-                let popped = stack.pop();
-                if index + 1 == s.len() {
-                    matched = popped.filter(|&(_, open)| open == '(').map(|(pos, _)| pos);
-                }
-            }
-            _ => {}
-        }
-    }
-    matched
-}
-
 /// Whether a prime can attach directly to `base` in Typst math rather than to
 /// a binary operator, delimiter, or unescaped line-break backslash.
 fn can_attach_prime(base: &str) -> bool {
@@ -640,44 +617,6 @@ fn can_attach_prime(base: &str) -> bool {
             | '/'
             | '*'
     )
-}
-
-/// Whether `prefix` ends inside an open Typst `"..."` string literal.
-fn is_inside_string(prefix: &str) -> bool {
-    let mut in_string = false;
-    let mut escaped = false;
-    for c in prefix.chars() {
-        if std::mem::take(&mut escaped) {
-            continue;
-        }
-        match c {
-            '\\' => escaped = true,
-            '"' => in_string = !in_string,
-            _ => {}
-        }
-    }
-    in_string
-}
-
-/// Where the parenthesised scripts at the end of `output` begin, if any.
-///
-/// For `j_(1)` this is the index of `_`, and for `x_(a)^(b)` the index of the
-/// first `_`. A call such as `f(x)` has no script.
-fn trailing_scripts_start(output: &str) -> Option<usize> {
-    let mut end = output.len();
-    let mut start = None;
-    while output[..end].ends_with(')') {
-        let open = matching_open_paren(&output[..end])?;
-        let marker = open.checked_sub(1)?;
-        if !matches!(output.as_bytes()[marker], b'_' | b'^')
-            || ends_with_unescaped_backslash(&output[..marker])
-        {
-            break;
-        }
-        start = Some(marker);
-        end = marker;
-    }
-    start.filter(|&index| index > 0)
 }
 
 /// Trim a converted argument, keeping the space after a trailing `\` line break.
@@ -1547,6 +1486,7 @@ impl LatexConverter {
             pending_section: None,
             attachment_repairs: AttachmentRepairs::default(),
             unpaired_delimiters: HashSet::new(),
+            trailing_script: None,
         }
     }
 
@@ -1562,6 +1502,7 @@ impl LatexConverter {
             pending_section: None,
             attachment_repairs: AttachmentRepairs::default(),
             unpaired_delimiters: HashSet::new(),
+            trailing_script: None,
         }
     }
 
@@ -1571,8 +1512,10 @@ impl LatexConverter {
             &mut self.unpaired_delimiters,
             super::delimiters::unpaired_delimiters(tree),
         );
+        let previous_trailing_script = self.trailing_script.take();
         self.visit_node(tree, output);
         self.unpaired_delimiters = previous;
+        self.trailing_script = previous_trailing_script;
     }
 
     /// Whether `elem` is a delimiter in math that must be escaped because it
@@ -1728,6 +1671,7 @@ impl LatexConverter {
         self.siunitx_arg_collector = None;
         self.pending_section = None;
         self.attachment_repairs.take();
+        self.trailing_script = None;
     }
 
     /// Convert a complete LaTeX document to Typst
@@ -1985,7 +1929,9 @@ impl LatexConverter {
                     })
                     .map_or(children.len(), |offset| index + 1 + offset);
                 let mut styled_content = String::new();
+                self.trailing_script = None;
                 self.visit_elements(&children[index + 1..end], &mut styled_content);
+                self.trailing_script = None;
                 // The content is a call argument, so a top-level `,` or `;`
                 // must not split it: `\displaystyle m=0,u\ne0;`.
                 let styled_content = protect_top_level_comma(styled_content.trim());
@@ -2101,7 +2047,9 @@ impl LatexConverter {
                         })
                         .collect();
                     let mut title = String::new();
+                    self.trailing_script = None;
                     self.visit_elements(&body, &mut title);
+                    self.trailing_script = None;
                     super::markup::emit_starred_section(pending, title.trim(), output);
                     return true;
                 }
@@ -2212,21 +2160,34 @@ impl LatexConverter {
     pub fn visit_element(&mut self, elem: SyntaxElement, output: &mut String) {
         use SyntaxKind::*;
 
-        if self.handle_pending_citation(elem.clone(), output) {
-            return;
-        }
-        if self.handle_pending_reference(elem.clone(), output) {
-            return;
-        }
-        if self.handle_pending_section(elem.clone(), output) {
-            return;
-        }
-        if self.handle_pending_siunitx(elem.clone(), output) {
+        if self.handle_pending_citation(elem.clone(), output)
+            || self.handle_pending_reference(elem.clone(), output)
+            || self.handle_pending_section(elem.clone(), output)
+            || self.handle_pending_siunitx(elem.clone(), output)
+        {
+            self.trailing_script = None;
             return;
         }
 
         if self.state.suppress_next_space && !matches!(elem.kind(), SyntaxKind::TokenWhiteSpace) {
             self.state.suppress_next_space = false;
+        }
+
+        let preserves_trailing_script = matches!(
+            elem.kind(),
+            ScopeRoot
+                | ItemText
+                | ClauseArgument
+                | ItemCurly
+                | ItemAttachComponent
+                | TokenApostrophe
+                | TokenWhiteSpace
+                | TokenLineBreak
+                | TokenComment
+                | ItemBlockComment
+        );
+        if !preserves_trailing_script {
+            self.trailing_script = None;
         }
 
         match elem.kind() {
@@ -2252,7 +2213,9 @@ impl LatexConverter {
                 if self.state.in_preamble {
                     if let SyntaxElement::Node(n) = elem {
                         let mut dummy = String::new();
+                        self.trailing_script = None;
                         self.visit_node(&n, &mut dummy);
+                        self.trailing_script = None;
                     }
                 } else if let SyntaxElement::Node(n) = elem {
                     self.visit_node(&n, output);
@@ -2262,6 +2225,7 @@ impl LatexConverter {
             // Math formula
             ItemFormula => {
                 super::math::convert_formula(self, elem, output);
+                self.trailing_script = None;
             }
 
             // Curly group
@@ -2275,6 +2239,7 @@ impl LatexConverter {
             // Left/Right delimiters
             ItemLR | ClauseLR => {
                 super::math::convert_lr(self, elem, output);
+                self.trailing_script = None;
             }
 
             // Attachment (subscript/superscript)
@@ -2285,11 +2250,13 @@ impl LatexConverter {
             // Command
             ItemCmd => {
                 super::markup::convert_command(self, elem, output);
+                self.trailing_script = None;
             }
 
             // Environment
             ItemEnv => {
                 super::environment::convert_environment(self, elem, output);
+                self.trailing_script = None;
             }
 
             // Plain word
@@ -2386,14 +2353,24 @@ impl LatexConverter {
                     }
                     // In `j_(1)'` Typst primes the subscript, drawing "(1)′";
                     // `j'_(1)` primes the base, as LaTeX's `j_1'` does.
-                    if let Some(start) = trailing_scripts_start(output) {
-                        let base_end = output[..start].trim_end().len();
-                        if base_end > 0 && can_attach_prime(&output[..base_end]) {
-                            output.replace_range(base_end..start, "'");
-                            return;
+                    if let Some(script) = self.trailing_script {
+                        if script.end == output.len()
+                            && script.start < script.end
+                            && output.is_char_boundary(script.start)
+                        {
+                            let base_end = output[..script.start].trim_end().len();
+                            if base_end > 0 && can_attach_prime(&output[..base_end]) {
+                                output.replace_range(base_end..script.start, "'");
+                                self.trailing_script = Some(TrailingScript {
+                                    start: base_end + 1,
+                                    end: output.len(),
+                                });
+                                return;
+                            }
                         }
                     }
                 }
+                self.trailing_script = None;
                 output.push('\'');
             }
             // A comma in a `cases` row or a matrix cell would separate cells, and
@@ -2561,7 +2538,9 @@ impl LatexConverter {
                         )
                     })
                     .collect();
+                self.trailing_script = None;
                 self.visit_elements(&content, &mut output);
+                self.trailing_script = None;
                 return Some(trim_converted_arg(&output));
             }
             optional_count += 1;
@@ -2593,7 +2572,9 @@ impl LatexConverter {
                             )
                         })
                         .collect();
+                    self.trailing_script = None;
                     self.visit_elements(&content, &mut output);
+                    self.trailing_script = None;
                     return Some(trim_converted_arg(&output));
                 }
                 required_count += 1;
@@ -2970,9 +2951,23 @@ impl LatexConverter {
             // base-less attachment.
             let pat = format!("{op}({op}(");
             let mut from = 0;
+            let mut scan_pos = 0;
+            let mut in_string = false;
+            let mut escaped = false;
             while let Some(rel) = result[from..].find(&pat) {
                 let start = from + rel; // outer op
-                if is_inside_string(&result[..start]) {
+                for c in result[scan_pos..start].chars() {
+                    if std::mem::take(&mut escaped) {
+                        continue;
+                    }
+                    match c {
+                        '\\' => escaped = true,
+                        '"' => in_string = !in_string,
+                        _ => {}
+                    }
+                }
+                scan_pos = start;
+                if in_string {
                     from = start + 2;
                     continue;
                 }
