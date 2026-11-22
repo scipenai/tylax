@@ -10254,6 +10254,19 @@ mod roundtrip_regressions {
         );
     }
 
+    /// Each argument of `cases` is a row, even one that starts with `&`.
+    #[test]
+    fn cases_rows_that_start_with_an_ampersand() {
+        assert_eq!(
+            latex_to_typst(r"\left\{\begin{aligned}&a\\&b\end{aligned}\right."),
+            "cases(& a, & b)"
+        );
+        assert_eq!(
+            t2l("cases(& a, & b)"),
+            "\\begin{cases}\n & a \\\\\n & b\n\\end{cases}"
+        );
+    }
+
     /// An alignment cell is a TeX group, so `\displaystyle` ends at `&` or `\\`.
     #[test]
     fn displaystyle_ends_at_the_cell() {
@@ -10264,6 +10277,34 @@ mod roundtrip_regressions {
         assert_eq!(
             latex_to_typst(r"\begin{pmatrix}\displaystyle a & b\end{pmatrix}"),
             r#"mat(delim: "(", display(a), b)"#
+        );
+    }
+
+    /// A comma in a function argument or a matrix cell separated arguments or
+    /// cells. Braces round the content would be drawn, so the comma is escaped.
+    #[test]
+    fn commas_in_arguments_and_cells_are_escaped() {
+        assert_eq!(latex_to_typst(r"\frac{a , b}{c}"), r"frac(a\, b, c)");
+        assert_eq!(latex_to_typst(r"\mathit{a , b}"), r"italic(a\, b)");
+        assert_eq!(latex_to_typst(r"\sqrt{a , b}"), r"sqrt(a\, b)");
+        assert_eq!(latex_to_typst(r"\left| a, b \right|"), r"abs(a\, b)");
+        assert_eq!(
+            latex_to_typst(r"\left| \sqrt[3]{x} \right|"),
+            "abs(root(3, x))"
+        );
+        assert_eq!(
+            latex_to_typst(r"\left\langle a, b \right\rangle"),
+            r"lr(chevron.l a\, b chevron.r)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\begin{array}{l} a, \end{array}"),
+            r"mat(delim: #none, align: #left, a\,)"
+        );
+        assert_eq!(t2l(r"frac(a\, b, c)"), r"\frac{a, b}{c}");
+        // A bracket that does not pair within its cell is escaped too.
+        assert_eq!(
+            latex_to_typst(r"{ \begin{array}{ll} ( & ) \end{array} }"),
+            r"mat(delim: #none, align: #left, \(, \))"
         );
     }
 
@@ -10563,6 +10604,13 @@ mod visual_regressions {
         assert_eq!(t2l("sscript(n)"), r"{\scriptscriptstyle n}");
     }
 
+    /// `\mbox` and `\hbox` set their text as math letters.
+    #[test]
+    fn boxes_in_math_are_text() {
+        assert_eq!(latex_to_typst(r"\hbox{eigenvals}"), r#""eigenvals""#);
+        assert_eq!(latex_to_typst(r"\mbox{for all} x"), r#""for all" x"#);
+    }
+
     /// `j_(1)'` primes the subscript in Typst, drawing "(1)′".
     #[test]
     fn prime_after_subscript_goes_on_the_base() {
@@ -10619,6 +10667,15 @@ mod corpus_compile_regressions {
         assert_eq!(latex_to_typst(r"\Bbb{k}"), "bb(k)");
     }
 
+    /// Plain TeX's `\cr` passed through as the identifier `cr`.
+    #[test]
+    fn cr_is_a_row_break() {
+        assert_eq!(
+            latex_to_typst(r"\begin{matrix} a & b \cr c & d \end{matrix}"),
+            "mat(delim: #none, a, b ; c, d)"
+        );
+    }
+
     /// A trailing `\\` gave a `\` that escaped the closing `$`.
     #[test]
     fn trailing_line_break_is_dropped() {
@@ -10630,11 +10687,72 @@ mod corpus_compile_regressions {
     }
 }
 
+mod spacing_regressions {
+    use super::*;
+
+    /// mitex gives `\hskip`, `\kern`, `\mkern` and `\mskip` no argument, so the
+    /// dimension came out as loose letters (`hskip 4 c m`).
+    #[test]
+    fn primitive_skips_take_their_dimension() {
+        assert_eq!(latex_to_typst(r"a\hskip 4 cm b"), "a #h(4cm) b");
+        assert_eq!(latex_to_typst(r"a\kern-4.5pt b"), "a #h(-4.5pt) b");
+        assert_eq!(latex_to_typst(r"a\mkern 18mu b"), "a #h(1em) b");
+        assert_eq!(
+            latex_to_typst(r"a\mskip 9mu plus 2mu minus 1mu b"),
+            "a #h(0.5em) b"
+        );
+        assert_eq!(latex_to_typst(r"a\hskip.5em b"), "a #h(0.5em) b");
+    }
+
+    /// A line break before text that spells a primitive stays a line break.
+    #[test]
+    fn line_break_before_skip_name_is_kept() {
+        assert!(!latex_to_typst(r"a\\hskip 2pt").contains("#h"));
+    }
+
+    /// Typst has only `pt`, `mm`, `cm`, `in` and `em`; the other TeX units are
+    /// converted, by TeX's own definitions where there is one.
+    #[test]
+    fn tex_units_become_typst_lengths() {
+        assert_eq!(latex_to_typst(r"\hspace{1 cm}"), "#h(1cm)");
+        assert_eq!(latex_to_typst(r"\hspace{3ex}"), "#h(1.29em)");
+        assert_eq!(latex_to_typst(r"\hspace{2pc}"), "#h(24pt)");
+        assert_eq!(latex_to_typst(r"\hspace{72bp}"), "#h(72.27pt)");
+        assert_eq!(latex_to_typst(r"\hspace{4px}"), "#h(3pt)");
+        assert_eq!(latex_to_typst(r"\hspace{1157dd}"), "#h(1238pt)");
+        assert_eq!(latex_to_typst(r"\hspace{65536sp}"), "#h(1pt)");
+        assert_eq!(latex_to_typst(r"\hspace{36mu}"), "#h(2em)");
+    }
+
+    /// In math, `#h(2cm)(a > b)` passed `(a > b)` to `h` as a second argument.
+    #[test]
+    fn space_ends_embedded_spacing_call() {
+        assert_eq!(latex_to_typst(r"\hspace{2cm}(a>b)"), "#h(2cm) (a > b)");
+    }
+
+    #[test]
+    fn enskip_and_rule() {
+        assert_eq!(latex_to_typst(r"a \enskip b"), "a #h(0.5em) b");
+        assert_eq!(
+            latex_to_typst(r"\rule{5cm}{0.4pt}"),
+            "#box(width: 5cm, height: 0.4pt, fill: black)"
+        );
+    }
+}
+
 mod typst_spacing_regressions {
     use super::*;
 
     fn t2l(input: &str) -> String {
         typst_to_latex(input)
+    }
+
+    /// MiniEval kept `10pt` as raw text, so `-10pt` failed to negate, and the
+    /// fallback wrote the call back as a bare `#`.
+    #[test]
+    fn negative_spacing_survives() {
+        assert_eq!(t2l("$a #h(-10pt) b$"), r"$a \hspace{-10pt} b$");
+        assert_eq!(latex_to_typst(r"a\kern-10pt b"), "a #h(-10pt) b");
     }
 
     /// `1em + 2pt` was concatenated as text: `#h([1em2pt])`.
@@ -10706,6 +10824,26 @@ mod structural_regressions {
         assert_eq!(latex_to_typst(r"\sqrt{a;b}"), r"sqrt(a\;b)");
     }
 
+    /// `\hline` left the table marker `|||HLINE|||` in a math array. Rules
+    /// and a shared column alignment become `mat(augment:, align:)`.
+    #[test]
+    fn array_rules_and_alignment() {
+        assert_eq!(
+            latex_to_typst(r"\left(\begin{array}{c|c} a & b \\ \hline c & d \end{array}\right)"),
+            r#"mat(delim: "(", augment: #(hline: 1, vline: 1), a, b ; c, d)"#
+        );
+        assert_eq!(
+            latex_to_typst(
+                r"\begin{array}{|l|l|}\hline a & b \\ \hline c & d \\ \hline\end{array}"
+            ),
+            "mat(delim: #none, augment: #(hline: 1, vline: 1), align: #left, a, b ; c, d)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\begin{array}{cc|c} 1 & 2 & 3 \\ \cline{1-2} 3 & 4 & 5\end{array}"),
+            "mat(delim: #none, augment: #(vline: 2), 1, 2, 3 ; 3, 4, 5)"
+        );
+    }
+
     #[test]
     fn augmented_matrix_back_to_array() {
         let latex = t2l(r#"$mat(delim: "(", augment: #(hline: 1, vline: 1), a, b ; c, d)$"#);
@@ -10713,6 +10851,49 @@ mod structural_regressions {
         assert!(latex.contains(r"\hline c & d"), "{latex}");
         let latex = t2l("$mat(delim: #none, align: #right, 1, 2 ; 3, 4)$");
         assert!(latex.contains(r"\begin{array}{rr}"), "{latex}");
+    }
+
+    /// Text holding math was copied as raw LaTeX: `#text[$\frac12$]`.
+    #[test]
+    fn text_with_math_is_converted() {
+        assert_eq!(latex_to_typst(r"\hbox{$\frac{1}{2}$} x"), "#text[$1/2$] x");
+        assert_eq!(
+            latex_to_typst(r"\textit{between $a$ and $b$}"),
+            "#emph[between $a$ and $b$]"
+        );
+        assert_eq!(t2l("$#text[if $x > 0$]$"), r"$\text{if $x > 0$}$");
+        assert_eq!(
+            t2l("$#emph[between $a$ and $b$]$"),
+            r"$\textit{between $a$ and $b$}$"
+        );
+    }
+
+    /// A unit is two letters: `\hskip 1cmv` is `1cm` then `v`.
+    #[test]
+    fn unit_is_two_letters() {
+        assert_eq!(latex_to_typst(r"\hskip 1cmv"), "#h(1cm) v");
+        assert_eq!(
+            latex_to_typst(r"\mathrm{1\mkern-5muI}"),
+            "upright(1 #h(-0.278em) I)"
+        );
+    }
+
+    #[test]
+    fn rule_raise() {
+        assert_eq!(
+            latex_to_typst(r"\rule[-0.9mm]{3mm}{.4pt}"),
+            "#box(width: 3mm, height: 0.4pt, fill: black, baseline: 0.9mm)"
+        );
+        assert_eq!(
+            t2l("$#box(width: 3mm, height: 0.4pt, fill: black, baseline: 0.9mm)$"),
+            r"$\rule[-0.9mm]{3mm}{0.4pt}$"
+        );
+    }
+
+    /// `#hide[$ 0 $](4)`: display math inside, and `(4)` read as arguments.
+    #[test]
+    fn phantom_is_inline_and_ends_its_call() {
+        assert_eq!(latex_to_typst(r"\hphantom{0}(4)"), "#hide[$0$] (4)");
     }
 
     /// `\not` appended `.not` to any symbol, giving `lt.double.not`.
@@ -10723,6 +10904,20 @@ mod structural_regressions {
         assert_eq!(
             latex_to_typst(r"i\not\!\partial"),
             "i #box(width: 0pt, $slash$) partial"
+        );
+    }
+
+    #[test]
+    fn overlaps() {
+        assert_eq!(latex_to_typst(r"\rlap{1}"), "#box(width: 0pt, $1$)");
+        assert_eq!(
+            latex_to_typst(r"D\llap{/}"),
+            "D #context { h(-measure($slash$).width); $slash$ }"
+        );
+        assert_eq!(t2l("$#box(width: 0pt, $1$)$"), r"$\rlap{$1$}$");
+        assert_eq!(
+            t2l("$D #context { h(-measure($slash$).width); $slash$ }$"),
+            r"$D \llap{$/$}$"
         );
     }
 }
@@ -10852,11 +11047,11 @@ mod delimiter_pairing_regressions {
     fn hbox_inside_cases_keeps_literal_commas_and_semicolons() {
         assert_eq!(
             latex_to_typst(r"\begin{cases} a & \hbox{x, y; z} \end{cases}"),
-            r#"cases(a & "x, y ; z")"#
+            r#"cases(a & "x, y; z")"#
         );
         assert_eq!(
             latex_to_typst(r"\begin{cases} a & \mbox{if } x = 1, 2; 3 \end{cases}"),
-            r#"cases(a & ""i f x = 1\, 2\; 3)"#
+            r#"cases(a & "if " x = 1\, 2\; 3)"#
         );
     }
 
@@ -10903,12 +11098,33 @@ mod delimiter_pairing_regressions {
 mod corpus_tail_regressions {
     use super::*;
 
+    /// `\fbox` takes text even in math, so its `$…$` is its own math.
+    #[test]
+    fn fbox_in_math_holds_text() {
+        assert_eq!(
+            latex_to_typst(r"\fbox{$x$}"),
+            "#box(stroke: 0.5pt, inset: 2pt, baseline: 20%)[$x$]"
+        );
+        assert_eq!(
+            typst_to_latex("$#box(stroke: 0.5pt, inset: 2pt, baseline: 20%)[6]$"),
+            r"$\fbox{6}$"
+        );
+    }
+
     /// The index of `\sqrt` was copied raw: `root(\ alpha, z)`. A symbol
     /// after `\sqrt` is its radicand: `\sqrt(2)` is the root of `(`.
     #[test]
     fn sqrt_index_and_symbol_radicand() {
         assert_eq!(latex_to_typst(r"\sqrt[\alpha]{z}"), "root(alpha, z)");
         assert_eq!(latex_to_typst(r"\sqrt(2)"), r"sqrt(\()2 \)");
+    }
+
+    /// `\mathtt{\ }` gave `mono()`; T → L trimmed `\ ` to `\`.
+    #[test]
+    fn control_space() {
+        assert_eq!(latex_to_typst(r"\mathtt{\ }"), "mono(space)");
+        assert_eq!(typst_to_latex("$mono(space) x$"), r"$\mathtt{\ } x$");
+        assert_eq!(typst_to_latex("$a space$"), r"$a \ $");
     }
 
     #[test]
@@ -10931,6 +11147,60 @@ mod corpus_tail_regressions {
     #[test]
     fn left_right_pair_with_each_other() {
         assert_eq!(latex_to_typst(r"\left( a-1)\right)"), r"(a - 1 \))");
+    }
+
+    /// A display environment inside other math is only its body, since a
+    /// nested `$ … $` closes the outer equation.
+    #[test]
+    fn display_environment_inside_math() {
+        assert_eq!(
+            latex_to_typst(r"x = \begin{align} a &= b \end{align}"),
+            "x = a & = b"
+        );
+        assert_eq!(
+            latex_to_typst(r"\begin{align} a &= b \end{align}").trim(),
+            "$ a & = b $"
+        );
+    }
+
+    #[test]
+    fn matrix_rows() {
+        assert_eq!(
+            latex_to_typst(r"\begin{matrix} a & b \\\hline c & d \end{matrix}"),
+            "mat(delim: #none, augment: #(hline: 1), a, b ; c, d)"
+        );
+        // A trailing escaped `\;` is content, not an empty row.
+        assert_eq!(
+            latex_to_typst(r"\begin{array}{c} a, \\ b;\end{array}"),
+            r"mat(delim: #none, a\, ; b\;)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\left\{\begin{array}{ll} \frac Tm & a \\ 1 & b \end{array}\right."),
+            "cases(T/m & a, 1 & b)"
+        );
+    }
+
+    #[test]
+    fn small_commands() {
+        assert_eq!(
+            latex_to_typst(r"\raisebox{2mm}{D}\hat{P}"),
+            "#box(baseline: -2mm)[D] hat(P)"
+        );
+        assert_eq!(
+            typst_to_latex("$#box(baseline: 2.5mm)[$x$ and y]$"),
+            r"$\raisebox{-2.5mm}{$x$ and y}$"
+        );
+        assert_eq!(
+            latex_to_typst(r"\raisebox{-2mm}{\scriptsize{$J = 0$}}"),
+            "#box(baseline: 2mm)[$J = 0$]"
+        );
+        assert_eq!(
+            latex_to_typst(r"\Bigg\downarrow x \Big\uparrow"),
+            "arrow.b x arrow.t"
+        );
+        assert_eq!(latex_to_typst(r"\displaystyle{\Biggr)}"), r"display(\))");
+        assert_eq!(latex_to_typst(r"{\cos\tt} {\bf}x"), "cos x");
+        assert_eq!(latex_to_typst(r"\hspace{.5 cm .}"), "#h(0.5cm)");
     }
 
     /// Bars pair only around one operand: not across cells, rows or the
@@ -11141,7 +11411,7 @@ mod corpus_tail_regressions {
         let op = latex_to_typst_with_diagnostics(r"$\operatorname{a\ b}$");
         assert!(op.warnings.is_empty(), "{:?}", op.warnings);
         let sp = latex_math_to_typst_with_diagnostics(r"a\ b");
-        assert_eq!(sp.output.trim(), "a b");
+        assert_eq!(sp.output.trim(), "a space b");
         assert!(sp.warnings.is_empty(), "{:?}", sp.warnings);
         assert_eq!(
             latex_to_typst("\\text{hello % comment\n world}"),
@@ -11155,5 +11425,24 @@ mod corpus_tail_regressions {
         };
         let doc = latex_document_to_typst_with_options(r"\not{AB}", &no_preamble);
         assert!(doc.contains("cancel(A B)"), "got: {doc}");
+    }
+
+    /// An escaped `\(` neither groups nor breaks a row of `cases`.
+    #[test]
+    fn escaped_paren_in_cases() {
+        assert_eq!(latex_to_typst(r"\left\{ b (c \right."), r"cases(b \(c)");
+        assert_eq!(
+            latex_to_typst(r"\left\{ \begin{aligned} a (b \\ c \end{aligned}\right."),
+            r"cases(a \(b, c)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\left\{ \begin{array}{ll} a & b \\\hline e & f \end{array}\right."),
+            "cases(a & b, e & f)"
+        );
+        assert_eq!(latex_to_typst(r"\mathnormal{H}"), "italic(H)");
+        assert_eq!(
+            latex_to_typst(r"\sqrt{\mathstrut x}"),
+            r"sqrt(#hide[$\($] x)"
+        );
     }
 }

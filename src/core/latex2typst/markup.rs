@@ -631,7 +631,9 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
 
     // Remove leading backslash for matching
     let base_name = cmd_str.trim_start_matches('\\');
-    if base_name.is_empty() || base_name == " " {
+    if (base_name.is_empty() && (!matches!(conv.state.mode, ConversionMode::Math) || conv.state.in_preamble))
+        || base_name == " "
+    {
         if !conv.state.in_preamble && base_name == " " {
             output.push(' ');
         }
@@ -841,7 +843,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         // into `#` and `\text{[a]}`. `*…*`, `_…_` and backticks are not markup
         // there, so the styled commands wrap the string in a math style.
         "textbf" | "textit" | "emph" | "texttt" | "textsf" | "text" | "textrm" | "textup"
-        | "textnormal"
+        | "textnormal" | "mbox" | "makebox" | "hbox"
             if matches!(conv.state.mode, ConversionMode::Math) =>
         {
             let (style, wrapper) = match base_name {
@@ -871,8 +873,8 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         // In text, `\textsf`, `\rm` and `\sf` (math is handled above) select a
         // font family that has no portable Typst name, so keep the text
-        // unstyled.
-        "textsf" | "rm" | "sf" => {
+        // unstyled. A box keeps its converted content.
+        "textsf" | "rm" | "sf" | "mbox" | "makebox" | "hbox" => {
             if let Some(content) = conv.convert_required_arg(&cmd, 0) {
                 output.push_str(&content);
             }
@@ -1237,6 +1239,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         // Equation numbering is Typst's to decide.
         "nonumber" | "notag" if matches!(conv.state.mode, ConversionMode::Math) => {}
+        "cr" if matches!(conv.state.mode, ConversionMode::Math) => conv.push_row_break(output),
         "mathbf" => {
             // \mathbf{x} -> upright(bold(x)) for proper bold upright. Argument is
             // math content, so render it by the math rule on every path (issue #35).
@@ -1336,6 +1339,15 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             let _ = write!(output, "cancel({})", content.trim());
         }
         // Boxed content - handle differently in math vs text mode
+        // `\fbox` takes text even in math: `\fbox{$x$}` holds its own math.
+        "fbox" | "framebox" if conv.state.mode == ConversionMode::Math => {
+            let arg = convert_text_arg(conv, &cmd, 0);
+            let _ = write!(
+                output,
+                "#box(stroke: 0.5pt, inset: 2pt, baseline: 20%)[{}] ",
+                arg.trim()
+            );
+        }
         "boxed" | "fbox" | "framebox" => {
             let arg = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
             if conv.state.mode == ConversionMode::Math {
@@ -2222,6 +2234,39 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "hspace" | "hspace*" => {
             let dim = conv.get_required_arg(&cmd, 0).unwrap_or_default();
             let _ = write!(output, "#h({})", convert_dimension(&dim));
+            space_in_math(conv, output);
+        }
+        // Zero-width overlaps. A box of zero width lets its content run on to
+        // the right; running to the left needs the content's width.
+        "rlap" if matches!(conv.state.mode, ConversionMode::Math) => {
+            let content = conv.convert_required_math_content(&cmd, 0).unwrap_or_default();
+            let _ = write!(output, "#box(width: 0pt, ${}$) ", content.trim());
+        }
+        "llap" if matches!(conv.state.mode, ConversionMode::Math) => {
+            let content = conv.convert_required_math_content(&cmd, 0).unwrap_or_default();
+            // No `let`: the T → L preprocessor hoists `let` bindings out of
+            // their block.
+            let content = content.trim();
+            let _ = write!(
+                output,
+                "#context {{ h(-measure(${content}$).width); ${content}$ }} "
+            );
+        }
+        "enskip" | "enspace" if matches!(conv.state.mode, ConversionMode::Math) => {
+            output.push_str("#h(0.5em) ");
+        }
+        "rule" => {
+            let width = convert_dimension(&conv.get_required_arg(&cmd, 0).unwrap_or_default());
+            let height = convert_dimension(&conv.get_required_arg(&cmd, 1).unwrap_or_default());
+            let baseline = conv
+                .get_optional_arg(&cmd, 0)
+                .map(|raise| format!(", baseline: {}", raised_baseline(&convert_dimension(&raise))))
+                .unwrap_or_default();
+            let _ = write!(
+                output,
+                "#box(width: {width}, height: {height}, fill: black{baseline})"
+            );
+            space_in_math(conv, output);
         }
         "vspace" | "vspace*" => {
             let dim = conv.get_required_arg(&cmd, 0).unwrap_or_default();
@@ -2255,8 +2300,12 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 output.push_str("  ");
             }
         }
+        // A control space, which mitex parses as a command with no name.
+        // Spaces in Typst math only separate tokens, and an argument of `\ `
+        // alone came out empty: `mono()`.
+        "" if matches!(conv.state.mode, ConversionMode::Math) => output.push_str(" space "),
         "!" | "negthinspace" => {}
-        "enspace" => output.push(' '),
+        "enskip" | "enspace" => output.push(' '),
 
         // Line breaks
         "newline" | "linebreak" => {
@@ -2445,30 +2494,20 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             // These are handled by ItemLR
         }
 
-        // Phantom and spacing - in math mode, use #hide() since hide() alone isn't a math function
-        "phantom" => {
+        // Phantom and spacing - in math mode, use #hide() since hide() alone isn't a math function.
+        // The equation inside is inline (`$0$`; `$ 0 $` is display math), and
+        // a space ends the call: `#hide[$0$](4)` takes `(4)` as arguments.
+        "phantom" | "hphantom" | "vphantom" => {
             let content = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
             if conv.state.mode == ConversionMode::Math {
-                let _ = write!(output, "#hide[$ {} $]", content.trim());
+                let _ = write!(output, "#hide[${}$] ", content.trim());
             } else {
                 let _ = write!(output, "#hide[{}]", content);
             }
         }
-        "hphantom" => {
-            let content = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            if conv.state.mode == ConversionMode::Math {
-                let _ = write!(output, "#hide[$ {} $]", content.trim());
-            } else {
-                let _ = write!(output, "#hide[{}]", content);
-            }
-        }
-        "vphantom" => {
-            let content = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            if conv.state.mode == ConversionMode::Math {
-                let _ = write!(output, "#hide[$ {} $]", content.trim());
-            } else {
-                let _ = write!(output, "#hide[{}]", content);
-            }
+        // A strut: no width, the height and depth of a parenthesis.
+        "mathstrut" if conv.state.mode == ConversionMode::Math => {
+            output.push_str("#hide[$\\($] ");
         }
 
         // Stacking - tex2typst style with limits()
@@ -2509,11 +2548,22 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         "protect" => {
             // ignore
         }
-        "mbox" | "makebox" | "hbox" => {
-            conv.state.push_env(EnvironmentContext::None);
-            let content = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
-            conv.state.pop_env();
-            let _ = write!(output, "\"{}\"", content);
+        // `\raisebox` takes text even in math, so `$…$` in it is its own
+        // math.
+        "raisebox" if conv.state.mode == ConversionMode::Math => {
+            let height = conv.get_required_arg(&cmd, 0).unwrap_or_default();
+            let content = convert_text_arg(conv, &cmd, 1);
+            let baseline = match typst_length(&height) {
+                Some(length)
+                    if length.starts_with('-')
+                        || length.trim_end_matches(char::is_alphabetic).parse::<f64>()
+                            != Ok(0.0) =>
+                {
+                    format!("(baseline: {})", raised_baseline(&length))
+                }
+                _ => String::new(),
+            };
+            let _ = write!(output, "#box{baseline}[{}] ", content.trim());
         }
         "raisebox" => {
             let _height = conv.get_required_arg(&cmd, 0);
@@ -3386,22 +3436,16 @@ fn expand_user_macro(conv: &mut LatexConverter, cmd: &CmdItem, macro_def: &Macro
 }
 
 /// Convert a LaTeX dimension to Typst
-fn convert_dimension(dim: &str) -> String {
+pub(super) fn convert_dimension(dim: &str) -> String {
     let dim = dim.trim();
 
     // Handle \linewidth, \textwidth, etc.
     if dim.contains("\\linewidth") || dim.contains("\\textwidth") || dim.contains("\\columnwidth") {
         // Extract multiplier if present
-        if let Some(mult) = dim.strip_suffix("\\linewidth") {
-            let mult = mult.trim();
-            if mult.is_empty() || mult == "1" {
-                return "100%".to_string();
-            }
-            if let Ok(f) = mult.parse::<f32>() {
-                return format!("{}%", (f * 100.0) as i32);
-            }
-        }
-        if let Some(mult) = dim.strip_suffix("\\textwidth") {
+        if let Some(mult) = dim
+            .strip_suffix("\\linewidth")
+            .or_else(|| dim.strip_suffix("\\textwidth"))
+        {
             let mult = mult.trim();
             if mult.is_empty() || mult == "1" {
                 return "100%".to_string();
@@ -3419,18 +3463,10 @@ fn convert_dimension(dim: &str) -> String {
         .replace("\\stretch", "1fr")
         .replace("\\hfill", "1fr");
 
-    // Already has a unit
-    if dim.ends_with("pt")
-        || dim.ends_with("em")
-        || dim.ends_with("ex")
-        || dim.ends_with("mm")
-        || dim.ends_with("cm")
-        || dim.ends_with("in")
-        || dim.ends_with("pc")
-        || dim.ends_with("bp")
-        || dim.ends_with("%")
-        || dim.ends_with("fr")
-    {
+    if let Some(length) = typst_length(&dim) {
+        return length;
+    }
+    if dim.ends_with('%') || dim.ends_with("fr") {
         return dim;
     }
 
@@ -3440,6 +3476,45 @@ fn convert_dimension(dim: &str) -> String {
     }
 
     dim
+}
+
+/// The Typst `baseline` of a box raised by the length `raise`: a positive
+/// baseline lowers a box.
+fn raised_baseline(raise: &str) -> String {
+    match raise.strip_prefix('-') {
+        Some(lower) => lower.to_string(),
+        None => format!("-{raise}"),
+    }
+}
+
+/// A TeX length such as `1 cm`, `.5ex` or `3mu` as a Typst length.
+///
+/// Typst has `pt`, `mm`, `cm`, `in` and `em`. The other TeX units become one
+/// of those: `ex` as 0.43 em (Computer Modern's x-height), `mu` as 1/18 em,
+/// and `pc`, `bp`, `px`, `dd`, `cc` and `sp` in points.
+fn typst_length(dim: &str) -> Option<String> {
+    let dim: String = dim.chars().filter(|c| !c.is_whitespace()).collect();
+    let unit_start = dim.find(|c: char| c.is_ascii_alphabetic())?;
+    let (number, unit) = dim.split_at(unit_start);
+    // Only the leading length counts: `.5 cm .` is `.5cm`.
+    let unit = &unit[..unit
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(unit.len())];
+    let value: f64 = number.replace(',', ".").parse().ok()?;
+    let (value, unit) = match unit {
+        "pt" | "mm" | "cm" | "in" | "em" => (value, unit),
+        "ex" => (value * 0.43, "em"),
+        "mu" => (value / 18.0, "em"),
+        "pc" => (value * 12.0, "pt"),
+        "bp" => (value * 72.27 / 72.0, "pt"),
+        "px" => (value * 0.75, "pt"),
+        "dd" => (value * 1238.0 / 1157.0, "pt"),
+        "cc" => (value * 12.0 * 1238.0 / 1157.0, "pt"),
+        "sp" => (value / 65536.0, "pt"),
+        _ => return None,
+    };
+    let rounded = (value * 1000.0).round() / 1000.0;
+    Some(format!("{rounded}{unit}"))
 }
 
 /// Apply a text accent to a character

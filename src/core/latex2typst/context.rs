@@ -2335,15 +2335,7 @@ impl LatexConverter {
             }
 
             // Newline command \\
-            ItemNewLine => match self.state.current_env() {
-                EnvironmentContext::Matrix => output.push_str("zws ;"),
-                EnvironmentContext::Cases => output.push(','),
-                EnvironmentContext::Align | EnvironmentContext::Equation => {
-                    output.push_str(" \\ ");
-                }
-                EnvironmentContext::Tabular => output.push_str("|||ROW|||"),
-                _ => output.push_str("\\ "),
-            },
+            ItemNewLine => self.push_row_break(output),
 
             // Ampersand (column separator)
             TokenAmpersand => match self.state.current_env() {
@@ -2710,6 +2702,19 @@ impl LatexConverter {
     // ============================================================
     // Math post-processing
     // ============================================================
+
+    /// Write a `\\` (or plain TeX's `\cr`) row break for the current environment.
+    pub(crate) fn push_row_break(&self, output: &mut String) {
+        match self.state.current_env() {
+            EnvironmentContext::Matrix => output.push_str("zws ;"),
+            EnvironmentContext::Cases => output.push_str(", "),
+            EnvironmentContext::Align | EnvironmentContext::Equation => {
+                output.push_str(" \\ ");
+            }
+            EnvironmentContext::Tabular => output.push_str("|||ROW|||"),
+            _ => output.push_str("\\ "),
+        }
+    }
 
     /// Post-process math output
     pub fn postprocess_math(&self, input: String) -> String {
