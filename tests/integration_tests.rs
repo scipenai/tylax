@@ -894,6 +894,24 @@ mod l2t_cli_parity {
             r"$\begin{cases} a & \hbox{x, y; z} \end{cases}$",
             r"$(\scriptstyle a) b$",
             r"$\frac{(\scriptstyle a}{b}$",
+            r"$\fbox{$x$ \\}$",
+            r"$\raisebox{2mm}{$x$ \\}$",
+            r"$\phantom{a\\}$",
+            r"$\hphantom{\\}$",
+            r"$\rlap{$x$}$",
+            r"$D\llap{$x$}$",
+            r"$\rlap{\(x\)}$",
+            r"$\rlap{foo $x$}$",
+            r"$\rlap{a\\}$",
+            r"$\rule[]{1cm}{1pt}$",
+            r"$\rule{}{1pt}$",
+            r"$a\kern --18mu b$",
+            r"$a\hspace{10pt plus 2pt}b$",
+            r"$\operatorname{a\ b}$",
+            r"$\begin{matrix} (a \cr b) \end{matrix}$",
+            r"$\begin{matrix} \displaystyle a \cr b \end{matrix}$",
+            r"$\begin{array}{*{2}{|c}} a & b \end{array}$",
+            r"\begin{tabular}{cc}a & b \cr c & d\end{tabular}",
         ] {
             let source = run_t2l_l2t_cli_no_preamble(formula);
             assert!(
@@ -11409,7 +11427,18 @@ mod corpus_tail_regressions {
     #[test]
     fn operator_control_space_comments_and_not_cleanup() {
         let op = latex_to_typst_with_diagnostics(r"$\operatorname{a\ b}$");
+        assert!(op.output.contains(r#"$op("a b")$"#), "got: {}", op.output);
         assert!(op.warnings.is_empty(), "{:?}", op.warnings);
+        assert_eq!(latex_to_typst(r"\operatorname{a\ b}"), r#"op("a b")"#);
+        assert_eq!(
+            latex_to_typst(r"\operatorname{lim\ sup}"),
+            r#"op("lim sup")"#
+        );
+        assert_eq!(latex_to_typst(r"\mathtt{\ }"), "mono(space)");
+        let trail = latex_math_to_typst_with_diagnostics(r"a\");
+        assert_eq!(trail.output.trim(), "a");
+        assert!(trail.warnings.is_empty(), "{:?}", trail.warnings);
+
         let sp = latex_math_to_typst_with_diagnostics(r"a\ b");
         assert_eq!(sp.output.trim(), "a space b");
         assert!(sp.warnings.is_empty(), "{:?}", sp.warnings);
@@ -11425,6 +11454,8 @@ mod corpus_tail_regressions {
         };
         let doc = latex_document_to_typst_with_options(r"\not{AB}", &no_preamble);
         assert!(doc.contains("cancel(A B)"), "got: {doc}");
+        let doc_space = latex_document_to_typst_with_options(r"a\ b", &no_preamble);
+        assert_eq!(doc_space.trim(), "a b");
     }
 
     /// An escaped `\(` neither groups nor breaks a row of `cases`.
@@ -11443,6 +11474,193 @@ mod corpus_tail_regressions {
         assert_eq!(
             latex_to_typst(r"\sqrt{\mathstrut x}"),
             r"sqrt(#hide[$\($] x)"
+        );
+    }
+
+    #[test]
+    fn cr_ends_rows_and_isolates_delimiters_and_styles_across_environments() {
+        let no_preamble = L2TOptions {
+            preamble: PreambleMode::None,
+            ..Default::default()
+        };
+        let tabular = latex_document_to_typst_with_options(
+            r"\begin{tabular}{cc}a & b \cr c & d\end{tabular}",
+            &no_preamble,
+        );
+        assert!(
+            tabular.contains("[a], [b],\n    [c], [d],"),
+            "expected two rows in tabular output, got:\n{tabular}"
+        );
+
+        assert_eq!(
+            latex_to_typst(r"\begin{matrix} (a \cr b) \end{matrix}"),
+            r"mat(delim: #none, \(a ; b \))"
+        );
+        assert_eq!(
+            latex_to_typst(r"\begin{matrix} \displaystyle a \cr b \end{matrix}"),
+            "mat(delim: #none, display(a); b)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\begin{array}{c} x \\ \displaystyle a [b \cr c] d \end{array}"),
+            r"mat(delim: #none, x ; display(a \[b); c \] d)"
+        );
+    }
+
+    #[test]
+    fn column_spec_preserves_inner_braces_and_bounds_repeats() {
+        assert_eq!(
+            latex_to_typst(r"\begin{array}{*{2}{|c}} a & b \end{array}"),
+            "mat(delim: #none, augment: #(vline: 1), a, b)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\begin{array}{*{2}{l|}} a & b \end{array}"),
+            "mat(delim: #none, augment: #(vline: 1), align: #left, a, b)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\begin{array}{p{3cm}|p{2cm}} a & b \\ c & d \end{array}"),
+            "mat(delim: #none, augment: #(vline: 1), align: #left, a, b ; c, d)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\begin{array}{@{*}l|l} a & b \end{array}"),
+            "mat(delim: #none, augment: #(vline: 1), align: #left, a, b)"
+        );
+
+        let no_preamble = L2TOptions {
+            preamble: PreambleMode::None,
+            ..Default::default()
+        };
+        let tabular = latex_document_to_typst_with_options(
+            r"\begin{tabular}{*{2}{|c}} a & b \end{tabular}",
+            &no_preamble,
+        );
+        assert!(tabular.contains("columns: (auto, auto)"), "got:\n{tabular}");
+        assert!(tabular.contains("table.vline(x: 0)"), "got:\n{tabular}");
+        assert!(tabular.contains("table.vline(x: 1)"), "got:\n{tabular}");
+
+        let huge_repeat = latex_to_typst(r"\begin{array}{*{999999999}{c}} a \end{array}");
+        assert_eq!(huge_repeat, "mat(delim: #none, a)");
+        let nested_huge = latex_to_typst(r"\begin{array}{*{100}{*{100}{c}}} a \end{array}");
+        assert_eq!(nested_huge, "mat(delim: #none, a)");
+    }
+
+    #[test]
+    fn boxes_phantoms_and_overlaps_handle_line_breaks_and_math_shifts() {
+        assert_eq!(
+            latex_to_typst(r"\fbox{$x$ \\}"),
+            r"#box(stroke: 0.5pt, inset: 2pt, baseline: 20%)[$x$ \ ]"
+        );
+        assert_eq!(
+            latex_to_typst(r"\fbox{[ $x$}"),
+            r"#box(stroke: 0.5pt, inset: 2pt, baseline: 20%)[\[ $x$]"
+        );
+        assert_eq!(
+            latex_to_typst(r"\fbox{a // b $x$}"),
+            r"#box(stroke: 0.5pt, inset: 2pt, baseline: 20%)[a /\/ b $x$]"
+        );
+        assert_eq!(
+            latex_to_typst(r"\raisebox{2mm}{$x$ \\}"),
+            r"#box(baseline: -2mm)[$x$ \ ]"
+        );
+        assert_eq!(latex_to_typst(r"\raisebox{-0pt}{x}"), "#box[x]");
+        assert_eq!(latex_to_typst(r"\phantom{a\\}"), "#hide[$a$]");
+        assert_eq!(latex_to_typst(r"\hphantom{\\}"), "#hide[$zws$]");
+
+        assert_eq!(latex_to_typst(r"\rlap{$x$}"), "#box(width: 0pt, $x$)");
+        assert_eq!(
+            latex_to_typst(r"D\llap{$x$}"),
+            "D #context { h(-measure($x$).width); $x$ }"
+        );
+        assert_eq!(latex_to_typst(r"\rlap{\(x\)}"), "#box(width: 0pt, $x$)");
+        assert_eq!(
+            latex_to_typst(r"\rlap{foo $x$}"),
+            "#box(width: 0pt)[foo $x$]"
+        );
+        assert_eq!(
+            latex_to_typst(r"D\llap{foo $x$}"),
+            "D #context { h(-measure([foo $x$]).width); [foo $x$] }"
+        );
+        assert_eq!(latex_to_typst(r"\rlap{a\\}"), "#box(width: 0pt, $a$)");
+        assert_eq!(
+            latex_to_typst(r"D\llap{a\\}"),
+            "D #context { h(-measure($a$).width); $a$ }"
+        );
+        assert_eq!(typst_to_latex("$#box(width: 0pt, $x$)$"), r"$\rlap{$x$}$");
+    }
+
+    #[test]
+    fn primitive_skips_preserve_source_offsets_and_ignore_comments_and_verb() {
+        let diag_src = "\\hskip 2pt + \\catcode";
+        let report = tylax::diagnostics::check_latex(diag_src);
+        let at = diag_src.find(r"\catcode").unwrap();
+        let d = report
+            .diagnostics
+            .iter()
+            .find(|d| d.message.contains(r"\catcode"))
+            .expect("expected diagnostic for \\catcode");
+        assert_eq!((d.line, d.column), (Some(1), Some(at + 1)));
+
+        let comment_diag = tylax::diagnostics::check_latex("% \\hskip 2pt\n\\catcode");
+        let comment_d = comment_diag
+            .diagnostics
+            .iter()
+            .find(|d| d.message.contains(r"\catcode"))
+            .expect("expected diagnostic for \\catcode");
+        assert_eq!((comment_d.line, comment_d.column), (Some(2), Some(1)));
+
+        let no_preamble = L2TOptions {
+            preamble: PreambleMode::None,
+            ..Default::default()
+        };
+        let macro_comment = latex_document_to_typst_with_options(
+            "\\newcommand{\\foo}[1]{#1 % \\hskip 2pt\nx}\n\\foo{y}",
+            &no_preamble,
+        );
+        assert!(!macro_comment.contains("#h("), "got: {macro_comment}");
+
+        let macro_verb = latex_document_to_typst_with_options(
+            "\\newcommand{\\foo}{\\verb|\\hskip 2pt|}\n\\foo",
+            &no_preamble,
+        );
+        assert!(macro_verb.contains(r"`\hskip 2pt`"), "got: {macro_verb}");
+    }
+
+    #[test]
+    fn dimensions_glue_rules_and_cmidrule_edge_cases() {
+        assert_eq!(latex_to_typst(r"a\kern --18mu b"), "a #h(1em) b");
+        assert_eq!(latex_to_typst(r"a\kern ---2pt b"), "a #h(-2pt) b");
+        assert!(!latex_to_typst(r"a\kern 1.2.3pt b").contains("#h(1.2.3pt)"));
+        assert_eq!(latex_to_typst(r"a\hspace{10pt plus 2pt}b"), "a #h(10pt) b");
+        assert_eq!(latex_to_typst(r"a\hspace{-0pt}b"), "a #h(0pt) b");
+
+        let huge_dim = format!(r"a\hspace{{{}pt}}b", "9".repeat(310));
+        let huge_out = latex_to_typst(&huge_dim);
+        assert!(!huge_out.contains("infpt"), "got: {huge_out}");
+
+        assert_eq!(
+            latex_to_typst(r"\rule[]{1cm}{1pt}"),
+            "#box(width: 1cm, height: 1pt, fill: black)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\rule{}{1pt}"),
+            "#box(width: 0pt, height: 1pt, fill: black)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\rule{1cm}{}"),
+            "#box(width: 1cm, height: 0pt, fill: black)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\rule[+2pt]{1cm}{1pt}"),
+            "#box(width: 1cm, height: 1pt, fill: black, baseline: -2pt)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\rule[0pt]{1cm}{1pt}"),
+            "#box(width: 1cm, height: 1pt, fill: black, baseline: 0pt)"
+        );
+        assert_eq!(
+            latex_to_typst(
+                r"\begin{array}{ccc} 1 & 2 & 3 \\ \cmidrule[0.4pt](lr){1-2} 4 & 5 & 6 \end{array}"
+            ),
+            "mat(delim: #none, 1, 2, 3 ; 4, 5, 6)"
         );
     }
 }

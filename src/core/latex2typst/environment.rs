@@ -6,10 +6,12 @@ use mitex_parser::syntax::{CmdItem, EnvItem, SyntaxElement, SyntaxKind, SyntaxNo
 use rowan::ast::AstNode;
 use std::fmt::Write;
 
-use super::context::{env_header_args, ConversionMode, EnvironmentContext, LatexConverter};
+use super::context::{
+    env_header_args_with_braces, ConversionMode, EnvironmentContext, LatexConverter,
+};
 use super::markup::convert_dimension;
 use super::table::{parse_with_grid_parser, CellAlign, FULL_RULE_MARKER, PARTIAL_RULE_MARKER};
-use super::utils::sanitize_label;
+use super::utils::{ends_with_unescaped_backslash, sanitize_label};
 use super::{ConversionWarning, WarningKind};
 use crate::data::constants::{CodeBlockOptions, TheoremStyle, LANGUAGE_MAP, THEOREM_TYPES};
 use crate::features::refs::label_to_typst;
@@ -836,24 +838,17 @@ pub(crate) fn convert_array_with_delim(
     conv.state.mode = prev_mode;
     conv.state.pop_env();
 
-    // `|` in the column spec becomes an `augment` line, as `\hline` does. A
-    // spec with `*{n}{…}` repetition gives no layout.
-    let spec = conv.get_env_required_arg(node, 0).unwrap_or_default();
-    let (rule_columns, align) = if spec.contains('*') {
-        (Vec::new(), None)
-    } else {
-        // TeX skips the spaces before a braced argument: `p {3cm}`.
-        let spec = parse_column_spec(&spec.replace(char::is_whitespace, ""));
-        // The alignment shared by every column, if it is not centred.
-        let align = match spec.columns.split_first() {
-            Some((first, rest)) if first != "c" && rest.iter().all(|a| a == first) => {
-                Some(if first == "l" { "left" } else { "right" })
-            }
-            _ => None,
-        };
-        (spec.vlines, align)
+    // `|` in the column spec becomes an `augment` line, as `\hline` does.
+    let spec = get_tabular_col_spec(node).unwrap_or_default();
+    let spec = parse_column_spec(&spec);
+    // The alignment shared by every column, if it is not centred.
+    let align = match spec.columns.split_first() {
+        Some((first, rest)) if first != "c" && rest.iter().all(|a| a == first) => {
+            Some(if first == "l" { "left" } else { "right" })
+        }
+        _ => None,
     };
-    write_mat(output, &content, delim_override, rule_columns, align);
+    write_mat(output, &content, delim_override, spec.vlines, align);
 }
 
 /// Write a converted matrix body as a `mat` call. `\hline` and the column
@@ -933,20 +928,41 @@ fn take_rule_markers(content: &str) -> (String, Vec<usize>) {
     // An escaped `\;` is content: `r^(*)= - r\;`.
     if let Some(body) = trimmed
         .strip_suffix(';')
-        .filter(|body| !body.ends_with('\\'))
+        .filter(|body| !ends_with_unescaped_backslash(body))
     {
         out.truncate(body.trim_end().len());
     }
     (out, rule_rows)
 }
 
+fn skip_balanced_delimiter(s: &str, open: char, close: char) -> Option<usize> {
+    let mut depth = 0usize;
+    for (idx, ch) in s.char_indices() {
+        if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(idx + ch.len_utf8());
+            }
+        }
+    }
+    None
+}
+
 /// Skip the column range that follows a partial rule, as math converts it:
-/// `\cline{1-2}` leaves `1 - 2` and `\cmidrule(lr){1-2}` leaves `(l r)1 - 2`.
+/// `\cline{1-2}` leaves `1 - 2` and `\cmidrule[0.4pt](lr){1-2}` leaves
+/// `[0.4 p t](l r)1 - 2`.
 fn skip_rule_range(s: &str) -> &str {
     let mut rest = s.trim_start();
+    if rest.starts_with('[') {
+        if let Some(end) = skip_balanced_delimiter(rest, '[', ']') {
+            rest = rest[end..].trim_start();
+        }
+    }
     if rest.starts_with('(') {
-        if let Some(end) = rest.find(')') {
-            rest = rest[end + 1..].trim_start();
+        if let Some(end) = skip_balanced_delimiter(rest, '(', ')') {
+            rest = rest[end..].trim_start();
         }
     }
     let digits = |s: &str| s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
@@ -1387,20 +1403,23 @@ fn convert_algorithm(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut 
 // Helper functions
 // =============================================================================
 
-/// Get the column specification from a tabular environment
-/// The col spec is in the first curly arg after the env name: \begin{tabular}{lccc}
+/// Get the column specification from a tabular or array environment.
+/// The col spec is in the last required curly arg: `\begin{tabular}{lccc}`.
 fn get_tabular_col_spec(node: &SyntaxNode) -> Option<String> {
     // The column spec is the LAST required slot for every shape in the family:
     // `tabular[pos]{cols}` as well as `tabular*{width}[pos]{cols}`.
-    env_header_args(node)
+    env_header_args_with_braces(node)
         .into_iter()
         .rfind(|arg| !arg.optional)
         .map(|arg| arg.content)
 }
 
-/// Skip over a braced group {...} if present.
+/// Skip over a braced group {...} if present (allowing TeX spaces before `{`).
 /// Handles nested braces correctly.
 fn skip_braced_group(chars: &mut std::iter::Peekable<std::str::Chars>) {
+    while chars.peek().is_some_and(|c| c.is_whitespace()) {
+        chars.next();
+    }
     if chars.peek() == Some(&'{') {
         let mut depth = 0;
         for ch in chars.by_ref() {
@@ -1418,9 +1437,12 @@ fn skip_braced_group(chars: &mut std::iter::Peekable<std::str::Chars>) {
     }
 }
 
-/// Extract content from a braced group {...} if present.
-/// Returns the content without the braces.
+/// Extract content from a braced group {...} if present (allowing TeX spaces
+/// before `{`). Returns the content without the braces.
 fn extract_braced_group(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String> {
+    while chars.peek().is_some_and(|c| c.is_whitespace()) {
+        chars.next();
+    }
     if chars.peek() != Some(&'{') {
         return None;
     }
@@ -1489,39 +1511,71 @@ fn parse_column_spec_full(spec: &str) -> ColumnSpec {
     parsed
 }
 
+const MAX_COL_SPEC_ITEMS: usize = 512;
+const MAX_COL_SPEC_DEPTH: usize = 8;
+
 /// Parse a column specification, keeping the vertical rules.
 ///
 /// The `|` separators are real table borders, not decoration, so they have to
 /// survive as structured information: once a table switches Typst's default
 /// grid off, nothing else would draw them (issue #43).
 fn parse_column_spec(spec: &str) -> ColumnSpec {
+    let mut budget = MAX_COL_SPEC_ITEMS;
+    parse_column_spec_bounded(spec, 0, &mut budget)
+}
+
+fn parse_column_spec_bounded(spec: &str, depth: usize, budget: &mut usize) -> ColumnSpec {
     let mut columns = Vec::new();
     let mut vlines = Vec::new();
     let mut chars = spec.chars().peekable();
 
     while let Some(c) = chars.next() {
+        if *budget == 0 {
+            break;
+        }
         match c {
-            'l' | 'c' | 'r' => columns.push(c.to_string()),
+            'l' | 'c' | 'r' => {
+                *budget -= 1;
+                columns.push(c.to_string());
+            }
             'p' | 'm' | 'b' | 'X' => {
                 skip_braced_group(&mut chars); // Skip width specification
+                *budget -= 1;
                 columns.push("l".to_string()); // Default to left
             }
             '*' => {
                 // Repeat specification *{n}{spec}
                 if let Some(count_str) = extract_braced_group(&mut chars) {
-                    let count: usize = count_str.parse().unwrap_or(1);
+                    let count: usize = count_str.trim().parse().unwrap_or(1);
                     if let Some(spec_str) = extract_braced_group(&mut chars) {
-                        let inner = parse_column_spec_full(&spec_str);
-                        for _ in 0..count {
-                            let base = columns.len();
-                            vlines.extend(inner.vlines.iter().map(|at| base + at));
-                            columns.extend(inner.columns.iter().cloned());
+                        if count > 0 && depth < MAX_COL_SPEC_DEPTH {
+                            let inner = parse_column_spec_bounded(&spec_str, depth + 1, budget);
+                            if inner.columns.is_empty() && inner.vlines.is_empty() {
+                                continue;
+                            }
+                            let item_cost = (inner.columns.len() + inner.vlines.len()).max(1);
+                            let mut remaining = count;
+                            while remaining > 0 {
+                                if remaining < count {
+                                    if *budget < item_cost {
+                                        break;
+                                    }
+                                    *budget -= item_cost;
+                                }
+                                let base = columns.len();
+                                vlines.extend(inner.vlines.iter().map(|at| base + at));
+                                columns.extend(inner.columns.iter().cloned());
+                                remaining -= 1;
+                            }
                         }
                     }
                 }
             }
             // A vertical rule sits at the boundary before the next column.
-            '|' => vlines.push(columns.len()),
+            '|' => {
+                *budget -= 1;
+                vlines.push(columns.len());
+            }
             '@' | '!' => skip_braced_group(&mut chars), // Skip @{} and !{} expressions
             '>' | '<' => skip_braced_group(&mut chars), // Skip column modifiers
             _ => {}

@@ -292,22 +292,37 @@ fn parse_tex_dimension(s: &str, allow_fil: bool) -> Option<(String, usize)> {
             *i += 1;
         }
     };
-    let mut dimension = String::new();
     skip_spaces(&mut i);
+    let mut negative = false;
     while i < bytes.len() && matches!(bytes[i], b'+' | b'-') {
         if bytes[i] == b'-' {
-            dimension.push('-');
+            negative = !negative;
         }
         i += 1;
         skip_spaces(&mut i);
     }
-    let number_start = i;
-    while i < bytes.len() && (bytes[i].is_ascii_digit() || matches!(bytes[i], b'.' | b',')) {
+    let mut number = String::new();
+    let mut seen_dot = false;
+    let mut has_digit = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_digit() {
+            has_digit = true;
+            number.push(b as char);
+        } else if matches!(b, b'.' | b',') && !seen_dot {
+            seen_dot = true;
+            number.push('.');
+        } else {
+            break;
+        }
         i += 1;
     }
-    let number = s[number_start..i].replace(',', ".");
-    if !number.chars().any(|c| c.is_ascii_digit()) {
+    if !has_digit {
         return None;
+    }
+    let mut dimension = String::new();
+    if negative {
+        dimension.push('-');
     }
     if number.starts_with('.') {
         dimension.push('0');
