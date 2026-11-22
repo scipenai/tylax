@@ -1649,7 +1649,7 @@ mod l2t_math {
         );
         assert_eq!(
             latex_to_typst(r"$\underbrace{x}_{\text{a, b}}$").trim(),
-            r#"$underbrace(x, #text[a, b])$"#
+            r#"$underbrace(x, "a, b")$"#
         );
     }
 
@@ -1900,20 +1900,20 @@ mod l2t_math {
         assert!(!s.contains("_(_("), "double subscript not collapsed: {s}");
         assert!(s.contains("V_(M - A B F)"), "collapsed form wrong: {s}");
 
-        // A base-less fragment gets an empty base `""` inserted.
+        // A base-less fragment gets an empty base `zws` inserted.
         let s = latex_to_typst(r"$^ { a , b }$");
-        assert!(s.starts_with(r#"$""^("#), "no empty base inserted: {s}");
+        assert!(s.starts_with("$zws^("), "no empty base inserted: {s}");
 
         let s = latex_to_typst(r"$_ { 1 - { \sqrt { 3 } } }$");
         assert!(
-            s.contains(r#""" _("#) || s.contains(r#"""_("#),
+            s.contains("zws _(") || s.contains("zws_("),
             "leading sub: {s}"
         );
 
         // A leading inner attachment inside a group also gets the empty base,
         // while a following attachment that already has a base is left alone.
         let s = latex_to_typst(r"$S _ { _ { \triangle U } _ { V } }$");
-        assert!(s.contains(r#"_(""_("#), "inner base-less not repaired: {s}");
+        assert!(s.contains("_(zws_("), "inner base-less not repaired: {s}");
 
         // Ordinary attachments with a real base must be untouched.
         let s = latex_to_typst(r"$a _ { 1 } + b ^ { 2 }$");
@@ -1982,7 +1982,7 @@ mod l2t_math {
     #[test]
     fn test_text_in_math() {
         let result = latex_to_typst(r"\text{hello}");
-        assert_eq!(result.trim(), "#text[hello]");
+        assert_eq!(result.trim(), r#""hello""#);
 
         let issue_label = latex_to_typst(r"\underbrace{U_p}_{\text{$p$th Layer}}");
         assert_eq!(
@@ -2045,10 +2045,10 @@ mod l2t_math {
     fn test_argmin() {
         // Test variants of argmin
 
-        // 1. operatorname with thin space (common)
+        // 1. operatorname with thin space (common), which stays a thin space
         let res1 = latex_to_typst(r"\operatorname*{arg\,min}_\theta");
         assert!(
-            res1.contains("argmin") || res1.contains("arg min"),
+            res1.contains(r"arg\u{2009}min"),
             "Failed for operatorname: {}",
             res1
         );
@@ -2066,11 +2066,11 @@ mod l2t_math {
         // Since DeclareMathOperator is ignored, argmin is unknown command -> outputs only argument (subscript)
         // This confirms the user's issue if they use \argmin defined this way.
         // But if they use \operatorname*{arg\,min}, it should work.
-        // If my fix works, res1 should be "limits(op("argmin"))_(\theta)"
+        // If my fix works, res1 should be "limits(op("arg\u{2009}min"))_(theta)"
 
         // Let's assert res1 specifically
         assert!(
-            res1.contains("limits(op(\"argmin\"))"),
+            res1.contains(r#"limits(op("arg\u{2009}min"))"#),
             "Strict check failed for operatorname: {}",
             res1
         );
@@ -2274,7 +2274,7 @@ mod l2t_math {
     fn attachment_repairs_are_reported_as_performed() {
         let result = latex_math_to_typst_with_diagnostics("^{2}");
         assert!(
-            result.output.contains("\"\"^("),
+            result.output.contains("zws^("),
             "the empty base must be kept so the output compiles, got: {}",
             result.output
         );
@@ -2293,7 +2293,7 @@ mod l2t_math {
             "\\documentclass{article}\n\\begin{document}\nText $^{2}$ end.\n\\end{document}\n",
         );
         assert!(
-            doc.output.contains("\"\"^("),
+            doc.output.contains("zws^("),
             "the document path must repair too, got: {}",
             doc.output
         );
@@ -9975,6 +9975,15 @@ mod fuzz_regressions {
         }
     }
 
+    #[test]
+    fn limits_on_an_operator_is_unchanged() {
+        assert_eq!(
+            latex_to_typst(r"\sum\limits_{i}^{n}"),
+            "limits(sum)_(i)^(n)"
+        );
+        assert_eq!(latex_to_typst(r"\_\limits"), r"limits(\_)");
+    }
+
     /// A huge `columns:` count sized allocations directly and exhausted memory.
     #[test]
     fn huge_table_column_count_is_rejected() {
@@ -10044,6 +10053,14 @@ mod fuzz_regressions {
         assert_eq!(latex_to_typst(r#"x = ""#), r#"x = \""#);
     }
 
+    /// A bare `_` in Typst math is a subscript.
+    #[test]
+    fn math_escaped_underscore_stays_escaped() {
+        assert_eq!(latex_to_typst(r"a\_b"), r"a \_b");
+        // Inside a string, `\_` is not a valid escape.
+        assert_eq!(latex_to_typst(r"\operatorname{a\_b}"), r#"op("a_b")"#);
+    }
+
     /// An unpaired `\{` inside a Typst call opens a group that swallows the `)`.
     #[test]
     fn escaped_brace_argument_is_escaped() {
@@ -10061,6 +10078,25 @@ mod fuzz_regressions {
         assert_eq!(latex_to_typst(r"x_("), r"x_(\()");
     }
 
+    /// Plain TeX font switches in math select the same fonts as the `\math..` commands.
+    #[test]
+    fn old_font_switches_in_math() {
+        assert_eq!(latex_to_typst(r"{\it x} + y"), "italic(x) + y");
+        assert_eq!(latex_to_typst(r"{\bf x} + y"), "upright(bold(x)) + y");
+        assert_eq!(latex_to_typst(r"{\rm x} + y"), "upright(x) + y");
+        assert_eq!(latex_to_typst(r"{\sf x} + y"), "sans(x) + y");
+        assert_eq!(latex_to_typst(r"{\tt x} + y"), "mono(x) + y");
+        assert_eq!(latex_to_typst(r"{\cal x} + y"), "cal(x) + y");
+        // In text, `\sf` used to drop its text.
+        assert_eq!(document_body(r"{\sf x} y"), "x y");
+    }
+
+    /// A trailing `\\` line break must not escape the closing bracket.
+    #[test]
+    fn trailing_line_break_in_argument() {
+        assert_eq!(document_body(r"\hl{\\}"), r"#highlight[\ ]");
+    }
+
     /// Typst's `<..>` label syntax rejects characters such as `~` and `=`.
     #[test]
     fn label_keys_outside_label_syntax() {
@@ -10074,6 +10110,25 @@ mod fuzz_regressions {
             document_body(r"\section{A}\label{s~1}"),
             r#"= A
 #label("s~1")"#
+        );
+    }
+
+    /// A group that opens with a script has an empty base, not the preceding `+`.
+    #[test]
+    fn group_starting_with_script_gets_empty_base() {
+        assert_eq!(latex_to_typst(r"a + {_i}"), "a + zws_(i)");
+    }
+
+    /// Plain TeX infix fractions and `\nolimits` have no Typst function of that name.
+    #[test]
+    fn infix_fractions_and_nolimits() {
+        assert_eq!(latex_to_typst(r"a \over b"), "frac(a, b)");
+        assert_eq!(latex_to_typst(r"{a+1 \over b} + c"), "frac(a + 1, b) + c");
+        assert_eq!(latex_to_typst(r"n \choose k"), "binom(n, k)");
+        assert_eq!(latex_to_typst(r"n \atop k"), "mat(delim: #none, n; k)");
+        assert_eq!(
+            latex_to_typst(r"\int\nolimits_0^1"),
+            "scripts(integral)_(0)^(1)"
         );
     }
 }
@@ -10157,6 +10212,26 @@ mod roundtrip_regressions {
         );
     }
 
+    /// Typst attaches primes only to the token right before them.
+    #[test]
+    fn primes_touch_their_base() {
+        assert_eq!(latex_to_typst(r"x'^{2}"), "x'^(2)");
+        assert_eq!(latex_to_typst(r"f''(x)"), "f''(x)");
+    }
+
+    /// `#text[a]` and `#underline[a]` take markup, which T → L could not read back.
+    #[test]
+    fn text_and_underline_in_math() {
+        assert_eq!(latex_to_typst(r"\text{a}"), r#""a""#);
+        assert_eq!(latex_to_typst(r#"\text{a"b\%c}"#), r#""a\"b%c""#);
+        assert_eq!(latex_to_typst(r"\sqrt{\text{a}}"), r#"sqrt("a")"#);
+        assert_eq!(latex_to_typst(r"\underline{a}"), "underline(a)");
+        // Inline math cannot go in a string, so it keeps the markup form.
+        assert_eq!(latex_to_typst(r"\text{$x$ b}"), "#text[$x$ b]");
+        assert_eq!(t2l(r#""a\"b%c""#), r#"\text{a"b\%c}"#);
+        assert_eq!(t2l(r#""a\\b""#), r"\text{a\textbackslash{}b}");
+    }
+
     /// Typst draws no delimiter for `lr(a)`, and inside `lr(` a bracket that
     /// does not balance opens a group: `\left( a \right.` gave `lr(( a)`.
     #[test]
@@ -10177,6 +10252,36 @@ mod roundtrip_regressions {
             t2l("lr(chevron.l { x } chevron.r)"),
             r"\left\langle\left\{x\right\}\right\rangle"
         );
+    }
+
+    /// An alignment cell is a TeX group, so `\displaystyle` ends at `&` or `\\`.
+    #[test]
+    fn displaystyle_ends_at_the_cell() {
+        assert_eq!(
+            latex_to_typst(r"\begin{cases}\displaystyle a \\ b\end{cases}"),
+            "cases(display(a), b)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\begin{pmatrix}\displaystyle a & b\end{pmatrix}"),
+            r#"mat(delim: "(", display(a), b)"#
+        );
+    }
+
+    /// `\operatorname` content that is not a plain name stays math; quoted, it
+    /// showed its Typst source as text.
+    #[test]
+    fn operatorname_content_stays_math() {
+        assert_eq!(
+            latex_to_typst(r"\operatorname{\mathbb{\chi}}"),
+            "op(bb(chi))"
+        );
+        assert_eq!(latex_to_typst(r"\operatorname{\alpha}"), "op(alpha)");
+        assert_eq!(latex_to_typst(r"\operatorname{T_2}"), "op(T_(2))");
+        assert_eq!(latex_to_typst(r"\operatorname{sn}"), r#"op("sn")"#);
+        assert_eq!(t2l("op(bb(chi))"), r"\operatorname{\mathbb{\chi}}");
+        assert_eq!(t2l(r#"op("sn")"#), r"\operatorname{sn}");
+        // `\mathbb` converts its argument, and keeps the spaces between letters.
+        assert_eq!(latex_to_typst(r"\mathbb{AB}"), "bb(A B)");
     }
 
     /// `limits` was dropped. LaTeX allows `\limits` only after an operator, so
@@ -10216,6 +10321,60 @@ mod roundtrip_regressions {
         );
     }
 
+    /// `\,` in `\operatorname` was dropped (`op("argmax")`). It stays as a thin
+    /// space, which T → L turns back into `\,`.
+    #[test]
+    fn operatorname_keeps_spacing() {
+        assert_eq!(
+            latex_to_typst(r"\operatorname{arg\,max}"),
+            r#"op("arg\u{2009}max")"#
+        );
+        assert_eq!(t2l(r#"op("arg\u{2009}max")"#), r"\operatorname{arg\,max}");
+        assert_eq!(
+            latex_to_typst(r"\operatorname{a\:b\;c}"),
+            r#"op("a\u{205F}b\u{2004}c")"#
+        );
+        assert_eq!(
+            t2l(r#"op("a\u{205F}b\u{2004}c")"#),
+            r"\operatorname{a\:b\;c}"
+        );
+    }
+
+    /// `\infty`, `\cdots` and `\ldots` ran into the next token (`infinity5`).
+    #[test]
+    fn symbols_keep_space_before_next_token() {
+        assert_eq!(latex_to_typst(r"\infty 5"), "infinity 5");
+        assert_eq!(latex_to_typst(r"\cdots {V}"), "dots.h.c V");
+        assert_eq!(latex_to_typst(r"\ldots p"), "... p");
+    }
+
+    /// A slash fraction ran into the next letter (`a/bx`), and took a script
+    /// on its denominator alone (`a/b^(2)`).
+    #[test]
+    fn slash_fraction_is_delimited() {
+        assert_eq!(latex_to_typst(r"\frac{a}{b}x"), "a/b x");
+        assert_eq!(latex_to_typst(r"\frac{a}{b}\tan x"), "a/b tan x");
+        assert_eq!(latex_to_typst(r"\frac{a}{b}^2"), "frac(a, b)^(2)");
+        assert_eq!(latex_to_typst(r"x^\frac{a}{b}"), "x^(a/b)");
+    }
+
+    /// `\binom` split its argument at a comma; `\dbinom` and `\tbinom` passed
+    /// through as unknown names.
+    #[test]
+    fn binom_family() {
+        assert_eq!(latex_to_typst(r"\binom{a , b}{c}"), r"binom(a\, b, c)");
+        assert_eq!(latex_to_typst(r"\dbinom{a}{b}"), "display(binom(a, b))");
+        assert_eq!(latex_to_typst(r"\tbinom{a}{b}"), "inline(binom(a, b))");
+    }
+
+    /// `\dddot` took no argument (`dot.triple x`).
+    #[test]
+    fn triple_and_quadruple_dot_accents() {
+        assert_eq!(latex_to_typst(r"\dddot{x}"), "dot.triple(x)");
+        assert_eq!(latex_to_typst(r"\ddddot{x}"), "dot.quad(x)");
+        assert_eq!(t2l("dot.triple(x)"), r"\dddot{x}");
+    }
+
     /// `mat(delim: "‖")` lost its delimiter.
     #[test]
     fn double_bar_matrix_is_vmatrix() {
@@ -10227,6 +10386,15 @@ mod roundtrip_regressions {
     #[test]
     fn operator_name_escapes_specials() {
         assert_eq!(t2l(r#"op("a_b")"#), r"\operatorname{a\_b}");
+    }
+
+    /// An empty string base gave `\text_a`, which loses its argument; a group
+    /// that opens with a script now uses `zws`, as `{}_a` does.
+    #[test]
+    fn empty_base_reads_back() {
+        assert_eq!(t2l(r#"""_(a) b"#), "{}_a b");
+        assert_eq!(latex_to_typst(r"{_a}b"), "zws_(a)b");
+        assert_eq!(latex_to_typst(r"{}_a"), "zws_(a)");
     }
 
     /// `nbsp`, `wj` and `shy` were dropped.
@@ -10250,6 +10418,21 @@ mod roundtrip_regressions {
         );
     }
 
+    /// An unknown command passed through with no warning.
+    #[test]
+    fn unknown_math_command_warns() {
+        let result = latex_to_typst_with_diagnostics(r"$\foo + \foo$");
+        let unknown: Vec<_> = result
+            .warnings
+            .iter()
+            .filter(|warning| warning.message.contains(r"\foo"))
+            .collect();
+        assert_eq!(unknown.len(), 1, "{:?}", result.warnings);
+        assert!(latex_to_typst_with_diagnostics(r"$\alpha$")
+            .warnings
+            .is_empty());
+    }
+
     /// `lr` took a bracket group at the edge of null-delimited content as its own
     /// delimiters: `\left. \left[ n \right] \right.` gave `lr([ n ])`.
     #[test]
@@ -10267,12 +10450,25 @@ mod roundtrip_regressions {
         assert_eq!(t2l("lr(a { b })"), r"\left.a\{b\right\}");
         assert_eq!(t2l("lr({ b } a)"), r"\left\{b\} a\right.");
     }
+
+    /// After a multi-byte character, symbol spacing read the wrong neighbours
+    /// and split `theta` (`† † th eta.alt`).
+    #[test]
+    fn symbol_spacing_after_multibyte_character() {
+        assert_eq!(latex_to_typst(r"\dag\dag\vartheta"), "† † theta.alt");
+    }
 }
 
 /// Output that compiled but drew something other than the LaTeX, found by the
 /// visual diff against MathJax (`tools/visual_diff/`).
 mod visual_regressions {
     use super::*;
+
+    fn t2l(math: &str) -> String {
+        typst_to_latex_with_options(math, &T2LOptions::math_only())
+            .trim()
+            .to_string()
+    }
 
     /// `\bigl(` and the other l/r size forms dropped their delimiter.
     #[test]
@@ -10325,6 +10521,20 @@ mod visual_regressions {
         assert_eq!(latex_to_typst(r"x \in \reals^n"), "x in RR^(n)");
     }
 
+    /// Text styles in math drew `*…*` and backticks literally.
+    #[test]
+    fn text_styles_in_math() {
+        assert_eq!(
+            latex_to_typst(r"\textbf{v} + \textit{w}"),
+            r#"bold("v") + italic("w")"#
+        );
+        assert_eq!(
+            latex_to_typst(r"\texttt{Log} \textsf{fin}"),
+            r#"mono("Log") sans("fin")"#
+        );
+        assert_eq!(t2l(r#"bold("v")"#), r"\boldsymbol{\text{v}}");
+    }
+
     /// `\displaystyle` inside `\left…\right` drew the word "display".
     #[test]
     fn displaystyle_inside_left_right() {
@@ -10337,12 +10547,50 @@ mod visual_regressions {
             "abs(display(sum_(i) x_(i)))"
         );
     }
+
+    /// `\scriptstyle` and `\scriptscriptstyle` were dropped.
+    #[test]
+    fn script_styles() {
+        assert_eq!(
+            latex_to_typst(r"{\scriptstyle a + b} + c"),
+            "script(a + b) + c"
+        );
+        assert_eq!(
+            latex_to_typst(r"x_{\scriptscriptstyle n}"),
+            "x_(sscript(n))"
+        );
+        assert_eq!(t2l("script(a + b) + c"), r"{\scriptstyle a + b} + c");
+        assert_eq!(t2l("sscript(n)"), r"{\scriptscriptstyle n}");
+    }
+
+    /// `j_(1)'` primes the subscript in Typst, drawing "(1)′".
+    #[test]
+    fn prime_after_subscript_goes_on_the_base() {
+        assert_eq!(latex_to_typst(r"j_1'"), "j'_(1)");
+        assert_eq!(latex_to_typst(r"j_1''"), "j''_(1)");
+        assert_eq!(latex_to_typst(r"f(x)'"), "f (x)'");
+    }
 }
 
 /// Output that Typst rejected, found by compiling the im2latex-100k and Math
 /// StackExchange corpora (`tests/corpus_compile_audit.rs`).
 mod corpus_compile_regressions {
     use super::*;
+
+    /// `\nonumber` and `\notag` passed through as identifiers.
+    #[test]
+    fn numbering_switches_are_dropped() {
+        assert_eq!(latex_to_typst(r"a = b \nonumber"), "a = b");
+        assert_eq!(latex_to_typst(r"a = b \notag"), "a = b");
+    }
+
+    /// The generic fallback wrote `check(H)` and `mathring(A)`.
+    #[test]
+    fn accents_use_typst_names() {
+        assert_eq!(latex_to_typst(r"\check{H}"), "caron(H)");
+        assert_eq!(latex_to_typst(r"\mathring{A}"), "circle(A)");
+        assert_eq!(latex_to_typst(r"\breve{a}"), "breve(a)");
+    }
 
     /// Symbols with no mapping, or a name Typst does not have.
     #[test]
@@ -10362,6 +10610,23 @@ mod corpus_compile_regressions {
         assert_eq!(latex_to_typst(r"\hbar"), "planck");
         assert_eq!(latex_to_typst(r"\sqcap"), "inter.sq");
         assert_eq!(latex_to_typst(r"\unlhd \unrhd"), "lt.tri.eq gt.tri.eq");
+    }
+
+    /// `\Bbb R` gave `BRR`.
+    #[test]
+    fn bbb_is_mathbb() {
+        assert_eq!(latex_to_typst(r"\Bbb R"), "RR");
+        assert_eq!(latex_to_typst(r"\Bbb{k}"), "bb(k)");
+    }
+
+    /// A trailing `\\` gave a `\` that escaped the closing `$`.
+    #[test]
+    fn trailing_line_break_is_dropped() {
+        assert_eq!(latex_to_typst(r"a\\"), "a");
+        assert_eq!(latex_to_typst(r"a \\ b \\"), r"a \ b");
+        assert!(!latex_to_typst_with_diagnostics(r"$a \\$")
+            .output
+            .contains(r"\$"));
     }
 }
 
@@ -10413,6 +10678,15 @@ mod typst_spacing_regressions {
     fn content_block_in_math() {
         assert_eq!(t2l("$x + #box[$y$ and $z$]$"), r"$x + y\text{ and } z$");
     }
+
+    /// The spaces at the edges of `\text{ if }` are typeset, and both
+    /// directions trimmed them, so `x\text{ if }y` rendered as "xify".
+    #[test]
+    fn text_keeps_edge_spaces() {
+        assert_eq!(latex_to_typst(r"x\text{ if }y"), r#"x " if " y"#);
+        assert_eq!(latex_to_typst(r"\text{a  b}"), r#""a b""#);
+        assert_eq!(t2l(r#"$x " and " y$"#), r"$x \text{ and } y$");
+    }
 }
 
 mod structural_regressions {
@@ -10422,6 +10696,16 @@ mod structural_regressions {
         typst_to_latex(input)
     }
 
+    /// A top-level `,` or `;` split the argument of `display(…)`.
+    #[test]
+    fn style_scope_protects_separators() {
+        assert_eq!(
+            latex_to_typst(r"\displaystyle m=0,u\ne0;"),
+            r"display(m = 0\,u != 0\;)"
+        );
+        assert_eq!(latex_to_typst(r"\sqrt{a;b}"), r"sqrt(a\;b)");
+    }
+
     #[test]
     fn augmented_matrix_back_to_array() {
         let latex = t2l(r#"$mat(delim: "(", augment: #(hline: 1, vline: 1), a, b ; c, d)$"#);
@@ -10429,6 +10713,17 @@ mod structural_regressions {
         assert!(latex.contains(r"\hline c & d"), "{latex}");
         let latex = t2l("$mat(delim: #none, align: #right, 1, 2 ; 3, 4)$");
         assert!(latex.contains(r"\begin{array}{rr}"), "{latex}");
+    }
+
+    /// `\not` appended `.not` to any symbol, giving `lt.double.not`.
+    #[test]
+    fn not_strikes_symbols_without_a_negation() {
+        assert_eq!(latex_to_typst(r"1\not \ll 2"), "1 cancel(lt.double) 2");
+        assert_eq!(latex_to_typst(r"a \not\asymp b"), "a asymp.not b");
+        assert_eq!(
+            latex_to_typst(r"i\not\!\partial"),
+            "i #box(width: 0pt, $slash$) partial"
+        );
     }
 }
 
@@ -10567,10 +10862,15 @@ mod delimiter_pairing_regressions {
 
     #[test]
     fn scriptstyle_keeps_balanced_enclosing_parentheses() {
-        assert_eq!(latex_to_typst(r"(\scriptstyle a) b"), "(a) b");
+        assert_eq!(latex_to_typst(r"(\scriptstyle a) b"), r"\(script(a \) b)");
+        assert_eq!(latex_to_typst(r"({\scriptstyle a}) b"), "(script(a)) b");
         assert_eq!(
             latex_to_typst(r"\frac{(\scriptstyle a}{b}"),
-            r"frac(\(a, b)"
+            r"frac(\(script(a), b)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\scriptstyle a, b; c"),
+            r"script(a\, b\; c)"
         );
     }
 
@@ -10603,6 +10903,30 @@ mod delimiter_pairing_regressions {
 mod corpus_tail_regressions {
     use super::*;
 
+    /// The index of `\sqrt` was copied raw: `root(\ alpha, z)`. A symbol
+    /// after `\sqrt` is its radicand: `\sqrt(2)` is the root of `(`.
+    #[test]
+    fn sqrt_index_and_symbol_radicand() {
+        assert_eq!(latex_to_typst(r"\sqrt[\alpha]{z}"), "root(alpha, z)");
+        assert_eq!(latex_to_typst(r"\sqrt(2)"), r"sqrt(\()2 \)");
+    }
+
+    #[test]
+    fn symbols() {
+        assert_eq!(latex_to_typst(r"A \subsetneqq B"), "A ⫋ B");
+        assert_eq!(typst_to_latex("$A ⫋ B$"), r"$A \subsetneqq B$");
+        assert_eq!(latex_to_typst(r"a \nleq b"), "a lt.eq.not b");
+        assert_eq!(latex_to_typst(r"\LaTeX"), r#"upright("LaTeX")"#);
+    }
+
+    /// Typst attaches nothing to an opening delimiter, and a script that
+    /// opens a group needs an empty base.
+    #[test]
+    fn scripts_next_to_opening_delimiters() {
+        assert_eq!(latex_to_typst(r"\Psi[^{a} G]"), r"Psi \[^(a) G \]");
+        assert_eq!(latex_to_typst(r"\left[ ^{2}K\right]"), "[zws^(2)K ]");
+    }
+
     /// Two bracket delimiters pair with each other, not with the body.
     #[test]
     fn left_right_pair_with_each_other() {
@@ -10620,6 +10944,15 @@ mod corpus_tail_regressions {
         assert_eq!(
             latex_to_typst(r"\begin{array}{cc} \big| a & b \big| \end{array}"),
             "mat(delim: #none, bar.v  a, b bar.v )"
+        );
+    }
+
+    /// `\\` is a token in an environment body, and ends a delimiter sequence.
+    #[test]
+    fn delimiters_do_not_pair_across_rows() {
+        assert_eq!(
+            latex_to_typst(r"\begin{array}{c} x \\ \displaystyle a [b \\ c] d \end{array}"),
+            r"mat(delim: #none, x ; display(a \[b); c \] d)"
         );
     }
 }

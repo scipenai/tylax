@@ -198,19 +198,6 @@ fn flatten_delimiter_sequence(
                     }
                 }
             }
-            // `\scriptstyle`/`\scriptscriptstyle` emit their greedy argument unwrapped,
-            // so delimiters inside stay in the enclosing sibling sequence.
-            SyntaxKind::ItemCmd
-                if is_command_named(&child, "scriptstyle")
-                    || is_command_named(&child, "scriptscriptstyle") =>
-            {
-                for arg in n
-                    .children()
-                    .filter(|c| c.kind() == SyntaxKind::ClauseArgument)
-                {
-                    flatten_delimiter_sequence(&arg, sequence, pending, unpaired);
-                }
-            }
             _ if ["displaystyle", "textstyle", "cal"]
                 .iter()
                 .any(|name| is_command_named(&child, name)) =>

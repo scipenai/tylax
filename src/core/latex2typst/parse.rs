@@ -146,12 +146,30 @@ pub(crate) fn parse_latex(input: &str, spec: CommandSpec) -> ParsedLatex {
                     // Consume an entire escaped Unicode character, not one of its bytes.
                     i = start + input[start..].chars().next().map_or(0, char::len_utf8);
                 } else {
-                    let wraps = spec.get_cmd(&input[start..end]).is_some_and(|cmd| {
+                    let name = &input[start..end];
+                    let wraps = spec.get_cmd(name).is_some_and(|cmd| {
                         matches!(cmd.args, ArgShape::Left1 | ArgShape::InfixGreedy)
                     });
                     if follows_script && wraps {
                         edits.push((i..i, "{".into()));
                         edits.push((end..end, "}".into()));
+                    }
+                    // TeX takes one token as `\sqrt`'s radicand, so `\sqrt(2)` is
+                    // the root of `(`, whereas mitex binds a symbol to nothing.
+                    if name == "sqrt" {
+                        let sym_pos = skip_spaces_and_comments(input, end);
+                        if let Some(symbol) = input[sym_pos..]
+                            .chars()
+                            .next()
+                            .filter(|&c| "()|<>.,;:!?+-=*/".contains(c))
+                        {
+                            let sym_end = sym_pos + symbol.len_utf8();
+                            edits.push((sym_pos..sym_pos, "{".into()));
+                            edits.push((sym_end..sym_end, "}".into()));
+                            i = sym_end;
+                            follows_script = false;
+                            continue;
+                        }
                     }
                     i = end;
                 }

@@ -293,7 +293,7 @@ COMMANDS_WITH_ARGS = {
     "newcommand": 2, "renewcommand": 2, "providecommand": 2, "DeclareMathOperator": 2,
     
     # Math formatting (1 arg)
-    "mathbf": 1, "mathit": 1, "mathrm": 1, "mathcal": 1, "mathbb": 1,
+    "mathbf": 1, "mathit": 1, "mathnormal": 1, "mathrm": 1, "mathcal": 1, "mathbb": 1, "Bbb": 1,
     "mathfrak": 1, "mathsf": 1, "mathtt": 1, "text": 1, "textrm": 1,
     "textbf": 1, "textit": 1, "texttt": 1, "textsc": 1, "emph": 1,
     "boldsymbol": 1, "bm": 1,
@@ -303,7 +303,7 @@ COMMANDS_WITH_ARGS = {
     "overline": 1, "underline": 1, "vec": 1, "overleftarrow": 1,
     "overleftrightarrow": 1, "overrightarrow": 1, "dot": 1, "ddot": 1,
     "overbrace": 1, "underbrace": 1, "check": 1, "acute": 1, "grave": 1,
-    "breve": 1,
+    "breve": 1, "dddot": 1, "ddddot": 1, "mathring": 1,
     
     # Limits and stacking (2 args)
     "overset": 2, "underset": 2, "stackrel": 2,
@@ -325,7 +325,8 @@ COMMANDS_WITH_ARGS = {
     "textcircled": 1,
     
     # Fractions and roots (2 args)
-    "frac": 2, "dfrac": 2, "tfrac": 2, "cfrac": 2, "binom": 2,
+    "frac": 2, "dfrac": 2, "tfrac": 2, "cfrac": 2, "binom": 2, "dbinom": 2,
+    "tbinom": 2,
     
     # Colors (1-3 args)
     "textcolor": 2, "colorbox": 2, "color": 1, "fcolorbox": 3,

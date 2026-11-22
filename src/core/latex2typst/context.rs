@@ -26,9 +26,10 @@ use super::{parse_latex, ConversionResult, ConversionWarning, WarningKind};
 
 use super::utils::{
     brackets_balanced, clean_whitespace, convert_caption_text, ends_with_unescaped_backslash,
-    extract_arg_content, extract_arg_content_with_braces, extract_curly_inner_content,
-    has_more_open_braces, protect_top_level_comma, protect_zero_arg_commands,
-    restore_protected_commands, sanitize_label, scan_brackets, BracketScanner,
+    extract_arg_content, extract_arg_content_untrimmed, extract_arg_content_with_braces,
+    extract_curly_inner_content, has_more_open_braces, protect_top_level_comma,
+    protect_zero_arg_commands, restore_protected_commands, sanitize_label, scan_brackets,
+    BracketScanner,
 };
 
 /// Marker for a `\big`-style vertical delimiter, paired during math cleanup.
@@ -562,6 +563,65 @@ fn is_required_clause(child: &SyntaxNode) -> bool {
         )
 }
 
+/// Trim math output, dropping line breaks at its end.
+///
+/// A trailing `\\` draws nothing in LaTeX, but its Typst `\` would escape the
+/// closing `$`: `$a\\$` gave `$a \$`.
+fn strip_trailing_line_breaks(math: &str) -> &str {
+    let mut math = math.trim();
+    while ends_with_unescaped_backslash(math) {
+        math = math[..math.len() - 1].trim_end();
+    }
+    math
+}
+
+/// Where the parenthesised scripts at the end of `output` begin, if any.
+///
+/// For `j_(1)` this is the index of `_`, and for `x_(a)^(b)` the index of the
+/// first `_`. A call such as `f(x)` has no script.
+fn trailing_scripts_start(output: &str) -> Option<usize> {
+    let mut end = output.len();
+    let mut start = None;
+    while output[..end].ends_with(')') {
+        let mut depth = 0usize;
+        let mut open = None;
+        for (index, c) in output[..end].char_indices().rev() {
+            match c {
+                ')' => depth += 1,
+                '(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        open = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let open = open?;
+        let marker = open.checked_sub(1)?;
+        if !matches!(output.as_bytes()[marker], b'_' | b'^') || output[..marker].ends_with('\\') {
+            break;
+        }
+        start = Some(marker);
+        end = marker;
+    }
+    start.filter(|&index| index > 0)
+}
+
+/// Trim a converted argument, keeping the space after a trailing `\` line break.
+///
+/// Without that space the `\` would escape whatever closes the argument, so
+/// `\hl{\\}` would give `#highlight[\]`.
+fn trim_converted_arg(output: &str) -> String {
+    let trimmed = output.trim();
+    if ends_with_unescaped_backslash(trimmed) {
+        format!("{trimmed} ")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn slash_is_between_mathy(elem: SyntaxElement) -> bool {
     let Some(prev) = nearest_non_trivia_sibling(&elem, false) else {
         return false;
@@ -834,8 +894,8 @@ pub(crate) struct AttachmentRepairs {
 }
 
 impl AttachmentRepairs {
-    /// An empty `""` base was inserted before a script Typst would reject.
-    fn note_empty_base(&self) {
+    /// An empty `zws` base was inserted before a script Typst would reject.
+    pub(crate) fn note_empty_base(&self) {
         self.empty_bases.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
@@ -1820,13 +1880,27 @@ impl LatexConverter {
             };
 
             if let Some(style) = style {
+                // An alignment cell is a TeX group, so the declaration ends at
+                // the next `&` or `\\`, not at the end of the environment.
+                let end = children[index + 1..]
+                    .iter()
+                    .position(|c| {
+                        matches!(
+                            c.kind(),
+                            SyntaxKind::ItemNewLine | SyntaxKind::TokenAmpersand
+                        )
+                    })
+                    .map_or(children.len(), |offset| index + 1 + offset);
                 let mut styled_content = String::new();
-                self.visit_elements(&children[index + 1..], &mut styled_content);
-                let styled_content = protect_top_level_comma(&styled_content);
+                self.visit_elements(&children[index + 1..end], &mut styled_content);
+                // The content is a call argument, so a top-level `,` or `;`
+                // must not split it: `\displaystyle m=0,u\ne0;`.
+                let styled_content = protect_top_level_comma(styled_content.trim());
                 if !styled_content.is_empty() {
                     let _ = write!(output, "{}({})", style, styled_content);
                 }
-                return;
+                index = end;
+                continue;
             }
 
             self.visit_element(child.clone(), output);
@@ -2208,7 +2282,27 @@ impl LatexConverter {
                     output.push_str("\\^");
                 }
             }
-            TokenApostrophe => output.push('\''),
+            TokenApostrophe => {
+                // Typst attaches primes only to the token right before them:
+                // `x '^(2)` is `x` followed by primes on an empty base.
+                if matches!(self.state.mode, ConversionMode::Math) {
+                    let base = output.trim_end();
+                    // Keep the space of a `\ ` line break, or `\'` becomes an escape.
+                    if !base.ends_with('\\') {
+                        output.truncate(base.len());
+                    }
+                    // In `j_(1)'` Typst primes the subscript, drawing "(1)′";
+                    // `j'_(1)` primes the base, as LaTeX's `j_1'` does.
+                    if let Some(start) = trailing_scripts_start(output) {
+                        let base_end = output[..start].trim_end().len();
+                        if base_end > 0 && !output[..base_end].ends_with('\\') {
+                            output.replace_range(base_end..start, "'");
+                            return;
+                        }
+                    }
+                }
+                output.push('\'');
+            }
             // A comma in a `cases` row or a matrix cell would separate cells, and
             // a semicolon would end the row.
             TokenComma | TokenSemicolon => {
@@ -2302,6 +2396,15 @@ impl LatexConverter {
         None
     }
 
+    /// `get_required_arg` with the edge spaces kept, for a text argument.
+    pub fn get_required_text_arg(&self, cmd: &CmdItem, index: usize) -> Option<String> {
+        cmd.syntax()
+            .children()
+            .filter(is_required_clause)
+            .nth(index)
+            .map(|child| extract_arg_content_untrimmed(&child))
+    }
+
     /// Get a required argument preserving inner braces
     pub fn get_required_arg_with_braces(&self, cmd: &CmdItem, index: usize) -> Option<String> {
         let mut required_count = 0;
@@ -2363,7 +2466,7 @@ impl LatexConverter {
                     })
                     .collect();
                 self.visit_elements(&content, &mut output);
-                return Some(output.trim().to_string());
+                return Some(trim_converted_arg(&output));
             }
             optional_count += 1;
         }
@@ -2395,7 +2498,7 @@ impl LatexConverter {
                         })
                         .collect();
                     self.visit_elements(&content, &mut output);
-                    return Some(output.trim().to_string());
+                    return Some(trim_converted_arg(&output));
                 }
                 required_count += 1;
             }
@@ -2506,7 +2609,7 @@ impl LatexConverter {
         // (`(_(` and leading `^(` are literal). Typst rejects these otherwise.
         result = self.fix_baseless_attachment(&result);
 
-        result.trim().to_string()
+        strip_trailing_line_breaks(&result).to_string()
     }
 
     /// Clean up math spacing
@@ -2536,7 +2639,7 @@ impl LatexConverter {
         result = self.fix_left_brace_cases(&result);
         result = self.fix_baseless_attachment(&result);
 
-        result.trim().to_string()
+        strip_trailing_line_breaks(&result).to_string()
     }
 
     /// Turn matched `\big|`/`\big\|` pairs into `abs(...)`/`norm(...)`. Only
@@ -2644,7 +2747,8 @@ impl LatexConverter {
                 if let Some(pos) = result[i..].find(symbol) {
                     let abs_pos = i + pos;
                     if abs_pos > 0 {
-                        let prev_char = result.chars().nth(abs_pos - 1).unwrap_or(' ');
+                        // `abs_pos` is a byte offset: after a `†` it is not a char index.
+                        let prev_char = result[..abs_pos].chars().next_back().unwrap_or(' ');
                         // Insert space if previous char is not a letter, space, or opening paren/bracket
                         if !prev_char.is_alphabetic()
                             && prev_char != ' '
@@ -2657,7 +2761,7 @@ impl LatexConverter {
                             // Check that we're not in the middle of a word
                             // e.g., don't change "tangent" when looking for "angle"
                             let after_symbol = abs_pos + symbol.len();
-                            let next_char = result.chars().nth(after_symbol);
+                            let next_char = result[after_symbol..].chars().next();
                             let is_word_boundary =
                                 next_char.is_none_or(|c| !c.is_alphanumeric() && c != '.');
 
@@ -2729,7 +2833,8 @@ impl LatexConverter {
                     "Z" => "ZZ".to_string(),
                     "Q" => "QQ".to_string(),
                     "C" => "CC".to_string(),
-                    _ => format!("bb({})", clean_content),
+                    // Keep the spaces: `bb(A B)` is two letters, `bb(AB)` a variable.
+                    _ => format!("bb({})", content.trim()),
                 };
 
                 let total_end = start + 3 + end + 1;
@@ -2800,26 +2905,35 @@ impl LatexConverter {
         result
     }
 
-    /// Insert an empty base `""` before a `_(`/`^(` attachment that has no base
-    /// (at the start of the string or right after an opening `(`). Both are
-    /// positions where Typst would otherwise report an unexpected `_`/`^`.
+    /// Insert an empty base `zws` before a `_(`/`^(` attachment that has no base:
+    /// at the start of the string, or right after an unescaped opening
+    /// delimiter or argument separator (`\left[ ^{2}K` gave `[^(2)K`). These
+    /// are positions where Typst would otherwise report an unexpected `_`/`^`.
+    /// `zws` is also how `{}_a` converts, so T -> L -> T reads it back the same.
     fn insert_empty_attachment_base(&self, input: &str) -> String {
         let mut out = String::with_capacity(input.len() + 4);
-        let mut last_nonspace: Option<char> = None;
+        // The last non-space character, and whether a backslash escaped it.
+        let mut last_nonspace: Option<(char, bool)> = None;
+        let mut escaped = false;
         let mut chars = input.chars().peekable();
         while let Some(c) = chars.next() {
             if (c == '_' || c == '^')
+                && !escaped
                 && chars.peek() == Some(&'(')
-                && matches!(last_nonspace, None | Some('('))
+                && matches!(
+                    last_nonspace,
+                    None | Some(('(' | '[' | '{' | ',' | ';' | '&', false))
+                )
             {
                 self.attachment_repairs.note_empty_base();
-                out.push_str("\"\"");
-                last_nonspace = Some('"');
+                out.push_str("zws");
+                last_nonspace = Some(('s', false));
             }
             out.push(c);
             if !c.is_whitespace() {
-                last_nonspace = Some(c);
+                last_nonspace = Some((c, escaped));
             }
+            escaped = c == '\\' && !escaped;
         }
         out
     }

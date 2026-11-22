@@ -392,10 +392,6 @@ lazy_static! {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("dagger.double".to_string()),
         }));
-        m.insert("dddot".to_string(), CommandSpecItem::Cmd(CmdShape {
-            args: ArgShape::Right { pattern: ArgPattern::None },
-            alias: Some("dot.triple".to_string()),
-        }));
         m.insert("ddots".to_string(), CommandSpecItem::Cmd(CmdShape {
             args: ArgShape::Right { pattern: ArgPattern::None },
             alias: Some("dots.down".to_string()),
@@ -1533,6 +1529,7 @@ lazy_static! {
         m.insert("Acf".to_string(), cmd1());
         m.insert("Acl".to_string(), cmd1());
         m.insert("Acs".to_string(), cmd1());
+        m.insert("Bbb".to_string(), cmd1());
         m.insert("Bqty".to_string(), cmd1());
         m.insert("Cref".to_string(), cmd1());
         m.insert("DeclareMathOperator".to_string(), cmd2());
@@ -1587,6 +1584,9 @@ lazy_static! {
         m.insert("cref".to_string(), cmd1());
         m.insert("curl".to_string(), cmd1());
         m.insert("date".to_string(), cmd1());
+        m.insert("dbinom".to_string(), cmd2());
+        m.insert("ddddot".to_string(), cmd1());
+        m.insert("dddot".to_string(), cmd1());
         m.insert("ddot".to_string(), cmd1());
         m.insert("dfrac".to_string(), cmd2());
         m.insert("diagonalmatrix".to_string(), cmd1());
@@ -1639,11 +1639,13 @@ lazy_static! {
         m.insert("mathfrak".to_string(), cmd1());
         m.insert("mathinner".to_string(), cmd1());
         m.insert("mathit".to_string(), cmd1());
+        m.insert("mathnormal".to_string(), cmd1());
         m.insert("mathop".to_string(), cmd1());
         m.insert("mathopen".to_string(), cmd1());
         m.insert("mathord".to_string(), cmd1());
         m.insert("mathpunct".to_string(), cmd1());
         m.insert("mathrel".to_string(), cmd1());
+        m.insert("mathring".to_string(), cmd1());
         m.insert("mathrm".to_string(), cmd1());
         m.insert("mathsf".to_string(), cmd1());
         m.insert("mathtt".to_string(), cmd1());
@@ -1702,6 +1704,7 @@ lazy_static! {
         m.insert("spmqty".to_string(), cmd1());
         m.insert("stackrel".to_string(), cmd2());
         m.insert("svmqty".to_string(), cmd1());
+        m.insert("tbinom".to_string(), cmd2());
         m.insert("text".to_string(), cmd1());
         m.insert("textbf".to_string(), cmd1());
         m.insert("textcircled".to_string(), cmd1());
