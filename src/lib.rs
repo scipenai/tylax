@@ -529,11 +529,11 @@ Math: $\norm{\xvec} = \sqrt{\inner{\xvec}{\xvec}}$
         let result = latex_to_typst(input);
         eprintln!("langle in sqrt result: {}", result);
 
-        // Should have {} wrapper around the content to protect the comma
-        // sqrt({angle.l x, y angle.r}) instead of sqrt(angle.l x, y angle.r)
+        // The comma is escaped, since braces would be drawn:
+        // sqrt(chevron.l x\, y chevron.r) instead of sqrt(chevron.l x, y chevron.r)
         assert!(
-            result.contains("sqrt({"),
-            "Should have sqrt({{...}}) wrapper to protect comma, got: {}",
+            result.contains(r"x\, y"),
+            "Should escape the comma, got: {}",
             result
         );
         assert!(

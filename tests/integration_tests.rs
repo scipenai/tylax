@@ -1593,15 +1593,15 @@ mod l2t_math {
     #[test]
     fn test_brace_annotation_top_level_comma_is_protected() {
         // A top-level comma in the label/body would make `underbrace(body,
-        // label)` parse as extra positional arguments, so the operand is wrapped
-        // in `{}` while still folding into the brace annotation.
+        // label)` parse as extra positional arguments, so the comma is escaped
+        // while still folding into the brace annotation.
         assert_eq!(
             latex_to_typst(r"$\underbrace{x}_{a, b}$").trim(),
-            "$underbrace(x, {a, b})$"
+            r"$underbrace(x, a\, b)$"
         );
         assert_eq!(
             latex_to_typst(r"$\underbrace{a, b}_{c}$").trim(),
-            "$underbrace({a, b}, c)$"
+            r"$underbrace(a\, b, c)$"
         );
         // Commas nested inside parens or a string literal are not top-level, so
         // these still fold safely.
@@ -1673,7 +1673,7 @@ mod l2t_math {
         assert_eq!(latex_to_typst(r"\Big\|x\Big\|").trim(), "norm(x)");
         assert_eq!(
             latex_to_typst(r"\big|x, y\big|").trim(),
-            "abs({x, y})",
+            r"abs(x\, y)",
             "a comma stays inside the absolute-value operand"
         );
 
@@ -9999,6 +9999,30 @@ mod fuzz_regressions {
             .to_string()
     }
 
+    /// A bare `"` in Typst math opens a string.
+    #[test]
+    fn math_double_quote_is_escaped() {
+        assert_eq!(latex_to_typst(r#"x = "y""#), r#"x = \"y \""#);
+        assert_eq!(latex_to_typst(r#"x = ""#), r#"x = \""#);
+    }
+
+    /// An unpaired `\{` inside a Typst call opens a group that swallows the `)`.
+    #[test]
+    fn escaped_brace_argument_is_escaped() {
+        assert_eq!(latex_to_typst(r"\frac\{a"), r"frac(\{, a)");
+        assert_eq!(latex_to_typst(r"\frac{\{a}{b}"), r"frac(\{a, b)");
+        // Paired braces need no escape.
+        assert_eq!(latex_to_typst(r"\{a, b\}"), "{a, b }");
+    }
+
+    /// TeX takes one token as an argument, so `\mathbf(x)` is `\mathbf{(}x)`.
+    #[test]
+    fn delimiter_argument_is_escaped() {
+        assert_eq!(latex_to_typst(r"\mathbf(x)"), r"upright(bold(\()) x \)");
+        assert_eq!(latex_to_typst(r"\frac(a"), r"frac(\(, a)");
+        assert_eq!(latex_to_typst(r"x_("), r"x_(\()");
+    }
+
     /// Typst's `<..>` label syntax rejects characters such as `~` and `=`.
     #[test]
     fn label_keys_outside_label_syntax() {
@@ -10024,6 +10048,34 @@ mod roundtrip_regressions {
         typst_to_latex_with_options(math, &T2LOptions::math_only())
             .trim()
             .to_string()
+    }
+
+    /// `EE` is the double-struck E, not `\exists`; `tilde` is the operator `∼`.
+    #[test]
+    fn typst_symbols_map_to_the_same_symbol() {
+        assert_eq!(t2l("EE AA"), r"\mathbb{E} \mathbb{A}");
+        assert_eq!(t2l("a tilde b"), r"a \sim b");
+        assert_eq!(t2l("tack.t tack.b"), r"\bot \top");
+        assert_eq!(t2l("star.op"), r"\star");
+    }
+
+    /// A one-character table value is literal: a backslash made `|` a double bar,
+    /// `~` an accent, `(` the start of inline math, and `Rho` (`P`) a pilcrow.
+    #[test]
+    fn literal_table_values_gain_no_backslash() {
+        assert_eq!(t2l("bar.v x bar.v"), r"\vert x \vert");
+        assert_eq!(t2l("a space.nobreak b"), "a ~ b");
+        assert_eq!(t2l("paren.l a paren.r"), "( a )");
+        assert_eq!(t2l("Rho Alpha"), "P A");
+        assert_eq!(t2l("section thin"), r"\S \,");
+    }
+
+    /// An unmapped name was copied as letters, which L → T split apart.
+    #[test]
+    fn typst_symbols_without_a_hand_written_mapping() {
+        assert_eq!(t2l("a slash b bot"), r"a / b \bot");
+        assert_eq!(t2l("triangle.stroked.small.b"), r"\triangledown");
+        assert_eq!(t2l("dot.double(x)"), r"\ddot{x}");
     }
 
     /// A name that no table maps is still copied, but now with a warning.
@@ -10067,6 +10119,19 @@ mod roundtrip_regressions {
         );
     }
 
+    /// Typst draws no delimiter for `lr(a)`, and inside `lr(` a bracket that
+    /// does not balance opens a group: `\left( a \right.` gave `lr(( a)`.
+    #[test]
+    fn lr_with_null_or_unpaired_delimiters() {
+        assert_eq!(latex_to_typst(r"\left. a \right."), "lr(a)");
+        assert_eq!(t2l("lr(a)"), r"\left.a\right.");
+        assert_eq!(latex_to_typst(r"\left( a \right."), "lr(paren.l a)");
+        assert_eq!(t2l("lr(paren.l a)"), r"\left(a\right.");
+        assert_eq!(latex_to_typst(r"\left. a \right)"), "lr(a paren.r)");
+        // A bracket in the body that pairs with the delimiter keeps its form.
+        assert_eq!(latex_to_typst(r"\left. \ln ( x \right)"), "lr(ln (x))");
+    }
+
     /// `{ x }` inside `lr` is a pair of literal braces, not a LaTeX group.
     #[test]
     fn braces_inside_lr() {
@@ -10098,6 +10163,21 @@ mod roundtrip_regressions {
         assert_eq!(latex_to_typst("x^2_3"), "x^(2)_(3)");
     }
 
+    /// A comma in `\left\{ … \right.` content was a column, which dropped it.
+    #[test]
+    fn cases_comma_is_escaped() {
+        assert_eq!(latex_to_typst(r"\left\{ a, b \right."), r"cases(a\, b)");
+        assert_eq!(
+            latex_to_typst(r"\left\{ x, x>0 \\ -x, x<0 \right."),
+            r"cases(x\, x > 0, - x\, x < 0)"
+        );
+        // A comma in a rendered `mat` still separates columns.
+        assert_eq!(
+            latex_to_typst(r"\left\{ \begin{array}{ll} a, b & c \end{array} \right."),
+            r"cases(a\, b & c)"
+        );
+    }
+
     /// `mat(delim: "‖")` lost its delimiter.
     #[test]
     fn double_bar_matrix_is_vmatrix() {
@@ -10119,11 +10199,131 @@ mod roundtrip_regressions {
         assert_eq!(t2l("a shy b"), r"a \- b");
     }
 
+    /// Bars round a delimited matrix keep the `lr` form, however the matrix is written.
+    #[test]
+    fn bars_round_delimited_matrix() {
+        assert_eq!(
+            latex_to_typst(r"\left| \left( \begin{matrix} a \end{matrix} \right) \right|"),
+            r#"lr(bar.v mat(delim: "(", a) bar.v)"#
+        );
+        assert_eq!(
+            latex_to_typst(r"\left\| \left[ \begin{matrix} a \end{matrix} \right] \right\|"),
+            r#"lr(bar.v.double mat(delim: "[", a) bar.v.double)"#
+        );
+    }
+
+    /// `lr` took a bracket group at the edge of null-delimited content as its own
+    /// delimiters: `\left. \left[ n \right] \right.` gave `lr([ n ])`.
+    #[test]
+    fn null_lr_round_bracket_group() {
+        assert_eq!(latex_to_typst(r"\left. \left[ n \right] \right."), "[ n ]");
+        assert_eq!(
+            latex_to_typst(r"\left. \left( b \right) a \right."),
+            "(b) a"
+        );
+    }
+
     /// A brace group split at the edge of `lr` left a LaTeX group open.
     #[test]
     fn lr_edge_brace_is_literal() {
         assert_eq!(t2l("lr(a { b })"), r"\left.a\{b\right\}");
         assert_eq!(t2l("lr({ b } a)"), r"\left\{b\} a\right.");
+    }
+}
+
+/// Output that compiled but drew something other than the LaTeX, found by the
+/// visual diff against MathJax (`tools/visual_diff/`).
+mod visual_regressions {
+    use super::*;
+
+    /// `\bigl(` and the other l/r size forms dropped their delimiter.
+    #[test]
+    fn sized_left_right_delimiters_are_kept() {
+        assert_eq!(latex_to_typst(r"3\bigl( a + d\bigr) + 1"), "3 (a + d) + 1");
+        assert_eq!(
+            latex_to_typst(r"\Bigl\langle a \Bigr\rangle"),
+            "chevron.l a chevron.r"
+        );
+        assert_eq!(latex_to_typst(r"\Bigl| x \Bigr|"), "abs(x)");
+    }
+
+    /// The parser reads `[` after `\big` as the argument, which the usual
+    /// argument getters skip as optional.
+    #[test]
+    fn sized_square_brackets_are_kept() {
+        assert_eq!(latex_to_typst(r"\bigl[ a \bigr]"), "[ a ]");
+        // Unpaired, so escaped like a bare `] a [`.
+        assert_eq!(latex_to_typst(r"\big] a \big["), r"\] a \[");
+    }
+
+    /// A lone `/` in Typst math is a fraction.
+    #[test]
+    fn sized_slash_is_a_symbol() {
+        assert_eq!(latex_to_typst(r"\big/"), "slash");
+        assert_eq!(
+            latex_to_typst(r"\left/ a \right\backslash"),
+            "lr(slash a backslash)"
+        );
+    }
+
+    /// `\left<` drew a less-than sign.
+    #[test]
+    fn angle_delimiters_are_chevrons() {
+        assert_eq!(
+            latex_to_typst(r"\left< x \right>"),
+            "lr(chevron.l x chevron.r)"
+        );
+        assert_eq!(latex_to_typst(r"\Big< a \Big>"), "chevron.l a chevron.r");
+        assert_eq!(latex_to_typst(r"\left\lbrack a \right\rbrack"), "[ a ]");
+    }
+
+    /// KaTeX's `\R`, `\N` and `\Z` passed through as plain letters.
+    #[test]
+    fn katex_number_sets() {
+        assert_eq!(
+            latex_to_typst(r"\R + \N + \Z + \Complex"),
+            "RR + NN + ZZ + CC"
+        );
+        assert_eq!(latex_to_typst(r"x \in \reals^n"), "x in RR^(n)");
+    }
+
+    /// `\displaystyle` inside `\left…\right` drew the word "display".
+    #[test]
+    fn displaystyle_inside_left_right() {
+        assert_eq!(
+            latex_to_typst(r"\ln\left(\displaystyle\frac{r}{a}\right)"),
+            "ln (display(r/a))"
+        );
+        assert_eq!(
+            latex_to_typst(r"\left| \displaystyle \sum_i x_i \right|"),
+            "abs(display(sum_(i) x_(i)))"
+        );
+    }
+}
+
+/// Output that Typst rejected, found by compiling the im2latex-100k and Math
+/// StackExchange corpora (`tests/corpus_compile_audit.rs`).
+mod corpus_compile_regressions {
+    use super::*;
+
+    /// Symbols with no mapping, or a name Typst does not have.
+    #[test]
+    fn unmapped_symbols() {
+        assert_eq!(latex_to_typst(r"\wp"), "℘");
+        assert_eq!(latex_to_typst(r"a \cdotp b"), "a dot b");
+        assert_eq!(latex_to_typst(r"\Box"), "square");
+        assert_eq!(latex_to_typst(r"A \subsetneq B"), "A subset.neq B");
+        assert_eq!(latex_to_typst(r"A \supsetneq B"), "A supset.neq B");
+        assert_eq!(latex_to_typst(r"x \owns y"), "x in.rev y");
+        assert_eq!(latex_to_typst(r"A \uplus B"), "A union.plus B");
+    }
+
+    /// `sect` is deprecated in codex 0.2, and `triangle.l.eq` does not exist.
+    #[test]
+    fn deprecated_and_invalid_symbol_names() {
+        assert_eq!(latex_to_typst(r"\hbar"), "planck");
+        assert_eq!(latex_to_typst(r"\sqcap"), "inter.sq");
+        assert_eq!(latex_to_typst(r"\unlhd \unrhd"), "lt.tri.eq gt.tri.eq");
     }
 }
 
@@ -10197,6 +10397,41 @@ mod structural_regressions {
 mod delimiter_pairing_regressions {
     use super::*;
 
+    /// A `;` in a `cases` row or matrix cell ended the row.
+    #[test]
+    fn semicolon_in_cell_is_escaped() {
+        assert_eq!(
+            latex_to_typst(r"\left\{\begin{array}{lc} a=0; \\ b=1. \end{array}\right."),
+            r"cases(a = 0\;, b = 1 .)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\begin{cases} a;b & x \end{cases}"),
+            r"cases(a\;b & x)"
+        );
+    }
+
+    /// Delimiters pair within their own group. A group with an unpaired one
+    /// escaped it, but its partner outside the group stayed bare, and Typst
+    /// read it as unclosed: `det (e^(- i theta^(0)\)))`.
+    #[test]
+    fn delimiters_pair_within_their_group() {
+        assert_eq!(
+            latex_to_typst(r"\frac{1}{\det(e^{-i \theta^0)}}"),
+            r"frac(1, det \(e^(- i theta^(0)\)))"
+        );
+        assert_eq!(latex_to_typst(r"\mu(T_c^)"), r"mu \(T_(c)^(\))");
+        assert_eq!(
+            latex_to_typst(r"\left\langle d (\xi\right\rangle"),
+            r"lr(chevron.l d \(xi chevron.r)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\frac{\exp[2(x-y)/V}{1}"),
+            r"frac(exp \[2 (x - y) slash V, 1)"
+        );
+        // Any opener pairs with any closer, as in Typst.
+        assert_eq!(latex_to_typst(r"[0,1)"), "[0,1)");
+    }
+
     /// The script strip read an escaped `\)` as closing the group.
     #[test]
     fn escaped_delimiter_in_script() {
@@ -10207,5 +10442,29 @@ mod delimiter_pairing_regressions {
         assert_eq!(typst_to_latex("$x^(\\))$"), r"$x^{)}$");
         assert_eq!(typst_to_latex("$x^(\\(a\\))$"), r"$x^{{(a)}}$");
         assert_eq!(typst_to_latex("$a \\} b$"), r"$a \} b$");
+    }
+}
+
+mod corpus_tail_regressions {
+    use super::*;
+
+    /// Two bracket delimiters pair with each other, not with the body.
+    #[test]
+    fn left_right_pair_with_each_other() {
+        assert_eq!(latex_to_typst(r"\left( a-1)\right)"), r"(a - 1 \))");
+    }
+
+    /// Bars pair only around one operand: not across cells, rows or the
+    /// arguments of a call.
+    #[test]
+    fn sized_bars_pair_within_one_operand() {
+        assert_eq!(
+            latex_to_typst(r"\frac{a\big|_{b}}{c\big|_{d}}"),
+            "frac(a bar.v _(b), c bar.v _(d))"
+        );
+        assert_eq!(
+            latex_to_typst(r"\begin{array}{cc} \big| a & b \big| \end{array}"),
+            "mat(delim: #none, bar.v  a, b bar.v )"
+        );
     }
 }
