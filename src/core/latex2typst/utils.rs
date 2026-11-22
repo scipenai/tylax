@@ -189,6 +189,12 @@ pub fn extract_node_text_with_braces(node: &SyntaxNode) -> String {
 
 /// Extract text content from an argument node
 pub fn extract_arg_content(node: &SyntaxNode) -> String {
+    extract_arg_content_untrimmed(node).trim().to_string()
+}
+
+/// `extract_arg_content` with the edge spaces kept, for text arguments, where
+/// they are typeset: `x\text{ if }y`.
+pub fn extract_arg_content_untrimmed(node: &SyntaxNode) -> String {
     let mut content = String::new();
     for child in node.children_with_tokens() {
         match child.kind() {
@@ -210,7 +216,7 @@ pub fn extract_arg_content(node: &SyntaxNode) -> String {
             }
         }
     }
-    content.trim().to_string()
+    content
 }
 
 /// Extract argument content preserving inner braces but stripping outermost

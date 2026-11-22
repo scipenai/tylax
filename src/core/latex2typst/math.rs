@@ -6,7 +6,7 @@ use mitex_parser::syntax::{CmdItem, EnvItem, FormulaItem, SyntaxElement, SyntaxK
 use rowan::ast::AstNode;
 use std::fmt::Write;
 
-use super::context::{ConversionMode, LatexConverter};
+use super::context::{ConversionMode, LatexConverter, TrailingScript};
 use super::environment::{convert_array_with_delim, convert_matrix_with_delim};
 use super::utils::{
     brackets_balanced, has_more_open_braces, protect_top_level_comma, scan_brackets,
@@ -61,6 +61,7 @@ pub fn convert_curly(conv: &mut LatexConverter, elem: SyntaxElement, output: &mu
             &mut conv.citations.pending,
             output,
         );
+        conv.trailing_script = None;
         return;
     }
 
@@ -68,6 +69,7 @@ pub fn convert_curly(conv: &mut LatexConverter, elem: SyntaxElement, output: &mu
     if let Some(op) = conv.state.pending_op.take() {
         // This group is the argument for a pending operator
         let mut content = String::new();
+        conv.trailing_script = None;
         // Extract content without braces
         for child in node.children_with_tokens() {
             match child.kind() {
@@ -78,35 +80,17 @@ pub fn convert_curly(conv: &mut LatexConverter, elem: SyntaxElement, output: &mu
                 _ => conv.visit_element(child, &mut content),
             }
         }
-        let text = content.trim();
-
-        // Handle common operator patterns that might include spacing commands
-        // e.g. "arg thin min" -> "argmin"
-        let normalized = text.replace("thin", "").replace(" ", "");
-        let final_text = if normalized == "argmin" {
-            "argmin"
-        } else if normalized == "argmax" {
-            "argmax"
-        } else {
-            text
-        };
-
-        // Try to keep it as simple text if possible for cleaner output
-        let op_content = if final_text
-            .chars()
-            .all(|c| c.is_alphanumeric() || c.is_whitespace())
-        {
-            format!("\"{}\"", final_text)
-        } else {
-            // Wrap in content block if complex
-            format!("[{}]", final_text)
-        };
-
+        let raw = node.text().to_string();
+        let raw = raw.trim();
+        let raw = raw.strip_prefix('{').unwrap_or(raw);
+        let raw = raw.strip_suffix('}').unwrap_or(raw);
+        let op_call = super::markup::operator_name_call(raw, content.trim());
         if op.is_limits {
-            let _ = write!(output, "limits(op({}))", op_content);
+            let _ = write!(output, "limits({})", op_call);
         } else {
-            let _ = write!(output, "op({})", op_content);
+            output.push_str(&op_call);
         }
+        conv.trailing_script = None;
         return;
     }
 
@@ -130,11 +114,48 @@ pub fn convert_curly(conv: &mut LatexConverter, elem: SyntaxElement, output: &mu
             content.push(child);
         }
     }
+    // A group that opens with a script has an empty base, as `{}_i` does. Typst
+    // would attach the script to whatever precedes the group (`a + {_i}` would
+    // put `i` under the `+`), so give it an explicit empty base. A group that is
+    // itself a script (`k_{_{AB}}`) is left to `fix_baseless_attachment`. The
+    // base is `zws`, as for `{}_i`, so both spellings read back the same.
+    if matches!(conv.state.mode, ConversionMode::Math)
+        && node.parent().map(|p| p.kind()) != Some(SyntaxKind::ItemAttachComponent)
+        && starts_with_baseless_script(&content)
+    {
+        conv.attachment_repairs.note_empty_base();
+        conv.trailing_script = None;
+        output.push_str("zws");
+    }
     conv.visit_elements(&content, output);
     // Add zero-width space for empty groups in math mode
     if !has_content && matches!(conv.state.mode, ConversionMode::Math) {
         output.push_str("zws ");
+        conv.trailing_script = None;
     }
+}
+
+/// Whether the first item of a group is a `_` or `^` script with no base.
+fn starts_with_baseless_script(content: &[SyntaxElement]) -> bool {
+    let is_trivia = |e: &SyntaxElement| {
+        matches!(
+            e.kind(),
+            SyntaxKind::TokenWhiteSpace | SyntaxKind::TokenLineBreak
+        )
+    };
+    let Some(SyntaxElement::Node(first)) = content.iter().find(|e| !is_trivia(e)) else {
+        return false;
+    };
+    first.kind() == SyntaxKind::ItemAttachComponent
+        && first
+            .children_with_tokens()
+            .find(|e| !is_trivia(e))
+            .is_some_and(|e| {
+                matches!(
+                    e.kind(),
+                    SyntaxKind::TokenUnderscore | SyntaxKind::TokenCaret
+                )
+            })
 }
 
 /// Convert \left...\right with enhanced delimiter handling
@@ -598,22 +619,31 @@ pub fn convert_attachment(conv: &mut LatexConverter, elem: SyntaxElement, output
     // in (`underbrace(body, label)`) instead of emitting a literal script.
     if let Some(folded) = fold_brace_annotation(conv, &node) {
         output.push_str(&folded);
+        conv.trailing_script = None;
         return;
     }
 
     let mut is_script = false;
+    let mut script_start: Option<usize> = None;
 
     for child in node.children_with_tokens() {
         let kind = child.kind();
 
-        if kind == SyntaxKind::TokenUnderscore {
-            output.push('_');
-            is_script = true;
-            continue;
-        }
-
-        if kind == SyntaxKind::TokenCaret {
-            output.push('^');
+        if kind == SyntaxKind::TokenUnderscore || kind == SyntaxKind::TokenCaret {
+            let marker = if kind == SyntaxKind::TokenUnderscore {
+                '_'
+            } else {
+                '^'
+            };
+            if script_start.is_none() {
+                let trimmed_len = output.trim_end().len();
+                script_start = match conv.trailing_script {
+                    Some(prev) if prev.end == trimmed_len => Some(prev.start),
+                    _ => Some(output.len()),
+                };
+            }
+            conv.trailing_script = None;
+            output.push(marker);
             is_script = true;
             continue;
         }
@@ -629,10 +659,15 @@ pub fn convert_attachment(conv: &mut LatexConverter, elem: SyntaxElement, output
             // Always wrap attachment content in parentheses to ensure correct binding
             // e.g. sum_i=1 -> sum_(i=1) instead of sum_i = 1
             output.push('(');
+            conv.trailing_script = None;
             conv.visit_element(child, output);
             output.push(')');
             // No space after script to ensure tight binding of multiple scripts
             is_script = false;
+            conv.trailing_script = script_start.map(|start| TrailingScript {
+                start,
+                end: output.len(),
+            });
         } else {
             // This handles the base or other parts if any (though usually base is previous sibling)
             conv.visit_element(child, output);
@@ -716,7 +751,9 @@ fn fold_brace_annotation(conv: &mut LatexConverter, node: &SyntaxNode) -> Option
     let previous_mode = conv.state.mode;
     conv.state.mode = ConversionMode::Math;
     let mut label = String::new();
+    conv.trailing_script = None;
     conv.visit_element(script, &mut label);
+    conv.trailing_script = None;
     conv.state.mode = previous_mode;
 
     // Top-level commas in `body` were already escaped by `convert_required_math_arg`.

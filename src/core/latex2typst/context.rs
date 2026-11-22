@@ -26,9 +26,10 @@ use super::{parse_latex, ConversionResult, ConversionWarning, WarningKind};
 
 use super::utils::{
     brackets_balanced, clean_whitespace, convert_caption_text, ends_with_unescaped_backslash,
-    extract_arg_content, extract_arg_content_with_braces, extract_curly_inner_content,
-    has_more_open_braces, protect_top_level_comma, protect_zero_arg_commands,
-    restore_protected_commands, sanitize_label, scan_brackets, BracketScanner,
+    extract_arg_content, extract_arg_content_untrimmed, extract_arg_content_with_braces,
+    extract_curly_inner_content, has_more_open_braces, protect_top_level_comma,
+    protect_zero_arg_commands, restore_protected_commands, sanitize_label, scan_brackets,
+    BracketScanner,
 };
 
 /// Marker for a `\big`-style vertical delimiter, paired during math cleanup.
@@ -519,6 +520,33 @@ impl ConversionState {
     }
 }
 
+/// Escape Typst markup syntax characters in literal text emitted inside an
+/// embedded math content block (`#text[...]`, `#strong[...]`, `#emph[...]`).
+pub(crate) fn push_escaped_typst_text(text: &str, output: &mut String) {
+    for c in text.chars() {
+        match c {
+            '/' if output.ends_with('/') => {
+                output.push('\\');
+                output.push('/');
+            }
+            '[' | ']' | '@' | '`' | '<' | '>' | '#' | '*' | '_' | '$' => {
+                output.push('\\');
+                output.push(c);
+            }
+            _ => output.push(c),
+        }
+    }
+}
+
+/// Byte range of trailing parenthesized scripts (`_(...)` / `^(...)`) just
+/// emitted at the end of the active output buffer, so a following `'` moves
+/// onto the script's base in O(1) without rescanning `output`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TrailingScript {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
 /// The main AST-based converter
 pub struct LatexConverter {
     pub(crate) state: ConversionState,
@@ -535,6 +563,11 @@ pub struct LatexConverter {
     /// Start offsets of the delimiters that do not pair within their sequence
     /// of siblings in the tree being visited (see [`unpaired_delimiters`]).
     pub(crate) unpaired_delimiters: HashSet<u32>,
+    /// Byte range of trailing `_(...)`/`^(...)` scripts at the end of `output`.
+    pub(crate) trailing_script: Option<TrailingScript>,
+    /// Whether we are converting an embedded math content block (`#text[...]`,
+    /// `#strong[...]`, `#emph[...]`), where Typst markup syntax chars must be escaped.
+    pub(crate) in_math_text_block: bool,
 }
 
 /// A `ClauseArgument` is a *required* argument iff it does not carry an
@@ -560,6 +593,62 @@ fn is_required_clause(child: &SyntaxNode) -> bool {
             child.first_token().map(|t| t.kind()),
             Some(SyntaxKind::TokenLBracket)
         )
+}
+
+/// Trim math output, dropping line breaks at its end.
+///
+/// A trailing `\\` draws nothing in LaTeX, but its Typst `\` would escape the
+/// closing `$`: `$a\\$` gave `$a \$`.
+fn strip_trailing_line_breaks(math: &str) -> &str {
+    let mut math = math.trim();
+    while ends_with_unescaped_backslash(math) {
+        math = math[..math.len() - 1].trim_end();
+    }
+    math
+}
+
+/// Whether a prime can attach directly to `base` in Typst math rather than to
+/// a binary operator, delimiter, or unescaped line-break backslash.
+fn can_attach_prime(base: &str) -> bool {
+    if base.is_empty() || ends_with_unescaped_backslash(base) {
+        return false;
+    }
+    let last = base.chars().next_back().unwrap();
+    let prefix = &base[..base.len() - last.len_utf8()];
+    if ends_with_unescaped_backslash(prefix) {
+        return true;
+    }
+    !matches!(
+        last,
+        '+' | '-'
+            | '='
+            | '<'
+            | '>'
+            | ','
+            | ';'
+            | '&'
+            | ':'
+            | '('
+            | '['
+            | '{'
+            | '^'
+            | '_'
+            | '/'
+            | '*'
+    )
+}
+
+/// Trim a converted argument, keeping the space after a trailing `\` line break.
+///
+/// Without that space the `\` would escape whatever closes the argument, so
+/// `\hl{\\}` would give `#highlight[\]`.
+fn trim_converted_arg(output: &str) -> String {
+    let trimmed = output.trim();
+    if ends_with_unescaped_backslash(trimmed) {
+        format!("{trimmed} ")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn slash_is_between_mathy(elem: SyntaxElement) -> bool {
@@ -746,6 +835,27 @@ fn render_sized_delimiter_operand(operand: &str, function: &str, matrix_delim: &
     format!("{}({})", function, protect_top_level_comma(operand))
 }
 
+fn fallback_for_following<'a>(fallback: &'a str, following: &str) -> &'a str {
+    if following.starts_with('\'') {
+        fallback.trim_end()
+    } else {
+        fallback
+    }
+}
+
+fn replace_unmatched_marker(input: &str, marker: &str, fallback: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+    while let Some(pos) = remaining.find(marker) {
+        output.push_str(&remaining[..pos]);
+        let after = &remaining[pos + marker.len()..];
+        output.push_str(fallback_for_following(fallback, after));
+        remaining = after;
+    }
+    output.push_str(remaining);
+    output
+}
+
 /// Pair the markers emitted for `\big`-style vertical delimiters, after
 /// rendering, where a delimiterless matrix is still distinguishable from a
 /// scalar operand. An unmatched marker is a legal one-sided delimiter.
@@ -758,7 +868,7 @@ fn resolve_sized_delimiter_pair(
 ) -> String {
     // Adjacent equal bars are ambiguous without a delimiter tree; keep the tokens.
     if markers_are_adjacent(input, marker) {
-        return input.replace(marker, fallback);
+        return replace_unmatched_marker(input, marker, fallback);
     }
 
     let mut scanner = BracketScanner::default();
@@ -779,8 +889,9 @@ fn resolve_sized_delimiter_pair(
         });
 
         let Some(close) = close else {
-            scanner.advance_math_stream(fallback);
-            output.push_str(fallback);
+            let emitted = fallback_for_following(fallback, after_open);
+            scanner.advance_math_stream(emitted);
+            output.push_str(emitted);
             // Keep scanning: a later pair in a following paragraph still resolves.
             remaining = after_open;
             continue;
@@ -834,8 +945,8 @@ pub(crate) struct AttachmentRepairs {
 }
 
 impl AttachmentRepairs {
-    /// An empty `""` base was inserted before a script Typst would reject.
-    fn note_empty_base(&self) {
+    /// An empty `zws` base was inserted before a script Typst would reject.
+    pub(crate) fn note_empty_base(&self) {
         self.empty_bases.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
@@ -1394,6 +1505,8 @@ impl LatexConverter {
             pending_section: None,
             attachment_repairs: AttachmentRepairs::default(),
             unpaired_delimiters: HashSet::new(),
+            trailing_script: None,
+            in_math_text_block: false,
         }
     }
 
@@ -1409,6 +1522,8 @@ impl LatexConverter {
             pending_section: None,
             attachment_repairs: AttachmentRepairs::default(),
             unpaired_delimiters: HashSet::new(),
+            trailing_script: None,
+            in_math_text_block: false,
         }
     }
 
@@ -1418,8 +1533,10 @@ impl LatexConverter {
             &mut self.unpaired_delimiters,
             super::delimiters::unpaired_delimiters(tree),
         );
+        let previous_trailing_script = self.trailing_script.take();
         self.visit_node(tree, output);
         self.unpaired_delimiters = previous;
+        self.trailing_script = previous_trailing_script;
     }
 
     /// Whether `elem` is a delimiter in math that must be escaped because it
@@ -1575,6 +1692,8 @@ impl LatexConverter {
         self.siunitx_arg_collector = None;
         self.pending_section = None;
         self.attachment_repairs.take();
+        self.trailing_script = None;
+        self.in_math_text_block = false;
     }
 
     /// Convert a complete LaTeX document to Typst
@@ -1820,13 +1939,29 @@ impl LatexConverter {
             };
 
             if let Some(style) = style {
+                // An alignment cell is a TeX group, so the declaration ends at
+                // the next `&` or `\\`, not at the end of the environment.
+                let end = children[index + 1..]
+                    .iter()
+                    .position(|c| {
+                        matches!(
+                            c.kind(),
+                            SyntaxKind::ItemNewLine | SyntaxKind::TokenAmpersand
+                        )
+                    })
+                    .map_or(children.len(), |offset| index + 1 + offset);
                 let mut styled_content = String::new();
-                self.visit_elements(&children[index + 1..], &mut styled_content);
-                let styled_content = protect_top_level_comma(&styled_content);
+                self.trailing_script = None;
+                self.visit_elements(&children[index + 1..end], &mut styled_content);
+                self.trailing_script = None;
+                // The content is a call argument, so a top-level `,` or `;`
+                // must not split it: `\displaystyle m=0,u\ne0;`.
+                let styled_content = protect_top_level_comma(styled_content.trim());
                 if !styled_content.is_empty() {
                     let _ = write!(output, "{}({})", style, styled_content);
                 }
-                return;
+                index = end;
+                continue;
             }
 
             self.visit_element(child.clone(), output);
@@ -1934,7 +2069,9 @@ impl LatexConverter {
                         })
                         .collect();
                     let mut title = String::new();
+                    self.trailing_script = None;
                     self.visit_elements(&body, &mut title);
+                    self.trailing_script = None;
                     super::markup::emit_starred_section(pending, title.trim(), output);
                     return true;
                 }
@@ -2045,21 +2182,36 @@ impl LatexConverter {
     pub fn visit_element(&mut self, elem: SyntaxElement, output: &mut String) {
         use SyntaxKind::*;
 
-        if self.handle_pending_citation(elem.clone(), output) {
-            return;
-        }
-        if self.handle_pending_reference(elem.clone(), output) {
-            return;
-        }
-        if self.handle_pending_section(elem.clone(), output) {
-            return;
-        }
-        if self.handle_pending_siunitx(elem.clone(), output) {
+        if self.handle_pending_citation(elem.clone(), output)
+            || self.handle_pending_reference(elem.clone(), output)
+            || self.handle_pending_section(elem.clone(), output)
+            || self.handle_pending_siunitx(elem.clone(), output)
+        {
+            self.trailing_script = None;
             return;
         }
 
         if self.state.suppress_next_space && !matches!(elem.kind(), SyntaxKind::TokenWhiteSpace) {
             self.state.suppress_next_space = false;
+        }
+
+        let preserves_trailing_script = matches!(
+            elem.kind(),
+            ScopeRoot
+                | ItemText
+                | ClauseArgument
+                | ItemCurly
+                | ItemAttachComponent
+                | ItemCmd
+                | TokenCommandSym
+                | TokenApostrophe
+                | TokenWhiteSpace
+                | TokenLineBreak
+                | TokenComment
+                | ItemBlockComment
+        );
+        if !preserves_trailing_script {
+            self.trailing_script = None;
         }
 
         match elem.kind() {
@@ -2085,7 +2237,9 @@ impl LatexConverter {
                 if self.state.in_preamble {
                     if let SyntaxElement::Node(n) = elem {
                         let mut dummy = String::new();
+                        self.trailing_script = None;
                         self.visit_node(&n, &mut dummy);
+                        self.trailing_script = None;
                     }
                 } else if let SyntaxElement::Node(n) = elem {
                     self.visit_node(&n, output);
@@ -2095,6 +2249,7 @@ impl LatexConverter {
             // Math formula
             ItemFormula => {
                 super::math::convert_formula(self, elem, output);
+                self.trailing_script = None;
             }
 
             // Curly group
@@ -2108,6 +2263,7 @@ impl LatexConverter {
             // Left/Right delimiters
             ItemLR | ClauseLR => {
                 super::math::convert_lr(self, elem, output);
+                self.trailing_script = None;
             }
 
             // Attachment (subscript/superscript)
@@ -2117,12 +2273,25 @@ impl LatexConverter {
 
             // Command
             ItemCmd => {
+                let saved = self.trailing_script.take();
+                let before_len = output.len();
                 super::markup::convert_command(self, elem, output);
+                let has_pending = self.state.pending_op.is_some()
+                    || self.state.pending_citation.is_some()
+                    || self.state.pending_reference.is_some()
+                    || self.pending_section.is_some()
+                    || self.siunitx_arg_collector.is_some();
+                self.trailing_script = if output.len() == before_len && !has_pending {
+                    saved
+                } else {
+                    None
+                };
             }
 
             // Environment
             ItemEnv => {
                 super::environment::convert_environment(self, elem, output);
+                self.trailing_script = None;
             }
 
             // Plain word
@@ -2134,6 +2303,8 @@ impl LatexConverter {
                     let text = t.text();
                     if matches!(self.state.mode, ConversionMode::Math) {
                         push_math_atoms(text, output);
+                    } else if self.in_math_text_block {
+                        push_escaped_typst_text(text, output);
                     } else {
                         output.push_str(text);
                     }
@@ -2208,7 +2379,37 @@ impl LatexConverter {
                     output.push_str("\\^");
                 }
             }
-            TokenApostrophe => output.push('\''),
+            TokenApostrophe => {
+                // Typst attaches primes only to the token right before them:
+                // `x '^(2)` is `x` followed by primes on an empty base.
+                if matches!(self.state.mode, ConversionMode::Math) {
+                    let base = output.trim_end();
+                    // Keep the space of a `\ ` line break, or `\'` becomes an escape.
+                    if !ends_with_unescaped_backslash(base) {
+                        output.truncate(base.len());
+                    }
+                    // In `j_(1)'` Typst primes the subscript, drawing "(1)′";
+                    // `j'_(1)` primes the base, as LaTeX's `j_1'` does.
+                    if let Some(script) = self.trailing_script {
+                        if script.end == output.len()
+                            && script.start < script.end
+                            && output.is_char_boundary(script.start)
+                        {
+                            let base_end = output[..script.start].trim_end().len();
+                            if base_end > 0 && can_attach_prime(&output[..base_end]) {
+                                output.replace_range(base_end..script.start, "'");
+                                self.trailing_script = Some(TrailingScript {
+                                    start: base_end + 1,
+                                    end: output.len(),
+                                });
+                                return;
+                            }
+                        }
+                    }
+                }
+                self.trailing_script = None;
+                output.push('\'');
+            }
             // A comma in a `cases` row or a matrix cell would separate cells, and
             // a semicolon would end the row.
             TokenComma | TokenSemicolon => {
@@ -2229,12 +2430,16 @@ impl LatexConverter {
                 output.push_str(&elem.to_string());
             }
             TokenSlash => {
-                if matches!(self.state.mode, ConversionMode::Math) || slash_is_between_mathy(elem) {
+                if matches!(self.state.mode, ConversionMode::Math)
+                    || (!self.in_math_text_block && slash_is_between_mathy(elem))
+                {
                     while output.ends_with(char::is_whitespace) {
                         output.pop();
                     }
                     output.push_str(" slash ");
                     self.state.suppress_next_space = true;
+                } else if self.in_math_text_block {
+                    push_escaped_typst_text("/", output);
                 } else {
                     output.push('/');
                 }
@@ -2250,7 +2455,13 @@ impl LatexConverter {
                     output.push_str("\\*");
                 }
             }
-            TokenAtSign => output.push('@'),
+            TokenAtSign => {
+                if self.in_math_text_block && matches!(self.state.mode, ConversionMode::Text) {
+                    output.push_str("\\@");
+                } else {
+                    output.push('@');
+                }
+            }
             // A bare `"` would open a Typst string in math.
             TokenDitto if matches!(self.state.mode, ConversionMode::Math) => {
                 output.push_str("\\\"")
@@ -2259,7 +2470,10 @@ impl LatexConverter {
             // Brackets here are literal text: a real optional argument is consumed by the grammar.
             TokenLBracket | TokenRBracket if self.state.in_preamble => {}
             TokenLParen | TokenRParen | TokenLBracket | TokenRBracket => {
-                if self.is_unpaired_delimiter(&elem) {
+                let escape_bracket = self.in_math_text_block
+                    && matches!(self.state.mode, ConversionMode::Text)
+                    && matches!(elem.kind(), TokenLBracket | TokenRBracket);
+                if self.is_unpaired_delimiter(&elem) || escape_bracket {
                     output.push('\\');
                 }
                 output.push_str(&elem.to_string());
@@ -2272,7 +2486,14 @@ impl LatexConverter {
 
             // Command symbol
             TokenCommandSym => {
+                let saved = self.trailing_script.take();
+                let before_len = output.len();
                 super::markup::convert_command_sym(self, elem, output);
+                self.trailing_script = if output.len() == before_len {
+                    saved
+                } else {
+                    None
+                };
             }
 
             // Typst code passthrough
@@ -2300,6 +2521,15 @@ impl LatexConverter {
             }
         }
         None
+    }
+
+    /// `get_required_arg` with the edge spaces kept, for a text argument.
+    pub fn get_required_text_arg(&self, cmd: &CmdItem, index: usize) -> Option<String> {
+        cmd.syntax()
+            .children()
+            .filter(is_required_clause)
+            .nth(index)
+            .map(|child| extract_arg_content_untrimmed(&child))
     }
 
     /// Get a required argument preserving inner braces
@@ -2362,8 +2592,10 @@ impl LatexConverter {
                         )
                     })
                     .collect();
+                self.trailing_script = None;
                 self.visit_elements(&content, &mut output);
-                return Some(output.trim().to_string());
+                self.trailing_script = None;
+                return Some(trim_converted_arg(&output));
             }
             optional_count += 1;
         }
@@ -2394,8 +2626,10 @@ impl LatexConverter {
                             )
                         })
                         .collect();
+                    self.trailing_script = None;
                     self.visit_elements(&content, &mut output);
-                    return Some(output.trim().to_string());
+                    self.trailing_script = None;
+                    return Some(trim_converted_arg(&output));
                 }
                 required_count += 1;
             }
@@ -2506,7 +2740,7 @@ impl LatexConverter {
         // (`(_(` and leading `^(` are literal). Typst rejects these otherwise.
         result = self.fix_baseless_attachment(&result);
 
-        result.trim().to_string()
+        strip_trailing_line_breaks(&result).to_string()
     }
 
     /// Clean up math spacing
@@ -2536,7 +2770,7 @@ impl LatexConverter {
         result = self.fix_left_brace_cases(&result);
         result = self.fix_baseless_attachment(&result);
 
-        result.trim().to_string()
+        strip_trailing_line_breaks(&result).to_string()
     }
 
     /// Turn matched `\big|`/`\big\|` pairs into `abs(...)`/`norm(...)`. Only
@@ -2644,7 +2878,8 @@ impl LatexConverter {
                 if let Some(pos) = result[i..].find(symbol) {
                     let abs_pos = i + pos;
                     if abs_pos > 0 {
-                        let prev_char = result.chars().nth(abs_pos - 1).unwrap_or(' ');
+                        // `abs_pos` is a byte offset: after a `†` it is not a char index.
+                        let prev_char = result[..abs_pos].chars().next_back().unwrap_or(' ');
                         // Insert space if previous char is not a letter, space, or opening paren/bracket
                         if !prev_char.is_alphabetic()
                             && prev_char != ' '
@@ -2657,7 +2892,7 @@ impl LatexConverter {
                             // Check that we're not in the middle of a word
                             // e.g., don't change "tangent" when looking for "angle"
                             let after_symbol = abs_pos + symbol.len();
-                            let next_char = result.chars().nth(after_symbol);
+                            let next_char = result[after_symbol..].chars().next();
                             let is_word_boundary =
                                 next_char.is_none_or(|c| !c.is_alphanumeric() && c != '.');
 
@@ -2729,7 +2964,8 @@ impl LatexConverter {
                     "Z" => "ZZ".to_string(),
                     "Q" => "QQ".to_string(),
                     "C" => "CC".to_string(),
-                    _ => format!("bb({})", clean_content),
+                    // Keep the spaces: `bb(A B)` is two letters, `bb(AB)` a variable.
+                    _ => format!("bb({})", content.trim()),
                 };
 
                 let total_end = start + 3 + end + 1;
@@ -2769,8 +3005,26 @@ impl LatexConverter {
             // base-less attachment.
             let pat = format!("{op}({op}(");
             let mut from = 0;
+            let mut scan_pos = 0;
+            let mut in_string = false;
+            let mut escaped = false;
             while let Some(rel) = result[from..].find(&pat) {
                 let start = from + rel; // outer op
+                for c in result[scan_pos..start].chars() {
+                    if std::mem::take(&mut escaped) {
+                        continue;
+                    }
+                    match c {
+                        '\\' => escaped = true,
+                        '"' => in_string = !in_string,
+                        _ => {}
+                    }
+                }
+                scan_pos = start;
+                if in_string {
+                    from = start + 2;
+                    continue;
+                }
                 let outer_open = start + 1; // outer '('
                 let inner_open = start + 3; // inner '('
                 let outer_end = self.find_matching_paren(&result[outer_open + 1..]);
@@ -2800,26 +3054,51 @@ impl LatexConverter {
         result
     }
 
-    /// Insert an empty base `""` before a `_(`/`^(` attachment that has no base
-    /// (at the start of the string or right after an opening `(`). Both are
-    /// positions where Typst would otherwise report an unexpected `_`/`^`.
+    /// Insert an empty base `zws` before a `_(`/`^(` attachment that has no base:
+    /// at the start of the string, or right after an unescaped opening
+    /// delimiter or argument separator (`\left[ ^{2}K` gave `[^(2)K`). These
+    /// are positions where Typst would otherwise report an unexpected `_`/`^`.
+    /// `zws` is also how `{}_a` converts, so T -> L -> T reads it back the same.
     fn insert_empty_attachment_base(&self, input: &str) -> String {
         let mut out = String::with_capacity(input.len() + 4);
-        let mut last_nonspace: Option<char> = None;
+        // The last non-space character, and whether a backslash escaped it.
+        let mut last_nonspace: Option<(char, bool)> = None;
+        let mut escaped = false;
+        let mut in_string = false;
         let mut chars = input.chars().peekable();
         while let Some(c) = chars.next() {
+            if in_string {
+                out.push(c);
+                if !escaped && c == '"' {
+                    in_string = false;
+                    last_nonspace = Some(('"', false));
+                }
+                escaped = c == '\\' && !escaped;
+                continue;
+            }
+            if !escaped && c == '"' {
+                in_string = true;
+                out.push(c);
+                last_nonspace = Some(('"', false));
+                continue;
+            }
             if (c == '_' || c == '^')
+                && !escaped
                 && chars.peek() == Some(&'(')
-                && matches!(last_nonspace, None | Some('('))
+                && matches!(
+                    last_nonspace,
+                    None | Some(('(' | '[' | '{' | ',' | ';' | '&', false))
+                )
             {
                 self.attachment_repairs.note_empty_base();
-                out.push_str("\"\"");
-                last_nonspace = Some('"');
+                out.push_str("zws");
+                last_nonspace = Some(('s', false));
             }
             out.push(c);
             if !c.is_whitespace() {
-                last_nonspace = Some(c);
+                last_nonspace = Some((c, escaped));
             }
+            escaped = c == '\\' && !escaped;
         }
         out
     }
