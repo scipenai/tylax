@@ -15,25 +15,49 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { basename, extname, join } from "node:path";
 
-const require = createRequire(join(homedir(), ".cache", "tylax", "node", "package.json"));
-const katex = require("katex");
-// KaTeX warns about each character it has no metrics for; the audit does not care.
-console.warn = () => {};
-
 const [input, output] = process.argv.slice(2);
 if (!input || !output) {
   console.error("usage: node tools/corpus_katex_filter.mjs <in.json|in.txt> <out.json>");
   process.exit(2);
 }
 
+const require = createRequire(join(homedir(), ".cache", "tylax", "node", "package.json"));
+let katex;
+try {
+  katex = require("katex");
+} catch (error) {
+  console.error(
+    `cannot load katex from ~/.cache/tylax/node (install with: npm install --prefix ~/.cache/tylax/node katex): ${error.message}`,
+  );
+  process.exit(1);
+}
+// KaTeX warns about each character it has no metrics for; the audit does not care.
+console.warn = () => {};
+
+function loadCases(path, text) {
+  const stem = basename(path, extname(path));
+  const isJsonExt = extname(path).toLowerCase() === ".json";
+  if (isJsonExt) {
+    return JSON.parse(text);
+  }
+  if (text.trimStart().startsWith("[")) {
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch {
+      // Plain text lines may begin with `[` (e.g., intervals `[0, 1]`).
+    }
+  }
+  return text
+    .split("\n")
+    .map((latex, index) => ({ id: `${stem}:${index + 1}`, latex: latex.replace(/\r$/, "") }))
+    .filter((c) => c.latex.trim() !== "");
+}
+
 const text = readFileSync(input, "utf8");
-const stem = basename(input, extname(input));
-const cases = text.trimStart().startsWith("[")
-  ? JSON.parse(text)
-  : text
-      .split("\n")
-      .map((latex, index) => ({ id: `${stem}:${index + 1}`, latex: latex.replace(/\r$/, "") }))
-      .filter((c) => c.latex.trim() !== "");
+const cases = loadCases(input, text);
 
 const kept = [];
 const reasons = new Map();

@@ -24,6 +24,7 @@ import argparse
 import gzip
 import html
 import json
+import os
 import re
 import sys
 import time
@@ -35,6 +36,16 @@ CACHE = Path.home() / ".cache" / "tylax" / "corpora"
 IM2LATEX_URL = "https://zenodo.org/records/56198/files/im2latex_formulas.lst?download=1"
 SE_API = "https://api.stackexchange.com/2.3"
 USER_AGENT = "tylax-corpus-fetch/0.1"
+
+
+def write_bytes_atomic(path: Path, data: bytes) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def fetch(url: str) -> bytes:
@@ -55,7 +66,7 @@ def write_formulas(name: str, formulas: list[tuple[str, str]]) -> None:
             seen.add(latex)
             unique.append({"id": case_id, "latex": latex})
     out = CACHE / name / "formulas.json"
-    out.write_text(json.dumps(unique, ensure_ascii=False, indent=0) + "\n", encoding="utf-8")
+    write_bytes_atomic(out, (json.dumps(unique, ensure_ascii=False, indent=0) + "\n").encode("utf-8"))
     print(f"{name}: {len(formulas)} formulas, {len(unique)} unique -> {out}")
 
 
@@ -68,7 +79,7 @@ def im2latex(_args: argparse.Namespace) -> None:
     path = raw / "im2latex_formulas.lst"
     if not path.exists():
         print(f"downloading {IM2LATEX_URL}")
-        path.write_bytes(fetch(IM2LATEX_URL))
+        write_bytes_atomic(path, fetch(IM2LATEX_URL))
     # Formulas are separated by "\n" only; a bare "\r" can occur inside one.
     text = path.read_bytes().decode("utf-8", errors="replace")
     formulas = []
@@ -116,7 +127,7 @@ def mse(args: argparse.Namespace) -> None:
                 data = json.loads(fetch(f"{SE_API}/{kind}?{query}"))
                 if "error_id" in data:
                     sys.exit(f"Stack Exchange API error: {data}")
-                path.write_text(json.dumps(data), encoding="utf-8")
+                write_bytes_atomic(path, json.dumps(data).encode("utf-8"))
                 print(f"{kind} page {page}: quota remaining {data.get('quota_remaining')}")
                 time.sleep(max(data.get("backoff", 0), 0.2))
             data = json.loads(path.read_text(encoding="utf-8"))

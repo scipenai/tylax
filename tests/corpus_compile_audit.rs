@@ -34,6 +34,8 @@
 
 #![cfg(feature = "data-loading")]
 
+use std::any::Any;
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
@@ -56,11 +58,11 @@ struct CorpusCase {
     latex: String,
 }
 
-/// A converted case. `typst` is `None` when the conversion panicked.
+/// A converted case. `typst` is `Err(reason)` when the conversion panicked.
 struct Case {
     id: String,
     latex: String,
-    typst: Option<String>,
+    typst: Result<String, String>,
 }
 
 struct Failure {
@@ -99,9 +101,18 @@ enum Outcome {
 fn load_corpus(path: &Path) -> Vec<CorpusCase> {
     let text = std::fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("cannot read corpus {}: {error}", path.display()));
-    if text.trim_start().starts_with('[') {
+    let is_json_ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+    if is_json_ext {
         return serde_json::from_str(&text)
             .unwrap_or_else(|error| panic!("invalid corpus JSON in {}: {error}", path.display()));
+    }
+    if text.trim_start().starts_with('[') {
+        if let Ok(cases) = serde_json::from_str(&text) {
+            return cases;
+        }
     }
     let stem = path
         .file_stem()
@@ -117,27 +128,71 @@ fn load_corpus(path: &Path) -> Vec<CorpusCase> {
         .collect()
 }
 
+thread_local! {
+    static LAST_PANIC: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+fn format_panic_payload(payload: &(dyn Any + Send)) -> &str {
+    if let Some(msg) = payload.downcast_ref::<&str>() {
+        msg
+    } else if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.as_str()
+    } else {
+        "non-string panic payload"
+    }
+}
+
+type PanicHook = Box<dyn Fn(&panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+
+struct PanicHookGuard(Option<PanicHook>);
+
+impl Drop for PanicHookGuard {
+    fn drop(&mut self) {
+        if let Some(hook) = self.0.take() {
+            panic::set_hook(hook);
+        }
+    }
+}
+
 /// Convert every case, catching panics so that one bad input does not end the
 /// audit. The output is flattened onto one line; a newline is whitespace in
 /// Typst math.
 fn convert_all(cases: Vec<CorpusCase>) -> Vec<Case> {
-    let previous_hook = panic::take_hook();
-    panic::set_hook(Box::new(|_| {}));
-    let converted = cases
+    let _guard = PanicHookGuard(Some(panic::take_hook()));
+    panic::set_hook(Box::new(|info| {
+        let msg = format_panic_payload(info.payload());
+        let detail = match info.location() {
+            Some(loc) => format!("at {}:{}:{}: {msg}", loc.file(), loc.line(), loc.column()),
+            None => format!(": {msg}"),
+        };
+        LAST_PANIC.with(|slot| *slot.borrow_mut() = Some(detail));
+    }));
+    cases
         .into_iter()
         .map(|case| {
-            let typst = panic::catch_unwind(AssertUnwindSafe(|| latex_to_typst(&case.latex)))
-                .ok()
-                .map(|output| output.trim().replace(['\r', '\n'], " "));
+            LAST_PANIC.with(|slot| *slot.borrow_mut() = None);
+            let typst = match panic::catch_unwind(AssertUnwindSafe(|| latex_to_typst(&case.latex)))
+            {
+                Ok(output) => Ok(output.trim().replace(['\r', '\n'], " ")),
+                Err(payload) => {
+                    let detail = LAST_PANIC
+                        .with(|slot| slot.borrow_mut().take())
+                        .unwrap_or_else(|| format!(": {}", format_panic_payload(payload.as_ref())));
+                    let message = if detail.starts_with("at ") {
+                        format!("latex_to_typst panicked {detail}")
+                    } else {
+                        format!("latex_to_typst panicked{detail}")
+                    };
+                    Err(message)
+                }
+            };
             Case {
                 id: case.id,
                 latex: case.latex,
                 typst,
             }
         })
-        .collect();
-    panic::set_hook(previous_hook);
-    converted
+        .collect()
 }
 
 /// Compile `formulas` as one document, one formula per line after the
@@ -146,14 +201,17 @@ fn compile(dir: &Path, name: &str, formulas: &[&str]) -> Outcome {
     let input = dir.join(format!("{name}.typ"));
     let output = dir.join(format!("{name}.pdf"));
     let mut source = String::from(PREAMBLE);
+    let mut wrapped = Vec::with_capacity(formulas.len());
     for formula in formulas {
         // A formula that is one display environment converts to a whole
         // equation, which must not be wrapped again. Keep it on one line.
         let formula = formula.trim();
         if formula.starts_with('$') || formula.starts_with("#math.equation") {
+            wrapped.push(false);
             source.push_str(&formula.replace('\n', " "));
             source.push('\n');
         } else {
+            wrapped.push(true);
             source.push_str(&format!("${formula}$\n"));
         }
     }
@@ -205,15 +263,22 @@ fn compile(dir: &Path, name: &str, formulas: &[&str]) -> Outcome {
             // `<path>:<line>:<column>: error: <message>`; warnings are skipped.
             let (position, message) = line.split_once(": error: ")?;
             let mut parts = position.rsplitn(3, ':');
-            // Typst's column is 0-based and counts the opening `$`.
+            // Typst's column is 0-based; only wrapped `$...$` lines have a leading `$`.
             let column = parts.next()?.parse::<usize>().ok();
             let line_number = parts.next()?.parse::<usize>().ok();
             let position = line_number
                 .and_then(|n| n.checked_sub(preamble_lines + 1))
                 .unwrap_or(usize::MAX);
+            let is_wrapped = wrapped.get(position).copied().unwrap_or(false);
             Some(CompileError {
                 position,
-                column: column.and_then(|c| c.checked_sub(1)),
+                column: column.and_then(|c| {
+                    if is_wrapped {
+                        c.checked_sub(1)
+                    } else {
+                        Some(c)
+                    }
+                }),
                 message: message.to_string(),
             })
         })
@@ -255,13 +320,11 @@ fn audit_batch(dir: &Path, name: &str, cases: &[Case], batch: &[usize]) -> Vec<F
         .iter()
         .copied()
         .filter(|&index| {
-            if cases[index].typst.is_none() {
+            if let Err(reason) = &cases[index].typst {
                 failures.push(Failure {
                     index,
                     kind: "panic",
-                    errors: vec![CompileError::unplaced(
-                        "latex_to_typst panicked".to_string(),
-                    )],
+                    errors: vec![CompileError::unplaced(reason.clone())],
                 });
                 false
             } else {
@@ -309,10 +372,20 @@ fn audit_batch(dir: &Path, name: &str, cases: &[Case], batch: &[usize]) -> Vec<F
     failures
 }
 
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Audit every case on all cores and return the failures in corpus order.
 fn audit(cases: &[Case]) -> Vec<Failure> {
-    let dir = std::env::temp_dir().join(format!("tylax-corpus-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temporary directory");
+    let dir_guard =
+        TempDirGuard(std::env::temp_dir().join(format!("tylax-corpus-{}", std::process::id())));
+    let dir = &dir_guard.0;
+    std::fs::create_dir_all(dir).expect("create temporary directory");
     let batches: Vec<Vec<usize>> = (0..cases.len())
         .collect::<Vec<_>>()
         .chunks(BATCH_SIZE)
@@ -324,7 +397,7 @@ fn audit(cases: &[Case]) -> Vec<Failure> {
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
     std::thread::scope(|scope| {
         for worker in 0..workers {
-            let (dir, batches, next, done, failures) = (&dir, &batches, &next, &done, &failures);
+            let (batches, next, done, failures) = (&batches, &next, &done, &failures);
             scope.spawn(move || loop {
                 let batch_index = next.fetch_add(1, Ordering::Relaxed);
                 let Some(batch) = batches.get(batch_index) else {
@@ -339,7 +412,7 @@ fn audit(cases: &[Case]) -> Vec<Failure> {
             });
         }
     });
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(dir_guard);
     let mut failures = failures.into_inner().unwrap();
     failures.sort_by_key(|failure| failure.index);
     failures
@@ -354,7 +427,7 @@ fn write_report(path: &Path, cases: &[Case], failures: &[Failure]) {
         let record = serde_json::json!({
             "id": case.id,
             "latex": case.latex,
-            "typst": case.typst,
+            "typst": case.typst.as_deref().ok(),
             "kind": failure.kind,
             "errors": failure
                 .errors
@@ -371,7 +444,7 @@ fn write_outputs(path: &Path, cases: &[Case]) {
         .unwrap_or_else(|error| panic!("cannot create {}: {error}", path.display()));
     let mut writer = std::io::BufWriter::new(file);
     for case in cases {
-        let record = serde_json::json!({"id": case.id, "latex": case.latex, "typst": case.typst});
+        let record = serde_json::json!({"id": case.id, "latex": case.latex, "typst": case.typst.as_deref().ok()});
         writeln!(writer, "{record}").expect("write output line");
     }
 }

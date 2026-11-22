@@ -18,17 +18,26 @@ Usage:
 import argparse
 import json
 import re
+import sys
 from collections import defaultdict
 
 NAME = re.compile(r"[A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z][A-Za-z0-9-]*)*")
 COMMAND = re.compile(r"\\([A-Za-z]+)")
+PANIC_AT = re.compile(r"^(latex_to_typst panicked at \S+?: )(.*)$", re.DOTALL)
 
 
-def template(message: str) -> str:
+def _normalize_body(message: str) -> str:
     message = re.sub(r"`[^`]*`", "`…`", message)
     message = re.sub(r"(unknown variable|missing argument|unexpected argument): .*", r"\1: <name>", message)
     message = re.sub(r"\b\d+(\.\d+)?\b", "N", message)
     return message
+
+
+def template(message: str) -> str:
+    if match := PANIC_AT.match(message):
+        prefix, body = match.groups()
+        return prefix + _normalize_body(body)
+    return _normalize_body(message)
 
 
 def token_at(typst: str, column) -> str:
@@ -50,16 +59,28 @@ def token_at(typst: str, column) -> str:
 def culprit(record: dict) -> str:
     error = record["errors"][0]
     message = error["message"]
+    kind = record.get("kind", "compile")
+    if kind == "panic":
+        if match := re.match(r"latex_to_typst panicked (at \S+?)(?:: |$)", message):
+            return f"<panic {match.group(1)}>"
+        return "<panic>"
+    if kind != "compile":
+        return f"<{kind}>"
     typst = record.get("typst") or ""
     if message.startswith("unknown variable: "):
         name = message.split(": ", 1)[1]
     else:
         name = token_at(typst, error.get("column"))
     head = name.split(".")[0]
-    command = next(
-        (c for c in COMMAND.findall(record["latex"]) if len(head) >= 2 and head.startswith(c)),
-        None,
-    )
+    commands = COMMAND.findall(record["latex"])
+    command = None
+    if len(head) >= 2:
+        if head in commands:
+            command = head
+        else:
+            matches = [c for c in commands if len(c) >= 2 and head.startswith(c)]
+            if matches:
+                command = max(matches, key=len)
     return f"{name}  (\\{command})" if command else name
 
 
@@ -80,6 +101,8 @@ def print_groups(title: str, groups: dict, top: int, examples: int) -> None:
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("reports", nargs="+")
     parser.add_argument("--top", type=int, default=30, help="groups to print per grouping (default 30)")

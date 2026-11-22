@@ -52,13 +52,24 @@ def katex_mathjax(path: str | None) -> tuple[set, dict]:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     else:
         script = ROOT / "tools" / "latex_command_lists.mjs"
-        data = json.loads(subprocess.run(["node", str(script)], check=True, capture_output=True, text=True).stdout)
+        data = json.loads(
+            subprocess.run(["node", str(script)], check=True, capture_output=True, text=True, encoding="utf-8").stdout
+        )
     return set(data["katex"]), data["mathjax"]
 
 
 def unicode_math(path: str | None) -> dict:
     if not path:
-        found = subprocess.run(["kpsewhich", "unicode-math-table.tex"], capture_output=True, text=True).stdout.strip()
+        try:
+            found = subprocess.run(
+                ["kpsewhich", "unicode-math-table.tex"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            ).stdout.strip()
+        except FileNotFoundError:
+            found = ""
         if not found:
             sys.exit("unicode-math-table.tex not found; pass --unicode-math")
         path = found
@@ -71,9 +82,15 @@ def unicode_math(path: str | None) -> dict:
 def corpus_counts(paths: list[str]) -> Counter:
     counts = Counter()
     for path in paths:
-        text = Path(path).read_text(encoding="utf-8")
-        if text.lstrip().startswith("["):
+        path_obj = Path(path)
+        text = path_obj.read_text(encoding="utf-8")
+        if path_obj.suffix.lower() == ".json":
             formulas = [case["latex"] for case in json.loads(text)]
+        elif text.lstrip().startswith("["):
+            try:
+                formulas = [case["latex"] for case in json.loads(text)]
+            except (json.JSONDecodeError, KeyError, TypeError):
+                formulas = text.split("\n")
         else:
             formulas = text.split("\n")
         for latex in formulas:
@@ -102,14 +119,22 @@ def probe(names: list[str]) -> tuple[dict, dict]:
         env = dict(os.environ, TYLAX_CORPUS=str(corpus), TYLAX_CORPUS_REPORT=str(report), TYLAX_CORPUS_OUTPUTS=str(outputs))
         command = ["cargo", "test", "--release", "--features", "data-loading", "--test", "corpus_compile_audit",
                    "--", "--ignored", "--nocapture"]
-        result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True)
+        result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if result.returncode != 0:
-            sys.exit(result.stderr[-3000:])
-        read = lambda path: {r["id"]: r for r in map(json.loads, path.read_text(encoding="utf-8").splitlines())}
+            combined = "\n".join(part for part in (result.stdout, result.stderr) if part)
+            sys.exit(combined[-3000:])
+        read = lambda path: {
+            r["id"]: r
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+            for r in (json.loads(line),)
+        }
         return read(outputs), read(report)
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--corpus", nargs="*", default=[], help="corpora for command frequencies")
     parser.add_argument("--commands", help="output of tools/latex_command_lists.mjs (default: run it)")
@@ -139,7 +164,8 @@ def main() -> None:
         return f"{counts[name]:7}  {src:3}  \\{name}{char}  ->  {typst}  [{note}]"
 
     def first_error(key: str) -> str:
-        return failures[key]["errors"][0]["message"]
+        errors = failures[key].get("errors") or []
+        return errors[0]["message"] if errors else "<none>"
 
     by_frequency = lambda n: (-counts[n], n)
     limit = args.top or None
@@ -165,7 +191,7 @@ def main() -> None:
         typst = (outputs.get(name) or {}).get("typst") or ""
         if name in failures or name in literals:
             continue
-        if re.search(rf"(?<![\\w.]){re.escape(name)}(?![\\w.])", typst):
+        if re.search(rf"(?<![\w.]){re.escape(name)}(?![\w.])", typst):
             accidental.append(name)
     print(f"\n== pass through as the bare name but compile: {len(accidental)} (check the meaning) ==")
     for name in sorted(accidental, key=by_frequency)[:limit]:
