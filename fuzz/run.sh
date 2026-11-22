@@ -7,6 +7,10 @@
 # a normal build handles, so the stack is raised to the macOS maximum. (Turning
 # the sanitizer off fails to link, because tylax also builds as a cdylib.)
 set -eu
+if [ "$#" -lt 1 ]; then
+  echo "usage: fuzz/run.sh <target> [seconds]" >&2
+  exit 2
+fi
 target=$1
 seconds=${2:-300}
 case $target in
@@ -18,7 +22,7 @@ case $target in
 esac
 [ -d "fuzz/seeds/$seeds" ] || python3 -I fuzz/make_seeds.py
 mkdir -p "fuzz/corpus/$target"
-ulimit -s 65520
+ulimit -s 65520 2>/dev/null || true
 cd fuzz
 exec cargo fuzz run "$target" "corpus/$target" "seeds/$seeds" -- \
   -dict="dict/$dict.dict" -max_total_time="$seconds" -timeout=5 -max_len=4096 \

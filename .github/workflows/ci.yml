@@ -85,3 +85,24 @@ jobs:
         shell: bash
       - name: Run tests
         run: pytest bindings/python/tests/ -v
+
+  fuzz:
+    name: Fuzz Harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check fuzz formatting
+        run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+      - name: Check fuzz targets
+        run: cargo check --manifest-path fuzz/Cargo.toml --bins
+      - name: Run fuzz clippy
+        run: cargo clippy --manifest-path fuzz/Cargo.toml --bins -- -D warnings
+      - name: Verify fuzz seed generator
+        run: |
+          python3 -I fuzz/make_seeds.py
+          test -n "$(ls -A fuzz/seeds/latex_math)"
+          test -n "$(ls -A fuzz/seeds/typst_math)"

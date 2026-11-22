@@ -82,19 +82,15 @@ fn plausibly_valid(input: &str) -> bool {
     depth == 0 && envs.is_empty()
 }
 
-/// Whether the output calls an unknown command as a function. tylax passes an
-/// unknown `\foo` through as `foo`, so `\foo(x` becomes the unclosed call
-/// `foo(x`. The input is invalid LaTeX (an undefined command), so skip it.
-fn calls_unknown_command(input: &str, output: &str) -> bool {
-    input.split('\\').skip(1).any(|rest| {
-        let name: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_alphabetic())
-            .collect();
-        !name.is_empty()
-            && tylax::latex_to_typst(&format!("\\{name}")).trim() == name
-            && output.contains(&format!("{name}("))
-    })
+/// Whether conversion encountered an unknown LaTeX math command passed through
+/// as a bare identifier (e.g. `\foo`). Undefined commands are invalid LaTeX and
+/// can produce unparseable Typst calls, so skip those cases based on tylax's
+/// own diagnostics rather than guessing from output identifiers.
+fn has_unknown_command(result: &tylax::L2TConversionResult) -> bool {
+    result
+        .warnings
+        .iter()
+        .any(|w| w.kind == tylax::WarningKind::UnsupportedMacro)
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -104,10 +100,13 @@ fuzz_target!(|data: &[u8]| {
     if !plausibly_valid(input) {
         return;
     }
-    let output = tylax::latex_to_typst(input);
-    let root = typst_syntax::parse(&format!("$ {output} $"));
-    if root.erroneous() && !calls_unknown_command(input, &output) {
+    let result = tylax::latex_math_to_typst_with_diagnostics(input);
+    let root = typst_syntax::parse(&format!("$ {} $", result.output));
+    if root.erroneous() && !has_unknown_command(&result) {
         let errors: Vec<_> = root.errors().into_iter().map(|e| e.message).collect();
-        panic!("output does not parse as Typst math\ninput:  {input:?}\noutput: {output:?}\nerrors: {errors:?}");
+        panic!(
+            "output does not parse as Typst math\ninput:  {input:?}\noutput: {:?}\nerrors: {errors:?}",
+            result.output
+        );
     }
 });

@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 
 root = Path(__file__).resolve().parent.parent
-cases = json.loads((root / "tests" / "corpus_merged.json").read_text())
+cases = json.loads((root / "tests" / "corpus_merged.json").read_text(encoding="utf-8"))
 
 for field, out in (("latex", "latex_math"), ("typst", "typst_math")):
     out_dir = root / "fuzz" / "seeds" / out
@@ -17,5 +17,5 @@ for field, out in (("latex", "latex_math"), ("typst", "typst_math")):
         text = case.get(field)
         if not text:
             continue
-        data = text.encode()
+        data = text.encode("utf-8")
         (out_dir / hashlib.sha1(data).hexdigest()).write_bytes(data)

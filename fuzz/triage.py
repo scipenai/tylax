@@ -17,6 +17,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+if len(sys.argv) < 2:
+    print(
+        "usage: python3 -I fuzz/triage.py <target> [examples-per-group]",
+        file=sys.stderr,
+    )
+    sys.exit(2)
 target = sys.argv[1]
 per_group = int(sys.argv[2]) if len(sys.argv) > 2 else 3
 
@@ -32,7 +38,7 @@ for path in sorted(glob.glob(str(fuzz / "artifacts" / target / "*"))):
         continue
     try:
         # Match run.sh: AddressSanitizer needs a larger stack than the 8 MB default.
-        run = subprocess.run(["/bin/sh", "-c", 'ulimit -s 65520 && exec "$0" "$1"', binary, path],
+        run = subprocess.run(["/bin/sh", "-c", 'ulimit -s 65520 2>/dev/null || true; exec "$0" "$1"', binary, path],
                              capture_output=True, text=True,
                              errors="replace", timeout=30)
         log, failed = run.stderr, run.returncode != 0
