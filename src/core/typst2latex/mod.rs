@@ -282,22 +282,35 @@ fn typst_to_latex_with_options_and_bibliography_keys(
 
     // Preprocess: strip `//! tylax:` ignore directives, then handle imports, etc.
     let input = preprocess::strip_tylax_ignores(input);
-    let processed_input = preprocess::preprocess_typst(&input);
+    let shadowed_marker = math_ir::unique_shadowed_context_marker(&input);
+    let annotated_input =
+        math_ir::annotate_shadowed_llap_contexts(&input, options.math_only, &shadowed_marker);
+    let processed_input = preprocess::preprocess_typst(&annotated_input);
 
     // The AST is kept so the reference finalizer can look up what each label
     // points at; Typst renders that supplement automatically and LaTeX does
     // not (issue #43).
-    let mut document_root = None;
-    if options.math_only {
-        let root = parse_math(&processed_input);
-        math::convert_math_node(&root, &mut ctx);
-    } else {
-        let root = parse(&processed_input);
-        markup::convert_markup_node(&root, &mut ctx);
-        document_root = Some(root);
-    }
+    let document_root = math_ir::with_math_build_env(
+        math_ir::MathBuildEnv {
+            shadowed_context_marker: Some(shadowed_marker.clone()),
+        },
+        || {
+            if options.math_only {
+                let root = parse_math(&processed_input);
+                math::convert_math_node(&root, &mut ctx);
+                None
+            } else {
+                let root = parse(&processed_input);
+                markup::convert_markup_node(&root, &mut ctx);
+                Some(root)
+            }
+        },
+    );
 
     let mut result = ctx.finalize();
+    if result.contains(&shadowed_marker) {
+        result = result.replace(&shadowed_marker, "");
+    }
     result = match document_root.as_ref() {
         Some(root) => supplement::resolve_references(root, &result, bibliography_keys),
         None => supplement::strip_marks(&result),
@@ -369,16 +382,33 @@ fn typst_to_latex_with_diagnostics_and_bibliography_keys(
     let input = preprocess::strip_tylax_ignores(input);
     let input = input.as_str();
 
+    // MiniEval parses documents; keep bare math in its math context.
+    let math_input = options.math_only.then(|| format!("${input}\n$"));
+    let eval_input = math_input.as_deref().unwrap_or(input);
+    let shadowed_marker = math_ir::unique_shadowed_context_marker(input);
+
     // Step 1: Expand macros using MiniEval (with show rules applied)
     let (expanded_input, expanded_nodes): (String, Option<Vec<ContentNode>>) =
-        match engine::expand_macros_with_warnings(input) {
+        match engine::expand_macros_with_shadowed_context_marker(eval_input, Some(&shadowed_marker))
+        {
             Ok(result) => {
                 warnings.extend(result.warnings.into_iter().map(ConversionWarning::from));
-                (result.output, Some(result.nodes))
+                let expanded = match result.nodes.as_slice() {
+                    [ContentNode::Math { segments, .. }] if options.math_only => {
+                        engine::render_math_segments_to_typst_source(segments)
+                    }
+                    _ => result.output,
+                };
+                (expanded, Some(result.nodes))
             }
             Err(e) => {
                 warnings.push(ConversionWarning::from_eval_error(&e));
-                (preprocess::preprocess_typst(input), None)
+                let annotated = math_ir::annotate_shadowed_llap_contexts(
+                    input,
+                    options.math_only,
+                    &shadowed_marker,
+                );
+                (preprocess::preprocess_typst(&annotated), None)
             }
         };
 
@@ -387,18 +417,25 @@ fn typst_to_latex_with_diagnostics_and_bibliography_keys(
     ctx.options = options.clone();
 
     // As above: keep the parsed document so reference supplements resolve.
-    let mut document_root = None;
-    if options.math_only {
-        let root = parse_math(&expanded_input);
-        math::convert_math_node(&root, &mut ctx);
-    } else if let Some(nodes) = expanded_nodes.as_ref() {
-        markup::convert_content_nodes_to_latex(nodes, &mut ctx);
-        document_root = Some(parse(&expanded_input));
-    } else {
-        let root = parse(&expanded_input);
-        markup::convert_markup_node(&root, &mut ctx);
-        document_root = Some(root);
-    }
+    let document_root = math_ir::with_math_build_env(
+        math_ir::MathBuildEnv {
+            shadowed_context_marker: Some(shadowed_marker.clone()),
+        },
+        || {
+            if options.math_only {
+                let root = parse_math(&expanded_input);
+                math::convert_math_node(&root, &mut ctx);
+                None
+            } else if let Some(nodes) = expanded_nodes.as_ref() {
+                markup::convert_content_nodes_to_latex(nodes, &mut ctx);
+                Some(parse(&expanded_input))
+            } else {
+                let root = parse(&expanded_input);
+                markup::convert_markup_node(&root, &mut ctx);
+                Some(root)
+            }
+        },
+    );
 
     warnings.extend(
         std::mem::take(&mut ctx.warnings)
@@ -406,6 +443,9 @@ fn typst_to_latex_with_diagnostics_and_bibliography_keys(
             .map(|message| ConversionWarning::new(WarningKind::Other, message)),
     );
     let mut output = ctx.finalize();
+    if output.contains(&shadowed_marker) {
+        output = output.replace(&shadowed_marker, "");
+    }
     output = match document_root.as_ref() {
         Some(root) => supplement::resolve_references(root, &output, bibliography_keys),
         None => supplement::strip_marks(&output),

@@ -121,6 +121,8 @@ pub struct MiniEval {
     show_rules: Vec<ShowRule>,
     /// Current recursion depth (for infinite recursion protection)
     current_depth: usize,
+    /// Internal marker spliced into shadowed `llap`-shaped `#context` nodes.
+    shadowed_context_marker: Option<String>,
 }
 
 /// A control flow event that occurred during evaluation.
@@ -149,6 +151,7 @@ impl MiniEval {
             warnings: Vec::new(),
             show_rules: Vec::new(),
             current_depth: 0,
+            shadowed_context_marker: None,
         }
     }
 
@@ -166,6 +169,7 @@ impl MiniEval {
             warnings: Vec::new(),
             show_rules: Vec::new(),
             current_depth: 0,
+            shadowed_context_marker: None,
         }
     }
 
@@ -183,6 +187,7 @@ impl MiniEval {
             warnings: Vec::new(),
             show_rules: Vec::new(),
             current_depth: 0,
+            shadowed_context_marker: None,
         }
     }
 
@@ -200,6 +205,7 @@ impl MiniEval {
             warnings: Vec::new(),
             show_rules: Vec::new(),
             current_depth: 0,
+            shadowed_context_marker: None,
         }
     }
 
@@ -675,6 +681,7 @@ impl MiniEval {
             warnings: Vec::new(),
             show_rules: self.show_rules.clone(),
             current_depth: self.current_depth, // Inherit depth from parent
+            shadowed_context_marker: self.shadowed_context_marker.clone(),
         };
 
         let root = parse(&content);
@@ -744,6 +751,7 @@ impl MiniEval {
             warnings: Vec::new(),
             show_rules: self.show_rules.clone(),
             current_depth: self.current_depth, // Inherit depth from parent
+            shadowed_context_marker: self.shadowed_context_marker.clone(),
         };
 
         let root = parse(&content);
@@ -1374,7 +1382,14 @@ impl MiniEval {
                 ContentNode::Text(text) => text.clone(),
                 _ => nodes[0].to_typst(),
             },
-            Value::Content(nodes) => nodes.iter().map(|n| n.to_typst()).collect::<String>(),
+            Value::Content(nodes) => nodes
+                .iter()
+                .map(|n| match n {
+                    ContentNode::Label(label) | ContentNode::LabelDef(label) => label.clone(),
+                    ContentNode::Text(text) => text.clone(),
+                    _ => n.to_typst(),
+                })
+                .collect::<String>(),
             other => other.display(),
         };
         Ok(normalize_ref_target_text(&raw))
@@ -2162,6 +2177,18 @@ impl MiniEval {
             }
         };
 
+        let push_value = |segments: &mut Vec<MathSegment>, value: Value| {
+            if node.kind() == Named && !matches!(value, Value::Str(_) | Value::Content(_)) {
+                // Named math arguments retain code types, such as augment: #(1).
+                push_source(
+                    segments,
+                    &format!("#{}", super::value::value_to_typst_arg(&value)),
+                );
+            } else {
+                segments.push(MathSegment::Evaluated(value));
+            }
+        };
+
         while i < children.len() {
             let child = &children[i];
             match child.kind() {
@@ -2176,7 +2203,7 @@ impl MiniEval {
                             Ident => {
                                 let name = expr_node.text().to_string();
                                 if let Some(value) = self.scopes.get(&name) {
-                                    result.push(MathSegment::Evaluated(value.clone()));
+                                    push_value(&mut result, value.clone());
                                 } else {
                                     push_source(&mut result, &format!("#{}", name));
                                 }
@@ -2190,7 +2217,7 @@ impl MiniEval {
                                     if let Some(expr) = inner.cast::<ast::Expr>() {
                                         match self.eval_expr(expr) {
                                             Ok(value) => {
-                                                result.push(MathSegment::Evaluated(value));
+                                                push_value(&mut result, value);
                                             }
                                             Err(_) => push_source(&mut result, &source()),
                                         }
@@ -2214,7 +2241,7 @@ impl MiniEval {
                                 if let Some(expr) = expr_node.cast::<ast::Expr>() {
                                     match self.eval_expr(expr) {
                                         Ok(value) => {
-                                            result.push(MathSegment::Evaluated(value));
+                                            push_value(&mut result, value);
                                         }
                                         Err(_) => push_source(&mut result, &source()),
                                     }
@@ -2225,9 +2252,33 @@ impl MiniEval {
                                 continue;
                             }
                             _ => {
+                                let marked = self.shadowed_context_marker.as_deref().and_then(|marker| {
+                                    let h_shadowed = self.scopes.contains("h");
+                                    let measure_shadowed = self.scopes.contains("measure");
+                                    if expr_node.kind() == Contextual
+                                        && (h_shadowed || measure_shadowed)
+                                    {
+                                        super::super::math_ir::mark_shadowed_context_source(
+                                            expr_node, marker,
+                                        )
+                                    } else if matches!(expr_node.kind(), ContentBlock | CodeBlock) {
+                                        super::super::math_ir::annotate_shadowed_llap_contexts_in_node(
+                                            expr_node,
+                                            h_shadowed,
+                                            measure_shadowed,
+                                            marker,
+                                        )
+                                    } else {
+                                        Option::None
+                                    }
+                                });
                                 // Unknown expression type after hash: keep its
                                 // source whole, as `#context { … }`.
-                                push_source(&mut result, &source());
+                                if let Some(text) = marked {
+                                    push_source(&mut result, &text);
+                                } else {
+                                    push_source(&mut result, &source());
+                                }
                                 i += 2;
                                 continue;
                             }
@@ -2357,6 +2408,13 @@ fn normalize_content_whitespace(nodes: Vec<ContentNode>) -> Vec<ContentNode> {
 ///
 /// This is the full version that returns both the expanded output and any warnings.
 pub fn expand_macros_with_warnings(source: &str) -> EvalResult<ExpandResult> {
+    expand_macros_with_shadowed_context_marker(source, None)
+}
+
+pub(crate) fn expand_macros_with_shadowed_context_marker(
+    source: &str,
+    shadowed_context_marker: Option<&str>,
+) -> EvalResult<ExpandResult> {
     let root = parse(source);
 
     if !root.errors().is_empty() {
@@ -2375,6 +2433,7 @@ pub fn expand_macros_with_warnings(source: &str) -> EvalResult<ExpandResult> {
         .ok_or_else(|| EvalError::syntax("expected markup"))?;
 
     let mut eval = MiniEval::new();
+    eval.shadowed_context_marker = shadowed_context_marker.map(str::to_string);
     let result = eval.eval_markup(markup)?;
 
     // Convert result to content nodes

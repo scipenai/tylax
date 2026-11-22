@@ -59,6 +59,7 @@ mod value;
 mod vfs;
 
 pub use data::{parse_csv, parse_json, parse_toml, parse_yaml};
+pub(crate) use eval::expand_macros_with_shadowed_context_marker;
 pub use eval::{expand_macros, expand_macros_with_warnings, EvalWarning, ExpandResult, MiniEval};
 pub use scope::{Scope, Scopes};
 pub(crate) use value::render_math_segments_to_typst_source;

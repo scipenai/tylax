@@ -323,7 +323,7 @@ fn unresolved_columns_keep_known_cells_with_a_warning() {
         ("#table(columns: tracks, [kept], [last]) After", 2),
         ("#table(columns: (..tracks, auto), [kept], [last]) After", 2),
         (
-            "#let n = 1001; #table(columns: (auto,) * n, [#calc.sin(30deg) kept], [last]) After",
+            "#let n = 1001; #table(columns: (auto,) * n, [#assert(false) kept], [last]) After",
             2,
         ),
         (

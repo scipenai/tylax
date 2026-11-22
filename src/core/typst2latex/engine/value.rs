@@ -1531,11 +1531,25 @@ fn value_to_typst_math_arg(value: &Value) -> String {
     }
 }
 
+fn escape_typst_markup_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(
+            ch,
+            '\\' | '$' | '#' | '[' | ']' | '*' | '_' | '`' | '<' | '>' | '@'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 impl ContentNode {
     /// Convert this content node back to Typst source code.
     pub fn to_typst(&self) -> String {
         match self {
-            ContentNode::Text(s) => s.clone(),
+            ContentNode::Text(s) => escape_typst_markup_text(s),
             ContentNode::Space => " ".to_string(),
             ContentNode::Linebreak => "\\\n".to_string(),
             ContentNode::Parbreak => "\n\n".to_string(),

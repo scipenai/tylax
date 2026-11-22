@@ -1,4 +1,4 @@
-use super::context::{ConvertContext, EnvironmentContext, T2LOptions, TokenType};
+use super::context::{ConvertContext, EnvironmentContext, TokenType};
 use super::math_ir::{
     normalize_math_ir, ArrayLayout, MathCommand, MathEnvironment, MathIr, MathSpacing,
     MathStyleMode,
@@ -44,6 +44,11 @@ pub fn emit_math_ir(ir: &MathIr, ctx: &mut ConvertContext) {
         MathIr::Command(command) => emit_command(command, ctx),
         MathIr::Environment(environment) => emit_environment(environment, ctx),
         MathIr::RawLiteral(text) => emit_raw_literal(text, ctx),
+        MathIr::PreservedSource { source, reason } => {
+            ctx.push(&format!("\n% Tylax: {reason}\n"));
+            super::utils::preserve_typst_source(source, ctx);
+            ctx.last_token = TokenType::Command;
+        }
     }
 }
 
@@ -60,18 +65,12 @@ fn emit_apply(callee: &MathIr, args: &[MathIr], ctx: &mut ConvertContext) {
     ctx.last_token = TokenType::CloseParen;
 }
 
-/// Render math IR in a context of its own, such as an equation inside a text
-/// argument, which is built outside an emitting context.
-pub fn render_math_ir(ir: &MathIr, options: &T2LOptions) -> String {
+pub fn emit_math_ir_to_string(ir: &MathIr, template: &ConvertContext) -> String {
     let mut nested = ConvertContext::new();
-    nested.options = options.clone();
+    nested.options = template.options.clone();
     nested.in_math = true;
     emit_math_ir(ir, &mut nested);
     nested.finalize()
-}
-
-pub fn emit_math_ir_to_string(ir: &MathIr, template: &ConvertContext) -> String {
-    render_math_ir(ir, &template.options)
 }
 
 fn emit_symbol(symbol: &str, ctx: &mut ConvertContext) {
@@ -131,7 +130,12 @@ fn emit_spacing(spacing: &MathSpacing, ctx: &mut ConvertContext) {
 fn emit_delimited(open: &str, content: &MathIr, close: &str, ctx: &mut ConvertContext) {
     ctx.push(open);
     ctx.last_token = delimiter_token_type(open, true);
-    emit_math_ir(content, ctx);
+    if open == "$" && close == "$" {
+        // An equation inside text stays inline in an outer aligned formula.
+        ctx.push(&emit_math_ir_to_string(content, ctx));
+    } else {
+        emit_math_ir(content, ctx);
+    }
     ctx.push(close);
     ctx.last_token = delimiter_token_type(close, false);
 }
@@ -295,14 +299,14 @@ fn emit_stacked_scripts(
     if let Some(sup) = sup {
         stacked = format!(
             r"\overset{{{}}}{{{}}}",
-            render_script_fragment(sup, ctx),
+            render_script_content(sup, true, ctx),
             stacked
         );
     }
     if let Some(sub) = sub {
         stacked = format!(
             r"\underset{{{}}}{{{}}}",
-            render_script_fragment(sub, ctx),
+            render_script_content(sub, true, ctx),
             stacked
         );
     }
@@ -529,30 +533,27 @@ fn emit_rendered_script_content(rendered: &str, ctx: &mut ConvertContext) {
 }
 
 fn emit_script_content_for_base(ir: &MathIr, base: Option<&MathIr>, ctx: &mut ConvertContext) {
-    if let Some(base) = base {
-        if is_limits_like_base(base) {
-            if let Some(lines) = split_top_level_script_lines(ir) {
-                let rendered_lines: Vec<String> = lines
-                    .iter()
-                    .map(|line| render_script_fragment(line, ctx))
-                    .filter(|line| !line.is_empty())
-                    .collect();
+    let rendered = render_script_content(ir, base.is_some_and(is_limits_like_base), ctx);
+    emit_rendered_script_content(&rendered, ctx);
+}
 
-                if rendered_lines.len() > 1 {
-                    let joined = strip_grouping_parentheses_from_rendered_script(
-                        rendered_lines.join(r" \\ "),
-                    );
-                    ctx.push(r"{\substack{");
-                    ctx.push(&joined);
-                    ctx.push("}}");
-                    ctx.last_token = TokenType::Command;
-                    return;
-                }
+fn render_script_content(ir: &MathIr, multiline: bool, ctx: &ConvertContext) -> String {
+    if multiline {
+        if let Some(lines) = split_top_level_script_lines(ir) {
+            let rendered_lines: Vec<String> = lines
+                .iter()
+                .map(|line| render_script_fragment(line, ctx))
+                .filter(|line| !line.is_empty())
+                .collect();
+
+            if rendered_lines.len() > 1 {
+                let joined =
+                    strip_grouping_parentheses_from_rendered_script(rendered_lines.join(r" \\ "));
+                return format!(r"\substack{{{joined}}}");
             }
         }
     }
-
-    emit_script_content(ir, ctx);
+    render_script_fragment(ir, ctx)
 }
 
 fn emit_script_content(ir: &MathIr, ctx: &mut ConvertContext) {
@@ -626,11 +627,16 @@ fn emit_command(command: &MathCommand, ctx: &mut ConvertContext) {
 
     for arg in &command.args {
         ctx.push("{");
-        match arg {
-            // Text is typeset as written, so its edge spaces stay:
-            // `x " and " y` → `x \text{ and } y`.
-            MathIr::RawLiteral(text) if command.latex == "\\text" => ctx.push(text),
-            _ => ctx.push(&emit_math_ir_to_string(arg, ctx)),
+        if command.preserve_empty_args {
+            ctx.last_token = TokenType::OpenParen;
+            emit_math_ir(arg, ctx);
+        } else {
+            match arg {
+                // Text is typeset as written, so its edge spaces stay:
+                // `x " and " y` → `x \text{ and } y`.
+                MathIr::RawLiteral(text) if command.latex == "\\text" => ctx.push(text),
+                _ => ctx.push(&emit_math_ir_to_string(arg, ctx)),
+            }
         }
         ctx.push("}");
     }
@@ -700,12 +706,10 @@ fn emit_raw_literal(text: &str, ctx: &mut ConvertContext) {
 }
 
 fn delimiter_token_type(delim: &str, is_open: bool) -> TokenType {
-    if delim.starts_with("\\left") || delim.starts_with("\\right") || delim.starts_with('\\') {
-        if is_open {
-            TokenType::OpenParen
-        } else {
-            TokenType::CloseParen
-        }
+    if delim.rsplit_once('\\').is_some_and(|(_, name)| {
+        !name.is_empty() && name.chars().all(|ch| ch.is_ascii_alphabetic())
+    }) {
+        TokenType::Command
     } else if is_open {
         TokenType::OpenParen
     } else {

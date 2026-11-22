@@ -376,8 +376,8 @@ impl ConvertContext {
         let mut prev_char = None;
         let mut in_comment = false;
         let mut escaped = false;
-        // Brace depth, and the depth inside a `\text{…}` argument, whose
-        // spaces are typeset and so are kept.
+        // Keep spaces next to braces in text and box arguments.
+        // Consecutive spaces still collapse.
         let mut depth = 0usize;
         let mut text_depth = None;
 
@@ -406,7 +406,14 @@ impl ConvertContext {
                 match ch {
                     '{' => {
                         depth += 1;
-                        if text_depth.is_none() && result.ends_with("\\text") {
+                        if text_depth.is_none()
+                            && [
+                                "\\text", "\\textit", "\\textbf", "\\texttt", "\\fbox", "\\rlap",
+                                "\\llap",
+                            ]
+                            .iter()
+                            .any(|cmd| result.ends_with(cmd))
+                        {
                             text_depth = Some(depth);
                         }
                     }
