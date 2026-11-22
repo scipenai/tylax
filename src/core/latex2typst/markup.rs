@@ -230,14 +230,14 @@ const NEGATABLE_SYMBOLS: &[&str] = &[
 /// A required argument of a text command inside math, converted as text.
 fn convert_text_arg(conv: &mut LatexConverter, cmd: &CmdItem, index: usize) -> String {
     let previous_mode = conv.state.mode;
-    let previous_escape = conv.state.escape_text_brackets;
+    let previous_block = conv.in_math_text_block;
     conv.state.mode = ConversionMode::Text;
-    conv.state.escape_text_brackets = true;
+    conv.in_math_text_block = true;
     conv.state.push_env(EnvironmentContext::None);
     let content = conv.convert_required_arg(cmd, index).unwrap_or_default();
     conv.state.pop_env();
     conv.state.mode = previous_mode;
-    conv.state.escape_text_brackets = previous_escape;
+    conv.in_math_text_block = previous_block;
     content
 }
 
@@ -915,13 +915,8 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "text" | "textrm" | "textup" | "textnormal" => {
             if let Some(arg) = conv.get_required_arg(&cmd, 0) {
-                if conv.state.escape_text_brackets {
-                    for c in arg.chars() {
-                        if matches!(c, '[' | ']') {
-                            output.push('\\');
-                        }
-                        output.push(c);
-                    }
+                if conv.in_math_text_block {
+                    super::context::push_escaped_typst_text(&arg, output);
                 } else {
                     output.push_str(&arg);
                 }

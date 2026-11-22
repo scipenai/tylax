@@ -128,6 +128,13 @@ fn flatten_delimiter_sequence(
     let mut after_script = false;
     for (index, child) in node.children_with_tokens().enumerate() {
         let kind = child.kind();
+        // Optional `[...]` arguments drop their outer brackets on output
+        // (`convert_optional_arg`), so they must not pair with inner delimiters.
+        if node.kind() == SyntaxKind::ItemBracket
+            && matches!(kind, SyntaxKind::TokenLBracket | SyntaxKind::TokenRBracket)
+        {
+            continue;
+        }
         if node.kind() == SyntaxKind::ItemAttachComponent {
             match kind {
                 SyntaxKind::TokenUnderscore | SyntaxKind::TokenCaret => {

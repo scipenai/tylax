@@ -10957,6 +10957,34 @@ mod corpus_tail_regressions {
     }
 
     #[test]
+    fn conversion_state_public_fields_stay_source_compatible() {
+        let state = tylax::ConversionState {
+            mode: Default::default(),
+            env_stack: Vec::new(),
+            indent: 0,
+            pending_label: None,
+            pending_op: None,
+            pending_citation: None,
+            pending_reference: None,
+            suppress_next_space: false,
+            macros: Default::default(),
+            in_preamble: false,
+            title: None,
+            author: None,
+            date: None,
+            document_class: None,
+            structured_warnings: Vec::new(),
+            warnings: Vec::new(),
+            counters: Default::default(),
+            acronyms: Default::default(),
+            glossary: Default::default(),
+            used_acronyms: Default::default(),
+            options: Default::default(),
+        };
+        assert!(!state.in_preamble);
+    }
+
+    #[test]
     fn text_blocks_in_math_escape_brackets_isolate_cases_and_keep_line_breaks() {
         assert_eq!(latex_to_typst(r"\textbf{[ $x$}"), r"#strong[\[ $x$]");
         assert_eq!(
@@ -10971,6 +10999,23 @@ mod corpus_tail_regressions {
             "cases(a & #text[if $x > 0$, then $y$; else $z$])"
         );
         assert_eq!(latex_to_typst(r"x\textbf{ if }y"), r#"x bold(" if ") y"#);
+        assert_eq!(
+            latex_to_typst(r"\textbf{a // b $x$}"),
+            r"#strong[a /\/ b $x$]"
+        );
+        assert_eq!(latex_to_typst(r"\text{a // b $x$}"), r"#text[a /\/ b $x$]");
+        assert_eq!(
+            latex_to_typst(r"\textbf{a /// b $x$}"),
+            r"#strong[a /\/\/ b $x$]"
+        );
+        assert_eq!(
+            latex_to_typst(r"\textbf{a \text{//} $x$}"),
+            r"#strong[a /\/ $x$]"
+        );
+        assert_eq!(latex_to_typst(r"\textbf{a @b $x$}"), r"#strong[a \@b $x$]");
+        assert_eq!(latex_to_typst(r"\textbf{a `b $x$}"), r"#strong[a \`b $x$]");
+        assert_eq!(latex_to_typst(r"\textbf{a <b $x$}"), r"#strong[a \<b $x$]");
+        assert_eq!(latex_to_typst(r"\textbf{$x$/$y$}"), r"#strong[$x$/$y$]");
     }
 
     #[test]
@@ -11036,6 +11081,21 @@ mod corpus_tail_regressions {
             .find(|d| d.message.contains(r"\catcode"))
             .expect("expected diagnostic for \\catcode");
         assert_eq!((d.line, d.column), (Some(1), Some(at + 1)));
+
+        assert_eq!(latex_to_typst(r"\sqrt[3](2)"), r"root(3, \()2 \)");
+        assert_eq!(
+            latex_to_typst(r"\sqrt[\sqrt(2)](3)"),
+            r"root(sqrt(\()2 \), \()3 \)"
+        );
+        let opt_src = "\\sqrt[3](2) + \\catcode";
+        let opt_report = tylax::diagnostics::check_latex(opt_src);
+        let opt_at = opt_src.find(r"\catcode").unwrap();
+        let opt_d = opt_report
+            .diagnostics
+            .iter()
+            .find(|d| d.message.contains(r"\catcode"))
+            .expect("expected diagnostic for \\catcode");
+        assert_eq!((opt_d.line, opt_d.column), (Some(1), Some(opt_at + 1)));
     }
 
     #[test]

@@ -102,10 +102,46 @@ impl SourceMap {
     }
 }
 
+/// Skip a balanced `[...]` optional argument starting at `start`, returning the
+/// byte offset right after the closing `]`.
+fn skip_optional_bracket_arg(input: &str, start: usize) -> Option<usize> {
+    if !input.get(start..)?.starts_with('[') {
+        return None;
+    }
+    let mut braces = 0usize;
+    let mut i = start + 1;
+    while i < input.len() {
+        let rest = &input[i..];
+        let ch = rest.chars().next().unwrap();
+        match ch {
+            '%' => i += rest.find('\n').unwrap_or(rest.len()),
+            '\\' => {
+                if let Some(verb) = inline_verb(input, i) {
+                    i = verb.end;
+                    continue;
+                }
+                i += 1 + input[i + 1..].chars().next().map_or(0, char::len_utf8);
+            }
+            '{' => {
+                braces += 1;
+                i += 1;
+            }
+            '}' => {
+                braces = braces.saturating_sub(1);
+                i += 1;
+            }
+            ']' if braces == 0 => return Some(i + 1),
+            _ => i += ch.len_utf8(),
+        }
+    }
+    None
+}
+
 /// Recover mitex-rs/mitex#225 without rewriting literal source.
 pub(crate) fn parse_latex(input: &str, spec: CommandSpec) -> ParsedLatex {
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
     let mut literals = LiteralStore::new(input, "TylaxParserLiteral");
+    let mut last_rbracket: Option<Option<usize>> = None;
     let mut i = 0;
     let mut follows_script = false;
 
@@ -154,10 +190,20 @@ pub(crate) fn parse_latex(input: &str, spec: CommandSpec) -> ParsedLatex {
                         edits.push((i..i, "{".into()));
                         edits.push((end..end, "}".into()));
                     }
-                    // TeX takes one token as `\sqrt`'s radicand, so `\sqrt(2)` is
-                    // the root of `(`, whereas mitex binds a symbol to nothing.
+                    // TeX takes one token as `\sqrt`'s radicand, so `\sqrt(2)` and
+                    // `\sqrt[3](2)` take `(` as the radicand, whereas mitex binds a
+                    // symbol to nothing.
                     if name == "sqrt" {
-                        let sym_pos = skip_spaces_and_comments(input, end);
+                        let mut sym_pos = skip_spaces_and_comments(input, end);
+                        if input.as_bytes().get(sym_pos) == Some(&b'[')
+                            && last_rbracket
+                                .get_or_insert_with(|| input.rfind(']'))
+                                .is_some_and(|last| last > sym_pos)
+                        {
+                            if let Some(after_opt) = skip_optional_bracket_arg(input, sym_pos) {
+                                sym_pos = skip_spaces_and_comments(input, after_opt);
+                            }
+                        }
                         if let Some(symbol) = input[sym_pos..]
                             .chars()
                             .next()
@@ -166,9 +212,6 @@ pub(crate) fn parse_latex(input: &str, spec: CommandSpec) -> ParsedLatex {
                             let sym_end = sym_pos + symbol.len_utf8();
                             edits.push((sym_pos..sym_pos, "{".into()));
                             edits.push((sym_end..sym_end, "}".into()));
-                            i = sym_end;
-                            follows_script = false;
-                            continue;
                         }
                     }
                     i = end;
@@ -187,6 +230,7 @@ pub(crate) fn parse_latex(input: &str, spec: CommandSpec) -> ParsedLatex {
     let prepared = if edits.is_empty() {
         Cow::Borrowed(input)
     } else {
+        edits.sort_by_key(|(range, _)| range.start);
         let mut output = String::with_capacity(input.len());
         let mut copied = 0;
         for (original, replacement) in edits {

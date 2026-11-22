@@ -291,8 +291,6 @@ pub struct ConversionState {
     pub pending_reference: Option<PendingReference>,
     /// Suppress the next raw whitespace token after emitting a spacing-aware token.
     pub suppress_next_space: bool,
-    /// Escape literal `[` / `]` emitted inside `#text[...]` / `#strong[...]` blocks.
-    pub escape_text_brackets: bool,
     /// User-defined macros
     pub macros: HashMap<String, MacroDef>,
     /// Whether we're in preamble
@@ -522,6 +520,24 @@ impl ConversionState {
     }
 }
 
+/// Escape Typst markup syntax characters in literal text emitted inside an
+/// embedded math content block (`#text[...]`, `#strong[...]`, `#emph[...]`).
+pub(crate) fn push_escaped_typst_text(text: &str, output: &mut String) {
+    for c in text.chars() {
+        match c {
+            '/' if output.ends_with('/') => {
+                output.push('\\');
+                output.push('/');
+            }
+            '[' | ']' | '@' | '`' | '<' | '>' | '#' | '*' | '_' | '$' => {
+                output.push('\\');
+                output.push(c);
+            }
+            _ => output.push(c),
+        }
+    }
+}
+
 /// Byte range of trailing parenthesized scripts (`_(...)` / `^(...)`) just
 /// emitted at the end of the active output buffer, so a following `'` moves
 /// onto the script's base in O(1) without rescanning `output`.
@@ -549,6 +565,9 @@ pub struct LatexConverter {
     pub(crate) unpaired_delimiters: HashSet<u32>,
     /// Byte range of trailing `_(...)`/`^(...)` scripts at the end of `output`.
     pub(crate) trailing_script: Option<TrailingScript>,
+    /// Whether we are converting an embedded math content block (`#text[...]`,
+    /// `#strong[...]`, `#emph[...]`), where Typst markup syntax chars must be escaped.
+    pub(crate) in_math_text_block: bool,
 }
 
 /// A `ClauseArgument` is a *required* argument iff it does not carry an
@@ -1487,6 +1506,7 @@ impl LatexConverter {
             attachment_repairs: AttachmentRepairs::default(),
             unpaired_delimiters: HashSet::new(),
             trailing_script: None,
+            in_math_text_block: false,
         }
     }
 
@@ -1503,6 +1523,7 @@ impl LatexConverter {
             attachment_repairs: AttachmentRepairs::default(),
             unpaired_delimiters: HashSet::new(),
             trailing_script: None,
+            in_math_text_block: false,
         }
     }
 
@@ -1672,6 +1693,7 @@ impl LatexConverter {
         self.pending_section = None;
         self.attachment_repairs.take();
         self.trailing_script = None;
+        self.in_math_text_block = false;
     }
 
     /// Convert a complete LaTeX document to Typst
@@ -2281,6 +2303,8 @@ impl LatexConverter {
                     let text = t.text();
                     if matches!(self.state.mode, ConversionMode::Math) {
                         push_math_atoms(text, output);
+                    } else if self.in_math_text_block {
+                        push_escaped_typst_text(text, output);
                     } else {
                         output.push_str(text);
                     }
@@ -2406,12 +2430,16 @@ impl LatexConverter {
                 output.push_str(&elem.to_string());
             }
             TokenSlash => {
-                if matches!(self.state.mode, ConversionMode::Math) || slash_is_between_mathy(elem) {
+                if matches!(self.state.mode, ConversionMode::Math)
+                    || (!self.in_math_text_block && slash_is_between_mathy(elem))
+                {
                     while output.ends_with(char::is_whitespace) {
                         output.pop();
                     }
                     output.push_str(" slash ");
                     self.state.suppress_next_space = true;
+                } else if self.in_math_text_block {
+                    push_escaped_typst_text("/", output);
                 } else {
                     output.push('/');
                 }
@@ -2427,7 +2455,13 @@ impl LatexConverter {
                     output.push_str("\\*");
                 }
             }
-            TokenAtSign => output.push('@'),
+            TokenAtSign => {
+                if self.in_math_text_block && matches!(self.state.mode, ConversionMode::Text) {
+                    output.push_str("\\@");
+                } else {
+                    output.push('@');
+                }
+            }
             // A bare `"` would open a Typst string in math.
             TokenDitto if matches!(self.state.mode, ConversionMode::Math) => {
                 output.push_str("\\\"")
@@ -2436,7 +2470,7 @@ impl LatexConverter {
             // Brackets here are literal text: a real optional argument is consumed by the grammar.
             TokenLBracket | TokenRBracket if self.state.in_preamble => {}
             TokenLParen | TokenRParen | TokenLBracket | TokenRBracket => {
-                let escape_bracket = self.state.escape_text_brackets
+                let escape_bracket = self.in_math_text_block
                     && matches!(self.state.mode, ConversionMode::Text)
                     && matches!(elem.kind(), TokenLBracket | TokenRBracket);
                 if self.is_unpaired_delimiter(&elem) || escape_bracket {
