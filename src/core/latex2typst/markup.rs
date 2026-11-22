@@ -835,7 +835,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 && conv.is_simple_term(&num)
                 && conv.is_simple_term(&den)
             {
-                let _ = write!(output, "{}/{}", num.trim(), den.trim());
+                let _ = write!(output, "{}/{} ", num.trim(), den.trim());
             } else {
                 let _ = write!(output, "frac({}, {})", num.trim(), den.trim());
             }
@@ -855,7 +855,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
                 && conv.is_simple_term(&num)
                 && conv.is_simple_term(&den)
             {
-                let _ = write!(output, "{}/{}", num.trim(), den.trim());
+                let _ = write!(output, "{}/{} ", num.trim(), den.trim());
             } else {
                 let _ = write!(output, "inline(frac({}, {}))", num.trim(), den.trim());
             }

@@ -1107,6 +1107,18 @@ mod l2t_math {
     }
 
     #[test]
+    fn simple_fraction_does_not_merge_with_following_symbol() {
+        for command in ["frac", "tfrac"] {
+            let input = format!(r"\{command}1T\int_0^T");
+            let output = latex_to_typst(&input);
+            assert!(
+                output.contains("1/T integral"),
+                "{input} produced {output:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_sqrt() {
         let result = latex_to_typst(r"\sqrt{x}");
         assert!(result.contains("sqrt") || result.contains("root"));
@@ -1756,7 +1768,7 @@ mod l2t_math {
         );
         assert_eq!(
             latex_to_typst(r"$\overrightarrow{AE} = \frac{2}{5}\overrightarrow{AD}$").trim(),
-            "$arrow(A E) = 2/5arrow(A D)$"
+            "$arrow(A E) = 2/5 arrow(A D)$"
         );
         // Round-trips: `arrow`/`arrow.l`/`arrow.l.r` map back to the over-arrows.
         assert_eq!(
