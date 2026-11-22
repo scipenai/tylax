@@ -6,9 +6,12 @@ use mitex_parser::syntax::{CmdItem, EnvItem, SyntaxElement, SyntaxKind, SyntaxNo
 use rowan::ast::AstNode;
 use std::fmt::Write;
 
-use super::context::{env_header_args, ConversionMode, EnvironmentContext, LatexConverter};
-use super::table::{parse_with_grid_parser, CellAlign};
-use super::utils::sanitize_label;
+use super::context::{
+    env_header_args_with_braces, ConversionMode, EnvironmentContext, LatexConverter,
+};
+use super::markup::convert_dimension;
+use super::table::{parse_with_grid_parser, CellAlign, FULL_RULE_MARKER, PARTIAL_RULE_MARKER};
+use super::utils::{ends_with_unescaped_backslash, sanitize_label};
 use super::{ConversionWarning, WarningKind};
 use crate::data::constants::{CodeBlockOptions, TheoremStyle, LANGUAGE_MAP, THEOREM_TYPES};
 use crate::features::refs::label_to_typst;
@@ -192,11 +195,8 @@ pub fn convert_environment(conv: &mut LatexConverter, elem: SyntaxElement, outpu
         | "eqnarray" | "eqnarray*" => {
             convert_align(conv, &node, env_str, output);
         }
-        "gather" | "gather*" => {
+        "gather" | "gather*" | "multline" | "multline*" => {
             convert_gather(conv, &node, env_str, output);
-        }
-        "multline" | "multline*" => {
-            convert_multline(conv, &node, env_str, output);
         }
         "split" => {
             // split is usually inside equation, just process content
@@ -622,6 +622,15 @@ fn convert_equation(
     let cleaned = strip_inline_labels(&cleaned);
     let cleaned = cleaned.trim();
 
+    // Inside other math, as KaTeX allows: only the body, since a nested
+    // `$ … $` would close the outer equation.
+    if nested_in_math(prev_mode, node) {
+        output.push_str(cleaned);
+        conv.state.mode = prev_mode;
+        conv.state.pop_env();
+        return;
+    }
+
     // For starred equations (equation*), disable numbering
     if is_starred {
         output.push_str("#math.equation(block: true, numbering: none)[\n$ ");
@@ -641,6 +650,26 @@ fn convert_equation(
 
     conv.state.mode = prev_mode;
     conv.state.pop_env();
+}
+
+/// Whether a display environment sits inside other math, as KaTeX allows. It
+/// is not when it is the whole input, so that converting a math fragment may
+/// still make it an equation of its own.
+fn nested_in_math(prev_mode: ConversionMode, node: &SyntaxNode) -> bool {
+    // The environment stands alone when everything around it is blank.
+    prev_mode == ConversionMode::Math
+        && !node.parent().is_none_or(|parent| {
+            parent.kind() == SyntaxKind::ScopeRoot
+                && parent.children_with_tokens().all(|element| {
+                    element.as_node() == Some(node)
+                        || matches!(
+                            element.kind(),
+                            SyntaxKind::TokenWhiteSpace
+                                | SyntaxKind::TokenLineBreak
+                                | SyntaxKind::TokenComment
+                        )
+                })
+        })
 }
 
 /// Convert an align environment
@@ -674,6 +703,10 @@ fn convert_align(
         // Inside an outer equation: emit the body unchanged (labels stay inline,
         // which the enclosing block handles).
         output.push_str(&cleaned);
+    } else if nested_in_math(prev_mode, node) {
+        // `align` inside other math, as KaTeX allows: a nested `$ … $` would
+        // close the outer equation.
+        output.push_str(strip_inline_labels(&cleaned).trim());
     } else if !is_starred && emit_labelled_math_rows(conv, output, &cleaned) {
         // Labels are emitted by the shared row renderer above.
     } else if is_starred {
@@ -693,7 +726,7 @@ fn convert_align(
     conv.state.pop_env();
 }
 
-/// Convert a gather environment
+/// Convert a gather or multline environment
 fn convert_gather(
     conv: &mut LatexConverter,
     node: &SyntaxNode,
@@ -714,42 +747,11 @@ fn convert_gather(
 
     let processed = conv.postprocess_math(content);
 
-    if !is_starred && emit_labelled_math_rows(conv, output, &processed) {
+    // Inside other math: a nested `$ … $` would close the outer equation.
+    if nested_in_math(prev_mode, node) {
+        output.push_str(strip_inline_labels(&processed).trim());
         return;
     }
-
-    let processed = strip_inline_labels(&processed);
-    if is_starred {
-        let _ = write!(
-            output,
-            "#math.equation(block: true, numbering: none)[\n$ {} $\n]\n",
-            processed.trim()
-        );
-    } else {
-        let _ = writeln!(output, "$ {} $", processed.trim());
-    }
-}
-
-/// Convert a multline environment
-fn convert_multline(
-    conv: &mut LatexConverter,
-    node: &SyntaxNode,
-    env_name: &str,
-    output: &mut String,
-) {
-    conv.state.push_env(EnvironmentContext::Equation);
-    let prev_mode = conv.state.mode;
-    conv.state.mode = ConversionMode::Math;
-
-    let is_starred = env_name.ends_with('*');
-
-    let mut content = String::new();
-    conv.visit_env_content(node, &mut content);
-
-    conv.state.mode = prev_mode;
-    conv.state.pop_env();
-
-    let processed = conv.postprocess_math(content);
 
     if !is_starred && emit_labelled_math_rows(conv, output, &processed) {
         return;
@@ -807,21 +809,7 @@ pub(crate) fn convert_matrix_with_delim(
         _ => None,
     });
 
-    // Clean up content - remove zws markers and format
-    let content = content
-        .replace("zws ;", ";")
-        .replace("zws, ", ", ")
-        .trim()
-        .to_string();
-
-    match delim {
-        Some(d) => {
-            let _ = write!(output, "mat(delim: \"{}\", {}) ", d, content);
-        }
-        None => {
-            let _ = write!(output, "mat(delim: #none, {}) ", content);
-        }
-    }
+    write_mat(output, &content, delim, Vec::new(), None);
 }
 
 /// Convert a \begin{array}{colspec}...\end{array} environment to Typst mat()
@@ -850,19 +838,210 @@ pub(crate) fn convert_array_with_delim(
     conv.state.mode = prev_mode;
     conv.state.pop_env();
 
-    let content = content
-        .replace("zws ;", ";")
-        .replace("zws, ", ", ")
-        .trim()
-        .to_string();
+    // `|` in the column spec becomes an `augment` line, as `\hline` does.
+    let spec = get_tabular_col_spec(node).unwrap_or_default();
+    let spec = parse_column_spec(&spec);
+    // The alignment shared by every column, if it is not centred.
+    let align = match spec.columns.split_first() {
+        Some((first, rest)) if first != "c" && rest.iter().all(|a| a == first) => {
+            Some(if first == "l" { "left" } else { "right" })
+        }
+        _ => None,
+    };
+    write_mat(output, &content, delim_override, spec.vlines, align);
+}
 
-    match delim_override {
-        Some(delim) => {
-            let _ = write!(output, "mat(delim: \"{}\", {}) ", delim, content);
+/// Write a converted matrix body as a `mat` call. `\hline` and the column
+/// rules `rule_columns` become `augment` lines. Typst draws only interior
+/// lines, so a rule on the outer edge is dropped, and a partial `\cline` has
+/// no equivalent.
+fn write_mat(
+    output: &mut String,
+    content: &str,
+    delim: Option<&str>,
+    rule_columns: Vec<usize>,
+    align: Option<&str>,
+) {
+    // Remove the zws markers of empty cells.
+    let content = content.replace("zws ;", ";").replace("zws, ", ", ");
+    let (content, rule_rows) = take_rule_markers(content.trim());
+    let (rows, columns) = matrix_shape(&content);
+    let hlines = interior_lines(rule_rows, rows);
+    let vlines = interior_lines(rule_columns, columns);
+    let mut options = String::new();
+    if !hlines.is_empty() || !vlines.is_empty() {
+        let mut parts = Vec::new();
+        if !hlines.is_empty() {
+            parts.push(format!("hline: {}", typst_index_list(&hlines)));
         }
-        None => {
-            let _ = write!(output, "mat(delim: #none, {}) ", content);
+        if !vlines.is_empty() {
+            parts.push(format!("vline: {}", typst_index_list(&vlines)));
         }
+        // Code values: in math, `(hline: 1)` and `left` would be math.
+        let _ = write!(options, "augment: #({}), ", parts.join(", "));
+    }
+    if let Some(align) = align {
+        let _ = write!(options, "align: #{align}, ");
+    }
+    let delim = delim.map_or_else(|| "#none".to_string(), |d| format!("\"{d}\""));
+    let _ = write!(output, "mat(delim: {delim}, {options}{content}) ");
+}
+
+/// Remove the table rule markers that `\hline` and `\cline` leave in a matrix
+/// body, returning the body and, for each full rule, the number of rows above it.
+fn take_rule_markers(content: &str) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(content.len());
+    let mut rule_rows = Vec::new();
+    let mut row = 0;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut rest = content;
+    while let Some(ch) = rest.chars().next() {
+        if let Some(after) = rest.strip_prefix(FULL_RULE_MARKER) {
+            rule_rows.push(row);
+            rest = after;
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix(PARTIAL_RULE_MARKER) {
+            rest = skip_rule_range(after);
+            continue;
+        }
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+        match ch {
+            '\\' => {
+                if let Some(next) = rest.chars().next() {
+                    out.push(next);
+                    rest = &rest[next.len_utf8()..];
+                }
+            }
+            '"' => in_string = !in_string,
+            _ if in_string => {}
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ';' if depth == 0 => row += 1,
+            _ => {}
+        }
+    }
+    // A rule after the last `\\` leaves an empty last row.
+    let trimmed = out.trim_end();
+    // An escaped `\;` is content: `r^(*)= - r\;`.
+    if let Some(body) = trimmed
+        .strip_suffix(';')
+        .filter(|body| !ends_with_unescaped_backslash(body))
+    {
+        out.truncate(body.trim_end().len());
+    }
+    (out, rule_rows)
+}
+
+fn skip_balanced_delimiter(s: &str, open: char, close: char) -> Option<usize> {
+    let mut depth = 0usize;
+    for (idx, ch) in s.char_indices() {
+        if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(idx + ch.len_utf8());
+            }
+        }
+    }
+    None
+}
+
+/// Skip the column range that follows a partial rule, as math converts it:
+/// `\cline{1-2}` leaves `1 - 2` and `\cmidrule[0.4pt](lr){1-2}` leaves
+/// `[0.4 p t](l r)1 - 2`.
+fn skip_rule_range(s: &str) -> &str {
+    let mut rest = s.trim_start();
+    if rest.starts_with('[') {
+        if let Some(end) = skip_balanced_delimiter(rest, '[', ']') {
+            rest = rest[end..].trim_start();
+        }
+    }
+    if rest.starts_with('(') {
+        if let Some(end) = skip_balanced_delimiter(rest, '(', ')') {
+            rest = rest[end..].trim_start();
+        }
+    }
+    let digits = |s: &str| s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let first = digits(rest);
+    if first == 0 {
+        return s;
+    }
+    let after_first = rest[first..].trim_start();
+    let Some(after_dash) = after_first.strip_prefix('-') else {
+        return s;
+    };
+    let after_dash = after_dash.trim_start();
+    let second = digits(after_dash);
+    if second == 0 {
+        return s;
+    }
+    after_dash[second..].trim_start()
+}
+
+/// The number of rows and the widest row's number of cells in a `mat` body.
+fn matrix_shape(content: &str) -> (usize, usize) {
+    let mut rows = 0;
+    let mut columns = 0;
+    let mut cells = 1;
+    let mut row_empty = true;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut chars = content.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                chars.next();
+            }
+            '"' => in_string = !in_string,
+            _ if in_string => {}
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => cells += 1,
+            ';' if depth == 0 => {
+                rows += 1;
+                columns = columns.max(cells);
+                cells = 1;
+                row_empty = true;
+                continue;
+            }
+            _ => {}
+        }
+        if !ch.is_whitespace() {
+            row_empty = false;
+        }
+    }
+    if !row_empty {
+        rows += 1;
+        columns = columns.max(cells);
+    }
+    (rows, columns)
+}
+
+/// The lines strictly inside a matrix of `count` rows or columns, sorted and
+/// without repeats.
+fn interior_lines(mut lines: Vec<usize>, count: usize) -> Vec<usize> {
+    lines.retain(|&line| line > 0 && line < count);
+    lines.sort_unstable();
+    lines.dedup();
+    lines
+}
+
+/// `1` or `(1, 3)`.
+fn typst_index_list(indices: &[usize]) -> String {
+    match indices {
+        [single] => single.to_string(),
+        _ => format!(
+            "({})",
+            indices
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -878,9 +1057,9 @@ pub(crate) fn convert_cases(conv: &mut LatexConverter, node: &SyntaxNode, output
     conv.state.mode = prev_mode;
     conv.state.pop_env();
 
-    // Format as cases
-    let content = content.trim();
-    let _ = write!(output, "cases({}) ", content);
+    // Typst's `cases` draws no rules, so `\hline` is dropped.
+    let (content, _) = take_rule_markers(content.trim());
+    let _ = write!(output, "cases({}) ", content.trim());
 }
 
 /// Convert a verbatim environment
@@ -1224,20 +1403,23 @@ fn convert_algorithm(conv: &mut LatexConverter, node: &SyntaxNode, output: &mut 
 // Helper functions
 // =============================================================================
 
-/// Get the column specification from a tabular environment
-/// The col spec is in the first curly arg after the env name: \begin{tabular}{lccc}
+/// Get the column specification from a tabular or array environment.
+/// The col spec is in the last required curly arg: `\begin{tabular}{lccc}`.
 fn get_tabular_col_spec(node: &SyntaxNode) -> Option<String> {
     // The column spec is the LAST required slot for every shape in the family:
     // `tabular[pos]{cols}` as well as `tabular*{width}[pos]{cols}`.
-    env_header_args(node)
+    env_header_args_with_braces(node)
         .into_iter()
         .rfind(|arg| !arg.optional)
         .map(|arg| arg.content)
 }
 
-/// Skip over a braced group {...} if present.
+/// Skip over a braced group {...} if present (allowing TeX spaces before `{`).
 /// Handles nested braces correctly.
 fn skip_braced_group(chars: &mut std::iter::Peekable<std::str::Chars>) {
+    while chars.peek().is_some_and(|c| c.is_whitespace()) {
+        chars.next();
+    }
     if chars.peek() == Some(&'{') {
         let mut depth = 0;
         for ch in chars.by_ref() {
@@ -1255,9 +1437,12 @@ fn skip_braced_group(chars: &mut std::iter::Peekable<std::str::Chars>) {
     }
 }
 
-/// Extract content from a braced group {...} if present.
-/// Returns the content without the braces.
+/// Extract content from a braced group {...} if present (allowing TeX spaces
+/// before `{`). Returns the content without the braces.
 fn extract_braced_group(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String> {
+    while chars.peek().is_some_and(|c| c.is_whitespace()) {
+        chars.next();
+    }
     if chars.peek() != Some(&'{') {
         return None;
     }
@@ -1316,47 +1501,85 @@ impl ColumnSpec {
     }
 }
 
+/// Parse a column specification, keeping the vertical rules. A specification
+/// without columns gets one left-aligned column.
+fn parse_column_spec_full(spec: &str) -> ColumnSpec {
+    let mut parsed = parse_column_spec(spec);
+    if parsed.columns.is_empty() {
+        parsed.columns.push("l".to_string());
+    }
+    parsed
+}
+
+const MAX_COL_SPEC_ITEMS: usize = 512;
+const MAX_COL_SPEC_DEPTH: usize = 8;
+
 /// Parse a column specification, keeping the vertical rules.
 ///
 /// The `|` separators are real table borders, not decoration, so they have to
 /// survive as structured information: once a table switches Typst's default
 /// grid off, nothing else would draw them (issue #43).
-fn parse_column_spec_full(spec: &str) -> ColumnSpec {
+fn parse_column_spec(spec: &str) -> ColumnSpec {
+    let mut budget = MAX_COL_SPEC_ITEMS;
+    parse_column_spec_bounded(spec, 0, &mut budget)
+}
+
+fn parse_column_spec_bounded(spec: &str, depth: usize, budget: &mut usize) -> ColumnSpec {
     let mut columns = Vec::new();
     let mut vlines = Vec::new();
     let mut chars = spec.chars().peekable();
 
     while let Some(c) = chars.next() {
+        if *budget == 0 {
+            break;
+        }
         match c {
-            'l' | 'c' | 'r' => columns.push(c.to_string()),
+            'l' | 'c' | 'r' => {
+                *budget -= 1;
+                columns.push(c.to_string());
+            }
             'p' | 'm' | 'b' | 'X' => {
                 skip_braced_group(&mut chars); // Skip width specification
+                *budget -= 1;
                 columns.push("l".to_string()); // Default to left
             }
             '*' => {
                 // Repeat specification *{n}{spec}
                 if let Some(count_str) = extract_braced_group(&mut chars) {
-                    let count: usize = count_str.parse().unwrap_or(1);
+                    let count: usize = count_str.trim().parse().unwrap_or(1);
                     if let Some(spec_str) = extract_braced_group(&mut chars) {
-                        let inner = parse_column_spec_full(&spec_str);
-                        for _ in 0..count {
-                            let base = columns.len();
-                            vlines.extend(inner.vlines.iter().map(|at| base + at));
-                            columns.extend(inner.columns.iter().cloned());
+                        if count > 0 && depth < MAX_COL_SPEC_DEPTH {
+                            let inner = parse_column_spec_bounded(&spec_str, depth + 1, budget);
+                            if inner.columns.is_empty() && inner.vlines.is_empty() {
+                                continue;
+                            }
+                            let item_cost = (inner.columns.len() + inner.vlines.len()).max(1);
+                            let mut remaining = count;
+                            while remaining > 0 {
+                                if remaining < count {
+                                    if *budget < item_cost {
+                                        break;
+                                    }
+                                    *budget -= item_cost;
+                                }
+                                let base = columns.len();
+                                vlines.extend(inner.vlines.iter().map(|at| base + at));
+                                columns.extend(inner.columns.iter().cloned());
+                                remaining -= 1;
+                            }
                         }
                     }
                 }
             }
             // A vertical rule sits at the boundary before the next column.
-            '|' => vlines.push(columns.len()),
+            '|' => {
+                *budget -= 1;
+                vlines.push(columns.len());
+            }
             '@' | '!' => skip_braced_group(&mut chars), // Skip @{} and !{} expressions
             '>' | '<' => skip_braced_group(&mut chars), // Skip column modifiers
             _ => {}
         }
-    }
-
-    if columns.is_empty() {
-        columns.push("l".to_string());
     }
 
     // Sorted but NOT deduplicated: `||` must stay visible as two rules.
@@ -1364,27 +1587,4 @@ fn parse_column_spec_full(spec: &str) -> ColumnSpec {
     vlines.sort_unstable();
 
     ColumnSpec { columns, vlines }
-}
-
-/// Convert a LaTeX dimension to Typst
-fn convert_dimension(dim: &str) -> String {
-    let dim = dim.trim();
-
-    if dim.contains("\\linewidth") || dim.contains("\\textwidth") {
-        if let Some(mult) = dim
-            .strip_suffix("\\linewidth")
-            .or(dim.strip_suffix("\\textwidth"))
-        {
-            let mult = mult.trim();
-            if mult.is_empty() || mult == "1" {
-                return "100%".to_string();
-            }
-            if let Ok(f) = mult.parse::<f32>() {
-                return format!("{}%", (f * 100.0) as i32);
-            }
-        }
-        return "100%".to_string();
-    }
-
-    dim.to_string()
 }

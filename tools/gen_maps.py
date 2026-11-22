@@ -244,6 +244,8 @@ GLOB_ARG_COMMANDS = {
     "pderivative": "{,b}ttt",
     "pdv": "{,b}ttt",
     "pdv*": "{,b}ttt",
+    # `\rule[raise]{width}{height}`.
+    "rule": "{,b}tt",
 }
 
 # Zero-argument commands with no Typst alias: known to the parser so
@@ -321,7 +323,7 @@ COMMANDS_WITH_ARGS = {
     # see the operator it wraps, so `\textcircled{\cdot}` loses its circle.
     "pmod": 1, "pod": 1, "displaylines": 1, "set": 1, "Set": 1,
     "not": 1, "phantom": 1, "cancel": 1, "bcancel": 1,
-    "boxed": 1, "fbox": 1, "hspace": 1, "hspace*": 1, "vspace": 1, "vspace*": 1,
+    "boxed": 1, "fbox": 1, "mbox": 1, "hbox": 1, "llap": 1, "rlap": 1, "hspace": 1, "hspace*": 1, "vspace": 1, "vspace*": 1,
     "textcircled": 1,
     
     # Fractions and roots (2 args)

@@ -344,6 +344,16 @@ pub(crate) struct EnvHeaderArg {
 /// bracket. mitex attaches the bound slots to the `\begin` marker, so they are
 /// collected from there rather than from the environment's children.
 pub(crate) fn env_header_args(node: &SyntaxNode) -> Vec<EnvHeaderArg> {
+    collect_env_header_args(node, false)
+}
+
+/// Like [`env_header_args`], but keeps nested `{...}` groups inside each
+/// slot (for column specs such as `*{2}{|c}` and `p{3cm}|p{2cm}`).
+pub(crate) fn env_header_args_with_braces(node: &SyntaxNode) -> Vec<EnvHeaderArg> {
+    collect_env_header_args(node, true)
+}
+
+fn collect_env_header_args(node: &SyntaxNode, preserve_inner_braces: bool) -> Vec<EnvHeaderArg> {
     let mut args = Vec::new();
     for child in node.children() {
         if child.kind() != SyntaxKind::ItemBegin {
@@ -360,10 +370,12 @@ pub(crate) fn env_header_args(node: &SyntaxNode) -> Vec<EnvHeaderArg> {
                 .children()
                 .any(|item| item.kind() == SyntaxKind::ItemCurly);
             if optional || braced {
-                args.push(EnvHeaderArg {
-                    optional,
-                    content: extract_arg_content(&slot),
-                });
+                let content = if preserve_inner_braces {
+                    extract_arg_content_with_braces(&slot)
+                } else {
+                    extract_arg_content(&slot)
+                };
+                args.push(EnvHeaderArg { optional, content });
             }
         }
     }
@@ -599,7 +611,7 @@ fn is_required_clause(child: &SyntaxNode) -> bool {
 ///
 /// A trailing `\\` draws nothing in LaTeX, but its Typst `\` would escape the
 /// closing `$`: `$a\\$` gave `$a \$`.
-fn strip_trailing_line_breaks(math: &str) -> &str {
+pub(super) fn strip_trailing_line_breaks(math: &str) -> &str {
     let mut math = math.trim();
     while ends_with_unescaped_backslash(math) {
         math = math[..math.len() - 1].trim_end();
@@ -1947,7 +1959,7 @@ impl LatexConverter {
                         matches!(
                             c.kind(),
                             SyntaxKind::ItemNewLine | SyntaxKind::TokenAmpersand
-                        )
+                        ) || is_command_named(c, "cr")
                     })
                     .map_or(children.len(), |offset| index + 1 + offset);
                 let mut styled_content = String::new();
@@ -2335,15 +2347,7 @@ impl LatexConverter {
             }
 
             // Newline command \\
-            ItemNewLine => match self.state.current_env() {
-                EnvironmentContext::Matrix => output.push_str("zws ;"),
-                EnvironmentContext::Cases => output.push(','),
-                EnvironmentContext::Align | EnvironmentContext::Equation => {
-                    output.push_str(" \\ ");
-                }
-                EnvironmentContext::Tabular => output.push_str("|||ROW|||"),
-                _ => output.push_str("\\ "),
-            },
+            ItemNewLine => self.push_row_break(output),
 
             // Ampersand (column separator)
             TokenAmpersand => match self.state.current_env() {
@@ -2710,6 +2714,19 @@ impl LatexConverter {
     // ============================================================
     // Math post-processing
     // ============================================================
+
+    /// Write a `\\` (or plain TeX's `\cr`) row break for the current environment.
+    pub(crate) fn push_row_break(&self, output: &mut String) {
+        match self.state.current_env() {
+            EnvironmentContext::Matrix => output.push_str("zws ;"),
+            EnvironmentContext::Cases => output.push_str(", "),
+            EnvironmentContext::Align | EnvironmentContext::Equation => {
+                output.push_str(" \\ ");
+            }
+            EnvironmentContext::Tabular => output.push_str("|||ROW|||"),
+            _ => output.push_str("\\ "),
+        }
+    }
 
     /// Post-process math output
     pub fn postprocess_math(&self, input: String) -> String {

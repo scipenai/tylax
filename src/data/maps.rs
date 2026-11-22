@@ -1617,6 +1617,7 @@ lazy_static! {
         m.insert("gradient".to_string(), cmd1());
         m.insert("grave".to_string(), cmd1());
         m.insert("hat".to_string(), cmd1());
+        m.insert("hbox".to_string(), cmd1());
         m.insert("highlight".to_string(), cmd1());
         m.insert("hl".to_string(), cmd1());
         m.insert("href".to_string(), cmd2());
@@ -1631,6 +1632,7 @@ lazy_static! {
         m.insert("ketbra".to_string(), cmd2());
         m.insert("label".to_string(), cmd1());
         m.insert("laplacian".to_string(), cmd1());
+        m.insert("llap".to_string(), cmd1());
         m.insert("mathbb".to_string(), cmd1());
         m.insert("mathbf".to_string(), cmd1());
         m.insert("mathbin".to_string(), cmd1());
@@ -1653,6 +1655,7 @@ lazy_static! {
         m.insert("matrixel".to_string(), cmd3());
         m.insert("matrixelement".to_string(), cmd3());
         m.insert("matrixquantity".to_string(), cmd1());
+        m.insert("mbox".to_string(), cmd1());
         m.insert("mdet".to_string(), cmd1());
         m.insert("mel".to_string(), cmd3());
         m.insert("mel*".to_string(), cmd3());
@@ -1694,6 +1697,7 @@ lazy_static! {
         m.insert("qqtext".to_string(), cmd1());
         m.insert("ref".to_string(), cmd1());
         m.insert("renewcommand".to_string(), cmd2());
+        m.insert("rlap".to_string(), cmd1());
         m.insert("sPmqty".to_string(), cmd1());
         m.insert("sbmqty".to_string(), cmd1());
         m.insert("set".to_string(), cmd1());
@@ -1771,6 +1775,7 @@ lazy_static! {
         m.insert("pderivative".to_string(), cmd3_opt());
         m.insert("pdv".to_string(), cmd3_opt());
         m.insert("pdv*".to_string(), cmd3_opt());
+        m.insert("rule".to_string(), cmd2_opt());
 
         CommandSpec::new(m)
     };

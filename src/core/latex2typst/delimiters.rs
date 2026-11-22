@@ -205,7 +205,7 @@ fn flatten_delimiter_sequence(
                     }
                 }
             }
-            _ if ["displaystyle", "textstyle", "cal"]
+            _ if ["displaystyle", "textstyle", "cal", "cr"]
                 .iter()
                 .any(|name| is_command_named(&child, name)) =>
             {

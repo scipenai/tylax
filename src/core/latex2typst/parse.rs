@@ -183,6 +183,14 @@ pub(crate) fn parse_latex(input: &str, spec: CommandSpec) -> ParsedLatex {
                     i = start + input[start..].chars().next().map_or(0, char::len_utf8);
                 } else {
                     let name = &input[start..end];
+                    if PRIMITIVE_SKIPS.contains(&name) {
+                        if let Some((dimension, used)) = parse_glue(&input[end..]) {
+                            edits.push((i..end + used, format!("\\hspace{{{dimension}}}")));
+                            i = end + used;
+                            follows_script = false;
+                            continue;
+                        }
+                    }
                     let wraps = spec.get_cmd(name).is_some_and(|cmd| {
                         matches!(cmd.args, ArgShape::Left1 | ArgShape::InfixGreedy)
                     });
@@ -252,4 +260,88 @@ pub(crate) fn parse_latex(input: &str, spec: CommandSpec) -> ParsedLatex {
         source_map,
         literals,
     }
+}
+
+/// TeX primitives whose dimension follows them unbraced.
+const PRIMITIVE_SKIPS: [&str; 4] = ["hskip", "kern", "mkern", "mskip"];
+
+/// Parse a TeX dimension, then any `plus`/`minus` glue, at the start of `s`.
+/// Returns the dimension with spaces removed and the bytes consumed.
+pub(super) fn parse_glue(s: &str) -> Option<(String, usize)> {
+    let (dimension, mut used) = parse_tex_dimension(s, false)?;
+    for keyword in ["plus", "minus"] {
+        let rest = &s[used..];
+        let trimmed = rest.trim_start();
+        if let Some(after) = trimmed.strip_prefix(keyword) {
+            let skipped = rest.len() - after.len();
+            if let Some((_, glue_used)) = parse_tex_dimension(after, true) {
+                used += skipped + glue_used;
+            }
+        }
+    }
+    Some((dimension, used))
+}
+
+/// Parse `[sign] number unit` at the start of `s`, allowing TeX's spaces.
+/// `fil` units (`1fill`) are accepted only for glue.
+fn parse_tex_dimension(s: &str, allow_fil: bool) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let skip_spaces = |i: &mut usize| {
+        while *i < bytes.len() && bytes[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+    };
+    skip_spaces(&mut i);
+    let mut negative = false;
+    while i < bytes.len() && matches!(bytes[i], b'+' | b'-') {
+        if bytes[i] == b'-' {
+            negative = !negative;
+        }
+        i += 1;
+        skip_spaces(&mut i);
+    }
+    let mut number = String::new();
+    let mut seen_dot = false;
+    let mut has_digit = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_digit() {
+            has_digit = true;
+            number.push(b as char);
+        } else if matches!(b, b'.' | b',') && !seen_dot {
+            seen_dot = true;
+            number.push('.');
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    if !has_digit {
+        return None;
+    }
+    let mut dimension = String::new();
+    if negative {
+        dimension.push('-');
+    }
+    if number.starts_with('.') {
+        dimension.push('0');
+    }
+    dimension.push_str(&number);
+    skip_spaces(&mut i);
+    // A unit is two letters, so `1cmv` is `1cm` then `v`; glue also takes
+    // `fil`, `fill` and `filll`.
+    let rest = &s[i..];
+    let fil = ["filll", "fill", "fil"]
+        .into_iter()
+        .find(|unit| allow_fil && rest.starts_with(unit));
+    let unit = fil.or_else(|| {
+        [
+            "pt", "mm", "cm", "in", "em", "ex", "pc", "bp", "px", "mu", "dd", "cc", "sp",
+        ]
+        .into_iter()
+        .find(|unit| rest.starts_with(unit))
+    })?;
+    dimension.push_str(unit);
+    Some((dimension, i + unit.len()))
 }
