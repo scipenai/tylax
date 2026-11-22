@@ -18,17 +18,38 @@ const path = require('path');
 const readline = require('readline');
 const { createRequire } = require('module');
 
+const [inPath, outDir, pxPerEmArg] = process.argv.slice(2);
+if (!inPath || !outDir) {
+  console.error('usage: node mathjax_render.js <in.jsonl> <out-dir> [px-per-em]');
+  process.exit(2);
+}
+const pxPerEm = pxPerEmArg === undefined ? 40 : Number(pxPerEmArg);
+if (!Number.isFinite(pxPerEm) || pxPerEm <= 0) {
+  console.error(`invalid px-per-em: ${pxPerEmArg}`);
+  process.exit(2);
+}
+
 const nodeDir = process.env.TYLAX_NODE_DIR || path.join(os.homedir(), '.cache/tylax/node');
 const load = createRequire(path.join(nodeDir, 'package.json'));
-const { mathjax } = load('mathjax-full/js/mathjax.js');
-const { TeX } = load('mathjax-full/js/input/tex.js');
-const { SVG } = load('mathjax-full/js/output/svg.js');
-const { liteAdaptor } = load('mathjax-full/js/adaptors/liteAdaptor.js');
-const { RegisterHTMLHandler } = load('mathjax-full/js/handlers/html.js');
-const { AllPackages } = load('mathjax-full/js/input/tex/AllPackages.js');
-
-const [inPath, outDir, pxPerEmArg] = process.argv.slice(2);
-const pxPerEm = Number(pxPerEmArg || 40);
+let mathjax;
+let TeX;
+let SVG;
+let liteAdaptor;
+let RegisterHTMLHandler;
+let AllPackages;
+try {
+  ({ mathjax } = load('mathjax-full/js/mathjax.js'));
+  ({ TeX } = load('mathjax-full/js/input/tex.js'));
+  ({ SVG } = load('mathjax-full/js/output/svg.js'));
+  ({ liteAdaptor } = load('mathjax-full/js/adaptors/liteAdaptor.js'));
+  ({ RegisterHTMLHandler } = load('mathjax-full/js/handlers/html.js'));
+  ({ AllPackages } = load('mathjax-full/js/input/tex/AllPackages.js'));
+} catch (error) {
+  console.error(
+    `cannot load mathjax-full from ${nodeDir} (set TYLAX_NODE_DIR or install with: npm install --prefix ~/.cache/tylax/node mathjax-full@3.2.2): ${error.message}`,
+  );
+  process.exit(1);
+}
 
 const adaptor = liteAdaptor();
 RegisterHTMLHandler(adaptor);
@@ -59,7 +80,10 @@ function render(latex) {
 
 async function main() {
   fs.mkdirSync(outDir, { recursive: true });
-  const lines = readline.createInterface({ input: fs.createReadStream(inPath) });
+  const lines = readline.createInterface({
+    input: fs.createReadStream(inPath, { encoding: 'utf8' }),
+    crlfDelay: Infinity,
+  });
   let index = 0;
   for await (const line of lines) {
     if (!line.trim()) continue;

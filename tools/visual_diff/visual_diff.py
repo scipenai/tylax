@@ -49,8 +49,13 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
-DRIVER = os.path.join(REPO, "target", "release", "examples", "l2t_batch")
-LABEL_FONT = "/System/Library/Fonts/Menlo.ttc"
+LABEL_FONT_CANDIDATES = (
+    "/System/Library/Fonts/Menlo.ttc",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    r"C:\Windows\Fonts\consola.ttf",
+)
 
 # Rendering scale: 40 px per em. Typst text is 10 pt, so 288 ppi matches.
 PX_PER_EM = 40
@@ -58,8 +63,37 @@ TYPST_PT = 10
 TYPST_PPI = PX_PER_EM * 72 / TYPST_PT
 
 
+def driver_path():
+    target_dir = os.environ.get("CARGO_TARGET_DIR") or os.path.join(REPO, "target")
+    name = "l2t_batch.exe" if os.name == "nt" else "l2t_batch"
+    return os.path.join(target_dir, "release", "examples", name)
+
+
+def find_label_font():
+    override = os.environ.get("TYLAX_LABEL_FONT")
+    if override:
+        return override
+    for candidate in LABEL_FONT_CANDIDATES:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def require_tools(names):
+    missing = [tool for tool in names if shutil.which(tool) is None]
+    if missing:
+        sys.exit("missing required tools on PATH: " + ", ".join(missing))
+
+
 def run(cmd, **kwargs):
-    return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        **kwargs,
+    )
 
 
 def load_entries(path):
@@ -90,7 +124,7 @@ def convert(entries, out, build):
             sys.exit("cargo build failed:\n" + res.stderr)
     src = os.path.join(out, "input.jsonl")
     write_jsonl(src, entries)
-    res = run([DRIVER, src])
+    res = run([driver_path(), src])
     if res.returncode != 0:
         sys.exit("l2t_batch failed:\n" + res.stderr)
     records = [json.loads(line) for line in res.stdout.splitlines() if line.strip()]
@@ -108,20 +142,25 @@ def render_mathjax(out):
 
 
 def typst_source(formulas):
-    """One page per formula. The closing `$` sits on its own line, so a `//`
-    in the output cannot comment it out. Returns the source and, per formula,
-    its 1-based line range."""
+    """One page per formula. A display equation that already starts with `$` or
+    `#math.equation` is emitted as-is; otherwise the closing `$` sits on its own
+    line, so a `//` in the output cannot comment it out. Returns the source and,
+    per formula, its 1-based line range."""
     lines = ["#set page(width: auto, height: auto, margin: 2pt, fill: white)",
              f"#set text(size: {TYPST_PT}pt)"]
     ranges = []
     for n, typst in enumerate(formulas):
         if n:
             lines.append("#pagebreak()")
-        body = typst.split("\n")
+        stripped = typst.strip()
+        body = stripped.split("\n")
         start = len(lines) + 1
-        lines.append("$ " + body[0])
-        lines.extend(body[1:])
-        lines.append("$")
+        if stripped.startswith("$") or stripped.startswith("#math.equation"):
+            lines.extend(body)
+        else:
+            lines.append("$ " + body[0])
+            lines.extend(body[1:])
+            lines.append("$")
         ranges.append((start, len(lines)))
     return "\n".join(lines) + "\n", ranges
 
@@ -131,52 +170,68 @@ ERROR_LINE = re.compile(r"^(.*?):(\d+):\d+: error: (.*)$")
 
 def compile_batch(work, name, formulas):
     """Compile one batch to PNG pages. A formula that does not compile is
-    replaced by an empty equation and the batch is compiled again. Returns
-    the page paths and the error message per formula (None when it compiled)."""
+    replaced by an empty equation and the batch is compiled again. Blamed
+    entries are confirmed singly so an unclosed token in one formula cannot
+    falsely condemn a neighbour. Returns the page paths and the error message
+    per formula (None when it compiled)."""
     formulas = list(formulas)
     errors = [None] * len(formulas)
     typ = os.path.join(work, name + ".typ")
-    for _ in range(len(formulas) + 1):
-        source, ranges = typst_source(formulas)
-        with open(typ, "w", encoding="utf-8") as f:
-            f.write(source)
-        for old in glob.glob(os.path.join(work, name + "-*.png")):
-            os.remove(old)
-        try:
-            res = run(["typst", "compile", "--diagnostic-format", "short",
-                       "--ppi", str(TYPST_PPI), typ,
-                       os.path.join(work, name + "-{0p}.png")], timeout=600)
-        except subprocess.TimeoutExpired:
-            res = None
-        if res is not None and res.returncode == 0:
-            pages = sorted(glob.glob(os.path.join(work, name + "-*.png")),
-                           key=lambda p: int(p.rsplit("-", 1)[1][:-4]))
-            assert len(pages) == len(formulas), (name, len(pages), len(formulas))
-            return pages, errors
-        culprits = {}
-        if res is not None:
-            for line in res.stderr.splitlines():
-                m = ERROR_LINE.match(line)
-                if not m or not m.group(1).endswith(name + ".typ"):
-                    continue
-                lineno = int(m.group(2))
-                for n, (a, b) in enumerate(ranges):
-                    if a <= lineno <= b and errors[n] is None:
-                        culprits.setdefault(n, m.group(3))
-        if not culprits:
-            # The error could not be pinned on one formula (or typst timed
-            # out): compile each one alone.
-            return compile_singly(work, name, formulas, errors)
-        for n, message in culprits.items():
-            errors[n] = message
-            formulas[n] = ""
-    raise RuntimeError("typst batch did not converge: " + name)
+    try:
+        for _ in range(len(formulas) + 1):
+            source, ranges = typst_source(formulas)
+            with open(typ, "w", encoding="utf-8") as f:
+                f.write(source)
+            for old in glob.glob(os.path.join(work, name + "-*.png")):
+                os.remove(old)
+            try:
+                res = run(["typst", "compile", "--diagnostic-format", "short",
+                           "--ppi", str(TYPST_PPI), typ,
+                           os.path.join(work, name + "-{0p}.png")], timeout=600)
+            except subprocess.TimeoutExpired:
+                res = None
+            if res is not None and res.returncode == 0:
+                pages = sorted(glob.glob(os.path.join(work, name + "-*.png")),
+                               key=lambda p: int(p.rsplit("-", 1)[1][:-4]))
+                assert len(pages) == len(formulas), (name, len(pages), len(formulas))
+                return pages, errors
+            culprits = {}
+            if res is not None:
+                for line in res.stderr.splitlines():
+                    m = ERROR_LINE.match(line)
+                    if not m or not m.group(1).endswith(name + ".typ"):
+                        continue
+                    lineno = int(m.group(2))
+                    for n, (a, b) in enumerate(ranges):
+                        if a <= lineno <= b and errors[n] is None:
+                            culprits.setdefault(n, m.group(3))
+            confirmed = False
+            for n in culprits:
+                try:
+                    p, err = compile_batch_once(work, f"{name}c{n}", formulas[n])
+                except subprocess.TimeoutExpired:
+                    p, err = None, "typst timed out"
+                if err is not None:
+                    errors[n] = err
+                    formulas[n] = ""
+                    confirmed = True
+                elif p and os.path.exists(p):
+                    os.remove(p)
+            if not confirmed:
+                # The error could not be pinned on one formula (or typst timed
+                # out): compile each remaining formula alone.
+                return compile_singly(work, name, formulas, errors)
+        raise RuntimeError("typst batch did not converge: " + name)
+    finally:
+        if os.path.exists(typ):
+            os.remove(typ)
 
 
 def compile_singly(work, name, formulas, errors):
     pages = []
     for n, typst in enumerate(formulas):
         sub = f"{name}s{n}"
+        p = None
         if errors[n] is None:
             try:
                 p, e = compile_batch_once(work, sub, typst)
@@ -184,8 +239,6 @@ def compile_singly(work, name, formulas, errors):
                 p, e = None, "typst timed out"
             if e is not None:
                 errors[n] = e
-        if errors[n] is not None:
-            p, _ = compile_batch_once(work, sub, "")
         pages.append(p)
     return pages, errors
 
@@ -193,12 +246,18 @@ def compile_singly(work, name, formulas, errors):
 def compile_batch_once(work, name, typst):
     source, _ = typst_source([typst])
     typ = os.path.join(work, name + ".typ")
+    png = os.path.join(work, name + "-1.png")
     with open(typ, "w", encoding="utf-8") as f:
         f.write(source)
-    png = os.path.join(work, name + "-1.png")
-    res = run(["typst", "compile", "--diagnostic-format", "short",
-               "--ppi", str(TYPST_PPI), typ, png], timeout=120)
+    try:
+        res = run(["typst", "compile", "--diagnostic-format", "short",
+                   "--ppi", str(TYPST_PPI), typ, png], timeout=120)
+    finally:
+        if os.path.exists(typ):
+            os.remove(typ)
     if res.returncode != 0:
+        if os.path.exists(png):
+            os.remove(png)
         first = next((l for l in res.stderr.splitlines() if ": error: " in l), res.stderr)
         return None, first.split(": error: ", 1)[-1].strip()
     return png, None
@@ -243,10 +302,15 @@ def magick_trim(src, dst):
 def ssim(a_args, b_args):
     res = run(["magick", "(", *a_args, ")", "(", *b_args, ")",
                "-metric", "SSIM", "-compare", "-format", "%[distortion]", "info:"])
-    if res.returncode != 0:
-        raise RuntimeError(res.stderr)
+    text = res.stdout.strip()
+    if res.returncode not in (0, 1) or not text:
+        raise RuntimeError(res.stderr or f"magick exited with {res.returncode}")
+    try:
+        distortion = float(text)
+    except ValueError as err:
+        raise RuntimeError(f"unexpected magick SSIM output {text!r}: {res.stderr}") from err
     # ImageMagick 7.1.2 reports 1 - SSIM as the distortion.
-    return round(1.0 - float(res.stdout.strip()), 4)
+    return round(1.0 - distortion, 4)
 
 
 def compare_pair(out, i, height, blur):
@@ -298,6 +362,8 @@ def quantiles(values, qs=(0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)):
 
 
 def cmd_run(args):
+    required = ([] if args.no_build else ["cargo"]) + ["node", "typst", "rsvg-convert", "magick"]
+    require_tools(required)
     out = os.path.abspath(args.out)
     for sub in ("mathjax", "typst", "norm"):
         shutil.rmtree(os.path.join(out, sub), ignore_errors=True)
@@ -346,6 +412,7 @@ def summarise(results):
 
 
 def cmd_sheets(args):
+    require_tools(["magick"])
     out = os.path.abspath(args.dir)
     results = [r for r in read_jsonl(os.path.join(out, "results.jsonl")) if r["status"] == "ok"]
     if args.key == "aspect":
@@ -360,11 +427,16 @@ def cmd_sheets(args):
     shutil.rmtree(sheets, ignore_errors=True)
     os.makedirs(sheets)
     width = args.width
+    font = find_label_font()
+    font_args = ["-font", font] if font else []
 
     def tile(r):
         i = r["index"]
         label = (f"#{r['index']} {r['id']}  score {r['score']:.3f}  ssim {r['ssim']:.3f}"
                  f"  stretch {r['ssim_stretch']:.3f}  width {r['width_ratio']:.2f}")
+        safe_label = label.replace("%", "%%")
+        if safe_label.startswith("@"):
+            safe_label = "\\" + safe_label
         dst = os.path.join(sheets, f"tile-{i:05d}.png")
         # One scale for both images, so that their sizes stay comparable.
         (wm, hm), (wt, ht) = r["size_m"], r["size_t"]
@@ -372,8 +444,8 @@ def cmd_sheets(args):
         fit = ["-resize", f"{scale * 100:.2f}%", "-background", "white",
                "-gravity", "West", "-extent", f"{width}x"]
         res = run(["magick",
-                   "(", "-size", f"{width}x22", "xc:#ddeeff", "-font", LABEL_FONT,
-                   "-pointsize", "14", "-gravity", "West", "-annotate", "+4+0", label, ")",
+                   "(", "-size", f"{width}x22", "xc:#ddeeff", *font_args,
+                   "-pointsize", "14", "-gravity", "West", "-annotate", "+4+0", safe_label, ")",
                    "(", os.path.join(out, "norm", f"{i:05d}-m.png"), *fit, ")",
                    "(", "-size", f"{width}x2", "xc:#ffaaaa", ")",
                    "(", os.path.join(out, "norm", f"{i:05d}-t.png"), *fit, ")",
@@ -388,7 +460,9 @@ def cmd_sheets(args):
     per = args.per_sheet
     for s in range(0, len(tiles), per):
         name = os.path.join(sheets, f"sheet-{s // per:03d}.png")
-        run(["magick", *tiles[s:s + per], "-append", name])
+        res = run(["magick", *tiles[s:s + per], "-append", name])
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr or f"magick exited with {res.returncode}")
         print(name)
         for r in results[s:s + per]:
             print(f"  #{r['index']} {r['id']}: {r['latex']}\n      -> {r['typst']}")
@@ -397,6 +471,8 @@ def cmd_sheets(args):
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="convert, render and score a formula list")
