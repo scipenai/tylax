@@ -8,7 +8,9 @@ use std::fmt::Write;
 
 use super::context::{ConversionMode, LatexConverter};
 use super::environment::{convert_array_with_delim, convert_matrix_with_delim};
-use super::utils::{brackets_balanced, protect_top_level_comma, scan_brackets};
+use super::utils::{
+    brackets_balanced, has_more_open_braces, protect_top_level_comma, scan_brackets,
+};
 use crate::data::symbols;
 
 /// Convert a math formula ($..$ or $$..$$)
@@ -373,7 +375,10 @@ pub fn convert_lr(conv: &mut LatexConverter, elem: SyntaxElement, output: &mut S
     };
     let mut inner = join(delimiters(false));
     // `lr({ ...)` is left for `fix_left_brace_cases`, which makes it `cases`.
-    let brace_cases = left_delim.as_deref() == Some("{") && right_delim.as_deref() == Some(".");
+    // Only skip bracket balancing when `{` actually stays unmatched.
+    let brace_cases = left_delim.as_deref() == Some("{")
+        && right_delim.as_deref() == Some(".")
+        && has_more_open_braces(&inner);
     if use_lr && !brace_cases {
         // Typst closes an opening bracket with any closing one, so a bracket
         // delimiter that does not balance opens a group or ends the call:
@@ -714,10 +719,7 @@ fn fold_brace_annotation(conv: &mut LatexConverter, node: &SyntaxNode) -> Option
     conv.visit_element(script, &mut label);
     conv.state.mode = previous_mode;
 
-    // A top-level comma in either operand would be read as an extra positional
-    // argument to the brace function; wrap such operands in `{}` so each stays a
-    // single argument (same protection used for `sqrt`, `root`, ...).
-    let body = protect_top_level_comma(&body);
+    // Top-level commas in `body` were already escaped by `convert_required_math_arg`.
     let label = protect_top_level_comma(&label);
 
     Some(format!("{}({}, {}) ", name, body, label))
@@ -733,7 +735,7 @@ fn fold_brace_annotation(conv: &mut LatexConverter, node: &SyntaxNode) -> Option
 /// - Single character: `(`, `)`, `[`, `]`, `|`, `.`
 /// - Letter-based commands: `\langle`, `\rangle`, `\lVert`, `\lfloor`, etc.
 /// - Non-letter commands: `\|`, `\{`, `\}`
-fn extract_delimiter_from_text(text: &str) -> &str {
+pub(super) fn extract_delimiter_from_text(text: &str) -> &str {
     if text.is_empty() {
         return ".";
     }

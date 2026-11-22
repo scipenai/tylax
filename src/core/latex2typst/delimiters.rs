@@ -9,9 +9,27 @@ use std::collections::HashSet;
 use mitex_parser::syntax::{CmdItem, SyntaxElement, SyntaxKind, SyntaxNode};
 use rowan::ast::AstNode;
 
-use crate::data::symbols::is_big_delimiter_command;
+use crate::data::symbols::{convert_delimiter, is_big_delimiter_command};
 
 use super::context::is_command_named;
+
+/// Map a LaTeX delimiter token/command string to `Some(true)` (opener) or
+/// `Some(false)` (closer) when its Typst output is one of `( ) [ ] { }`.
+fn bracket_direction(delim: &str) -> Option<bool> {
+    match convert_delimiter(delim.trim())? {
+        "(" | "[" | "{" => Some(true),
+        ")" | "]" | "}" => Some(false),
+        _ => None,
+    }
+}
+
+/// Direction of the bracket token/command held by `\big`-style commands.
+fn sized_bracket_direction(elem: &SyntaxElement) -> Option<bool> {
+    match elem {
+        SyntaxElement::Token(t) => bracket_direction(t.text()),
+        SyntaxElement::Node(n) => bracket_direction(&n.text().to_string()),
+    }
+}
 
 /// The delimiters in `root` that do not pair within their own sequence of
 /// siblings, by start offset.
@@ -34,28 +52,26 @@ pub(super) fn unpaired_delimiters(root: &SyntaxNode) -> HashSet<u32> {
                 .children()
                 .filter(|child| child.kind() == SyntaxKind::ClauseLR)
                 .collect();
-            let delimiter = |clause: &SyntaxNode| {
-                clause.children_with_tokens().find_map(|e| {
-                    let t = e.into_token()?;
-                    matches!(
-                        t.kind(),
-                        SyntaxKind::TokenLParen
-                            | SyntaxKind::TokenRParen
-                            | SyntaxKind::TokenLBracket
-                            | SyntaxKind::TokenRBracket
-                    )
-                    .then(|| u32::from(t.text_range().start()))
-                })
+            let clause_delimiter = |clause: &SyntaxNode| -> Option<(u32, bool)> {
+                let text = clause.text().to_string();
+                let delim = text
+                    .strip_prefix("\\left")
+                    .or_else(|| text.strip_prefix("\\right"))
+                    .map(|rest| super::math::extract_delimiter_from_text(rest.trim()))?;
+                let is_opener = bracket_direction(delim)?;
+                Some((u32::from(clause.text_range().start()), is_opener))
             };
             // Two bracket delimiters pair with each other, so `\left( a)\right)`
-            // escapes the body's `)`. One alone may pair with the body.
+            // escapes the body's `)`. One alone pairs with the body only when its
+            // actual direction opens from the left (`\left(`, `\left\{`) or
+            // closes from the right (`\right)`, `\right\}`), never `\left]`.
             if let [left, right] = clauses.as_slice() {
-                match (delimiter(left), delimiter(right)) {
-                    (Some(offset), None) => {
+                match (clause_delimiter(left), clause_delimiter(right)) {
+                    (Some((offset, true)), None) => {
                         sequence.insert(0, Some((offset, true)));
                         fixed.push(offset);
                     }
-                    (None, Some(offset)) => {
+                    (None, Some((offset, false))) => {
                         sequence.push(Some((offset, false)));
                         fixed.push(offset);
                     }
@@ -171,15 +187,28 @@ fn flatten_delimiter_sequence(
             SyntaxKind::ItemNewLine => sequence.push(None),
             // `\left(` is paired by the `lr` code.
             SyntaxKind::ClauseLR => {}
-            // `\bigl(` pairs like a bare `(`. `\middle` sits inside an `lr`.
+            // `\bigl(` / `\bigl\lbrace` pairs like a bare bracket. `\middle` sits inside an `lr`.
             SyntaxKind::ItemCmd if is_sized_delimiter_command(&child) => {
                 let token = CmdItem::cast(n.clone())
                     .filter(|cmd| cmd.name_tok().is_some_and(|name| name.text() != "\\middle"))
                     .and_then(|cmd| super::markup::sized_delimiter_token(&cmd));
                 if let Some(token) = token {
-                    if let Some(is_opener) = delimiter(&token) {
+                    if let Some(is_opener) = sized_bracket_direction(&token) {
                         sequence.push(Some((offset(&token), is_opener)));
                     }
+                }
+            }
+            // `\scriptstyle`/`\scriptscriptstyle` emit their greedy argument unwrapped,
+            // so delimiters inside stay in the enclosing sibling sequence.
+            SyntaxKind::ItemCmd
+                if is_command_named(&child, "scriptstyle")
+                    || is_command_named(&child, "scriptscriptstyle") =>
+            {
+                for arg in n
+                    .children()
+                    .filter(|c| c.kind() == SyntaxKind::ClauseArgument)
+                {
+                    flatten_delimiter_sequence(&arg, sequence, pending, unpaired);
                 }
             }
             _ if ["displaystyle", "textstyle", "cal"]

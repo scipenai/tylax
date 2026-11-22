@@ -327,11 +327,29 @@ fn sized_delimiter_arg(cmd: &CmdItem) -> Option<String> {
     Some(text.trim().to_string())
 }
 
-/// The delimiter token or `\{` command that `\big` and its kin take.
+/// The delimiter token or command that `\big` and its kin take, unwrapping a
+/// single-element `{...}` group such as `\bigl{\lbrace}`.
 pub(super) fn sized_delimiter_token(cmd: &CmdItem) -> Option<SyntaxElement> {
-    sized_delimiter_clause(cmd)?
+    let first = sized_delimiter_clause(cmd)?
         .children_with_tokens()
-        .find(|child| child.kind() != SyntaxKind::TokenWhiteSpace)
+        .find(|child| child.kind() != SyntaxKind::TokenWhiteSpace)?;
+    if first.kind() == SyntaxKind::ItemCurly {
+        if let Some(group) = first.as_node() {
+            let mut significant = group.children_with_tokens().filter(|child| {
+                !matches!(
+                    child.kind(),
+                    SyntaxKind::TokenLBrace
+                        | SyntaxKind::TokenRBrace
+                        | SyntaxKind::TokenWhiteSpace
+                        | SyntaxKind::TokenLineBreak
+                )
+            });
+            if let (Some(inner), None) = (significant.next(), significant.next()) {
+                return Some(inner);
+            }
+        }
+    }
+    Some(first)
 }
 
 /// The argument clause that holds the delimiter of `\big` and its kin.
@@ -1015,7 +1033,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         // two script-size switches have no Typst equivalent, so just keep
         // their contents rather than leaking an unknown identifier.
         "scriptstyle" | "scriptscriptstyle" => {
-            if let Some(content) = conv.convert_required_math_arg(&cmd, 0) {
+            if let Some(content) = conv.convert_required_math_content(&cmd, 0) {
                 let trimmed = content.trim();
                 if !trimmed.is_empty() {
                     output.push_str(trimmed);
@@ -2245,7 +2263,9 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
             // ignore
         }
         "mbox" | "makebox" | "hbox" => {
+            conv.state.push_env(EnvironmentContext::None);
             let content = conv.convert_required_arg(&cmd, 0).unwrap_or_default();
+            conv.state.pop_env();
             let _ = write!(output, "\"{}\"", content);
         }
         "raisebox" => {

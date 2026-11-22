@@ -865,6 +865,44 @@ mod l2t_cli_parity {
         }
     }
 
+    #[test]
+    fn delimiter_and_style_call_outputs_compile_with_real_typst() {
+        if !typst_available() {
+            eprintln!("skipping delimiter_and_style_call_outputs_compile_with_real_typst: `typst` not on PATH");
+            return;
+        }
+
+        for formula in [
+            r"$\left(\displaystyle a,b\right)$",
+            r"$\left(\textstyle a;b\right)$",
+            r"$\displaystyle a,b$",
+            r"$\textstyle a;b$",
+            r"$\cal A, B$",
+            r"$\left\{ \begin{bmatrix} a & b \\ c & d \end{bmatrix} \right.$",
+            r"$\left\{ \begin{Bmatrix} f: X \to Y \end{Bmatrix} \right.$",
+            r"$\left\{ \begin{pmatrix} a \\ b \end{pmatrix} \right.$",
+            r"$\left\{ a \} \right.$",
+            r"$\left\lbrace a \} \right.$",
+            r"$\frac{\left] a ) \right.}{b}$",
+            r"$\left. ( a \right[$",
+            r"$\frac{a \\ , b}{c}$",
+            r"$\frac{a \\ ; b}{c}$",
+            r"$\underbrace{a \\ , b}_{c}$",
+            r"$\frac{\bigl\lbrace a}{b}$",
+            r"$\frac{\bigl{\lbrace} a}{b}$",
+            r"$\frac{\bigl\lbrack a}{b}$",
+            r"$\begin{cases} a & \hbox{x, y; z} \end{cases}$",
+            r"$(\scriptstyle a) b$",
+            r"$\frac{(\scriptstyle a}{b}$",
+        ] {
+            let source = run_t2l_l2t_cli_no_preamble(formula);
+            assert!(
+                typst_compiles(&source),
+                "CLI output for {formula:?} must compile with typst:\n{source}"
+            );
+        }
+    }
+
     /// Run the CLI over a temporary file and return exit status, stdout, stderr.
     fn run_t2l_cli_on_file(source: &str, extension: &str, args: &[&str]) -> (bool, String, String) {
         let path = std::env::temp_dir().join(format!(
@@ -10442,6 +10480,123 @@ mod delimiter_pairing_regressions {
         assert_eq!(typst_to_latex("$x^(\\))$"), r"$x^{)}$");
         assert_eq!(typst_to_latex("$x^(\\(a\\))$"), r"$x^{{(a)}}$");
         assert_eq!(typst_to_latex("$a \\} b$"), r"$a \} b$");
+    }
+
+    #[test]
+    fn style_declaration_calls_escape_top_level_commas_and_semicolons() {
+        assert_eq!(
+            latex_to_typst(r"\left(\displaystyle a,b\right)"),
+            r"(display(a\,b))"
+        );
+        assert_eq!(
+            latex_to_typst(r"\left(\displaystyle \frac{r}{a}, b\right)"),
+            r"(display(r/a\, b))"
+        );
+        assert_eq!(
+            latex_to_typst(r"\left(\textstyle a;b\right)"),
+            r"(inline(a\;b))"
+        );
+        assert_eq!(latex_to_typst(r"\displaystyle a,b"), r"display(a\,b)");
+        assert_eq!(latex_to_typst(r"\textstyle a;b"), r"inline(a\;b)");
+        assert_eq!(latex_to_typst(r"\cal A, B"), r"cal(A\, B)");
+    }
+
+    #[test]
+    fn left_brace_cases_preserves_delimited_matrices() {
+        assert_eq!(
+            latex_to_typst(r"\left\{ \begin{bmatrix} a & b \\ c & d \end{bmatrix} \right."),
+            r#"cases(mat(delim: "[", a, b ; c, d))"#
+        );
+        assert_eq!(
+            latex_to_typst(r"\left\{ \begin{Bmatrix} f: X \to Y \end{Bmatrix} \right."),
+            r#"cases(mat(delim: "{", f : X -> Y))"#
+        );
+        assert_eq!(
+            latex_to_typst(r"\left\{ \begin{pmatrix} a \\ b \end{pmatrix} \right."),
+            r#"cases(mat(delim: "(", a ; b))"#
+        );
+    }
+
+    #[test]
+    fn brace_lr_and_sized_lbrace_delimiters_pair_and_escape() {
+        assert_eq!(latex_to_typst(r"\left\{ a \} \right."), "lr({ a })");
+        assert_eq!(latex_to_typst(r"\left\lbrace a \} \right."), "lr({ a })");
+        assert_eq!(
+            latex_to_typst(r"\frac{\bigl\lbrace a}{b}"),
+            r"frac(\{ a, b)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\frac{\bigl{\lbrace} a}{b}"),
+            r"frac(\{ a, b)"
+        );
+        assert_eq!(
+            latex_to_typst(r"\frac{\bigl\lbrack a}{b}"),
+            r"frac(\[ a, b)"
+        );
+    }
+
+    #[test]
+    fn single_sided_reversed_lr_does_not_swallow_body_delimiters() {
+        assert_eq!(
+            latex_to_typst(r"\frac{\left] a ) \right.}{b}"),
+            r"frac(lr(bracket.r a \)), b)"
+        );
+        assert_eq!(latex_to_typst(r"\left. ( a \right["), r"lr(\(a bracket.l)");
+    }
+
+    #[test]
+    fn top_level_comma_protection_keeps_typst_line_break_space() {
+        assert_eq!(latex_to_typst(r"\frac{a \\ , b}{c}"), r"frac(a \ \, b, c)");
+        assert_eq!(
+            latex_to_typst(r"\underbrace{a \\ , b}_{c}"),
+            r"underbrace(a \ \, b, c)"
+        );
+    }
+
+    #[test]
+    fn hbox_inside_cases_keeps_literal_commas_and_semicolons() {
+        assert_eq!(
+            latex_to_typst(r"\begin{cases} a & \hbox{x, y; z} \end{cases}"),
+            r#"cases(a & "x, y ; z")"#
+        );
+        assert_eq!(
+            latex_to_typst(r"\begin{cases} a & \mbox{if } x = 1, 2; 3 \end{cases}"),
+            r#"cases(a & ""i f x = 1\, 2\; 3)"#
+        );
+    }
+
+    #[test]
+    fn scriptstyle_keeps_balanced_enclosing_parentheses() {
+        assert_eq!(latex_to_typst(r"(\scriptstyle a) b"), "(a) b");
+        assert_eq!(
+            latex_to_typst(r"\frac{(\scriptstyle a}{b}"),
+            r"frac(\(a, b)"
+        );
+    }
+
+    #[test]
+    fn sized_bar_pairing_scales_linearly_and_isolates_prose() {
+        let many_bars = std::iter::repeat_n(r"\big| x \big|", 2_000)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let started = std::time::Instant::now();
+        let out = latex_to_typst(&many_bars);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "expected linear-time pairing, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(out.matches("abs(x)").count(), 2_000);
+
+        let no_preamble = L2TOptions {
+            preamble: PreambleMode::None,
+            ..Default::default()
+        };
+        let doc = latex_document_to_typst_with_options(
+            "Prose with (unclosed \"quote\n\n$ \\big| x, y \\big| $",
+            &no_preamble,
+        );
+        assert!(doc.contains(r"abs(x\, y)"), "got: {doc}");
     }
 }
 
