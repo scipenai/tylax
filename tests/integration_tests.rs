@@ -11053,6 +11053,12 @@ mod corpus_tail_regressions {
         assert_eq!(latex_to_typst(r"x_1'^2'"), "x''_(1)^(2)");
         assert_eq!(latex_to_typst(r"\frac{x_1}{2}'"), "frac(x_(1), 2)'");
         assert_eq!(latex_to_typst(r"(x_1)'"), "(x_(1))'");
+        assert_eq!(latex_to_typst(r"x_1\relax'"), "x'_(1)");
+        assert_eq!(latex_to_typst(r"x_1\relax\relax''"), "x''_(1)");
+        assert_eq!(latex_to_typst(r"x_1\relax ^2'"), "x'_(1)^(2)");
+        assert_eq!(latex_to_typst(r"x_1\nonumber'"), "x'_(1)");
+        assert_eq!(latex_to_typst(r"x_1\, '"), "x_(1)thin'");
+        assert_eq!(latex_to_typst(r"x_1 \alpha'"), "x_(1) alpha'");
     }
 
     #[test]

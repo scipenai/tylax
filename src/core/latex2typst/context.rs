@@ -2180,6 +2180,8 @@ impl LatexConverter {
                 | ClauseArgument
                 | ItemCurly
                 | ItemAttachComponent
+                | ItemCmd
+                | TokenCommandSym
                 | TokenApostrophe
                 | TokenWhiteSpace
                 | TokenLineBreak
@@ -2249,8 +2251,19 @@ impl LatexConverter {
 
             // Command
             ItemCmd => {
+                let saved = self.trailing_script.take();
+                let before_len = output.len();
                 super::markup::convert_command(self, elem, output);
-                self.trailing_script = None;
+                let has_pending = self.state.pending_op.is_some()
+                    || self.state.pending_citation.is_some()
+                    || self.state.pending_reference.is_some()
+                    || self.pending_section.is_some()
+                    || self.siunitx_arg_collector.is_some();
+                self.trailing_script = if output.len() == before_len && !has_pending {
+                    saved
+                } else {
+                    None
+                };
             }
 
             // Environment
@@ -2439,7 +2452,14 @@ impl LatexConverter {
 
             // Command symbol
             TokenCommandSym => {
+                let saved = self.trailing_script.take();
+                let before_len = output.len();
                 super::markup::convert_command_sym(self, elem, output);
+                self.trailing_script = if output.len() == before_len {
+                    saved
+                } else {
+                    None
+                };
             }
 
             // Typst code passthrough
