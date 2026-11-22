@@ -1,0 +1,6 @@
+#show heading: it => text(red, it)
+= A
+#for i in range(3) [Item #i ]
+#if true { [yes] } else { [no] }
+/ Term: definition
+$ mat(1, 2; 3, 4) $

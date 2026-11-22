@@ -24,7 +24,8 @@ exclude = [
     "examples/**/*",
     "Dockerfile",
     "docker-compose.yml",
-    "bindings/**/*"
+    "bindings/**/*",
+    "fuzz/**/*",
 ]
 
 [lib]

@@ -1,0 +1,21 @@
+#set page(paper: "a4")
+#set heading(numbering: "1.")
+#let R = $bb(R)$
+
+= Intro <sec:intro>
+Let $f: R -> R$ be given by
+$ f(x) = 1 / (1 + e^(-x)) $ <eq:f>
+See @eq:f and @sec:intro.
+
+- First *bold* and _emph_.
+- Second with `raw` text // a comment
++ Numbered
+
+#figure(
+  table(
+    columns: 2,
+    [a], [b],
+    [$x^2$], [1],
+  ),
+  caption: [A table],
+)
