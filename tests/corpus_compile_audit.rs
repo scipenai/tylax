@@ -110,8 +110,10 @@ fn load_corpus(path: &Path) -> Vec<CorpusCase> {
             .unwrap_or_else(|error| panic!("invalid corpus JSON in {}: {error}", path.display()));
     }
     if text.trim_start().starts_with('[') {
-        if let Ok(cases) = serde_json::from_str(&text) {
-            return cases;
+        if let Ok(cases) = serde_json::from_str::<Vec<CorpusCase>>(&text) {
+            if !cases.is_empty() {
+                return cases;
+            }
         }
     }
     let stem = path
@@ -142,14 +144,12 @@ fn format_panic_payload(payload: &(dyn Any + Send)) -> &str {
     }
 }
 
-type PanicHook = Box<dyn Fn(&panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+struct PanicHookGuard<F: FnOnce()>(Option<F>);
 
-struct PanicHookGuard(Option<PanicHook>);
-
-impl Drop for PanicHookGuard {
+impl<F: FnOnce()> Drop for PanicHookGuard<F> {
     fn drop(&mut self) {
-        if let Some(hook) = self.0.take() {
-            panic::set_hook(hook);
+        if let Some(restore) = self.0.take() {
+            restore();
         }
     }
 }
@@ -158,7 +158,8 @@ impl Drop for PanicHookGuard {
 /// audit. The output is flattened onto one line; a newline is whitespace in
 /// Typst math.
 fn convert_all(cases: Vec<CorpusCase>) -> Vec<Case> {
-    let _guard = PanicHookGuard(Some(panic::take_hook()));
+    let previous_hook = panic::take_hook();
+    let _guard = PanicHookGuard(Some(move || panic::set_hook(previous_hook)));
     panic::set_hook(Box::new(|info| {
         let msg = format_panic_payload(info.payload());
         let detail = match info.location() {

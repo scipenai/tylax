@@ -43,7 +43,11 @@ function loadCases(path, text) {
   if (text.trimStart().startsWith("[")) {
     try {
       const parsed = JSON.parse(text);
-      if (Array.isArray(parsed)) {
+      if (
+        Array.isArray(parsed) &&
+        parsed.length > 0 &&
+        parsed.every((c) => c !== null && typeof c === "object" && typeof c.latex === "string")
+      ) {
         return parsed;
       }
     } catch {

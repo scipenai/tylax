@@ -88,8 +88,16 @@ def corpus_counts(paths: list[str]) -> Counter:
             formulas = [case["latex"] for case in json.loads(text)]
         elif text.lstrip().startswith("["):
             try:
-                formulas = [case["latex"] for case in json.loads(text)]
-            except (json.JSONDecodeError, KeyError, TypeError):
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = None
+            if (
+                isinstance(parsed, list)
+                and parsed
+                and all(isinstance(case, dict) and isinstance(case.get("latex"), str) for case in parsed)
+            ):
+                formulas = [case["latex"] for case in parsed]
+            else:
                 formulas = text.split("\n")
         else:
             formulas = text.split("\n")
