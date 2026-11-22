@@ -14,7 +14,7 @@ use super::utils::{
     count_heading_markers, escape_latex_text, extract_length_value, format_latex_color_command,
     get_raw_text_with_lang, get_simple_text, get_string_content, is_display_math,
     is_string_or_content, normalize_typst_color_expr, parse_angle_value, parse_spacing_spec,
-    ref_supplement_markup, FuncArgs, SpacingSpec,
+    preserve_typst_source, ref_supplement_markup, FuncArgs, SpacingSpec,
 };
 use crate::data::typst_compat::{
     get_heading_command, is_math_func_in_markup, MarkupHandler, TYPST_MARKUP_HANDLERS,
@@ -224,7 +224,12 @@ pub fn convert_content_nodes_to_latex(nodes: &[ContentNode], ctx: &mut ConvertCo
             ContentNode::Math { segments, block } => {
                 flush_typst_chunk(&mut buffer, ctx);
                 let math_source = render_math_segments_to_typst_source(segments);
-                let math_content = convert_math_source_to_latex(&math_source, &ctx.options, false);
+                let math_content = convert_math_source_to_latex(
+                    &math_source,
+                    &ctx.options,
+                    false,
+                    &mut ctx.warnings,
+                );
                 let math_content = rerender_math_with_row_linebreaks_if_aligned(
                     &math_source,
                     &ctx.options,
@@ -243,6 +248,7 @@ fn convert_math_source_to_latex(
     math_source: &str,
     options: &T2LOptions,
     linebreak_as_row: bool,
+    warnings: &mut Vec<String>,
 ) -> String {
     let wrapped = format!("${}$", math_source);
     let root = typst_syntax::parse(&wrapped);
@@ -253,16 +259,18 @@ fn convert_math_source_to_latex(
         math_ctx.push_env(EnvironmentContext::Align);
     }
     convert_first_math_child(&root, &mut math_ctx);
-    math_ctx.finalize().trim().to_string()
+    warnings.append(&mut math_ctx.warnings);
+    super::context::trim_latex(&math_ctx.finalize()).to_string()
 }
 
+// In both math paths, only the first render reports warnings.
 fn rerender_math_with_row_linebreaks_if_aligned(
     math_source: &str,
     options: &T2LOptions,
     rendered: String,
 ) -> String {
     if rendered.contains(" \\\n") && has_unescaped_alignment(&rendered) {
-        convert_math_source_to_latex(math_source, options, true)
+        convert_math_source_to_latex(math_source, options, true, &mut Vec::new())
     } else {
         rendered
     }
@@ -272,6 +280,7 @@ fn convert_equation_math_to_latex(
     node: &SyntaxNode,
     options: &T2LOptions,
     linebreak_as_row: bool,
+    warnings: &mut Vec<String>,
 ) -> String {
     let mut math_ctx = ConvertContext::new();
     math_ctx.options = options.clone();
@@ -284,7 +293,8 @@ fn convert_equation_math_to_latex(
             convert_math_node(child, &mut math_ctx);
         }
     }
-    math_ctx.finalize().trim().to_string()
+    warnings.append(&mut math_ctx.warnings);
+    super::context::trim_latex(&math_ctx.finalize()).to_string()
 }
 
 fn rerender_equation_with_row_linebreaks_if_aligned(
@@ -293,7 +303,7 @@ fn rerender_equation_with_row_linebreaks_if_aligned(
     rendered: String,
 ) -> String {
     if rendered.contains(" \\\n") && has_unescaped_alignment(&rendered) {
-        convert_equation_math_to_latex(node, options, true)
+        convert_equation_math_to_latex(node, options, true, &mut Vec::new())
     } else {
         rendered
     }
@@ -331,7 +341,14 @@ fn has_unescaped_alignment(content: &str) -> bool {
     let mut chars = content.chars().peekable();
 
     while let Some(ch) = chars.next() {
-        if ch == '\\' {
+        if ch == '%' {
+            // Retained Typst source is a comment, not part of the math layout.
+            for ch in chars.by_ref() {
+                if matches!(ch, '\n' | '\r') {
+                    break;
+                }
+            }
+        } else if ch == '\\' {
             // Check for \begin or \end before treating the next character as an
             // escaped literal (for example `\&`, which is not an alignment
             // marker).
@@ -499,8 +516,12 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
         // Escape sequences: \$, \#, \%, etc.
         SyntaxKind::Escape => {
             let text = node.text().to_string();
-            // Remove the leading backslash and escape for LaTeX
-            let escaped_char = text.trim_start_matches('\\');
+            let decoded = node
+                .cast::<ast::Escape>()
+                .map(|escape| escape.get().to_string());
+            let escaped_char = decoded
+                .as_deref()
+                .unwrap_or_else(|| text.strip_prefix('\\').unwrap_or(&text));
             // Map Typst escape to LaTeX escape
             let latex = match escaped_char {
                 "$" => "\\$",
@@ -665,7 +686,8 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
             // Convert math content to a temporary buffer first. Start with
             // inline-fragment linebreaks, then re-render with LaTeX row
             // separators only when the expression is actually aligned.
-            let math_content = convert_equation_math_to_latex(node, &ctx.options, false);
+            let math_content =
+                convert_equation_math_to_latex(node, &ctx.options, false, &mut ctx.warnings);
             let math_content =
                 rerender_equation_with_row_linebreaks_if_aligned(node, &ctx.options, math_content);
 
@@ -767,7 +789,7 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
         SyntaxKind::Numeric => {
             // Numeric includes lengths like "10pt", "2em", etc.
             let text = node.text().to_string();
-            ctx.push(&text);
+            ctx.push(&escape_latex_text(&text));
             ctx.last_token = TokenType::Number;
         }
 
@@ -1794,11 +1816,7 @@ fn preserve_unconverted_layout(reason: &str, children: &[&SyntaxNode], ctx: &mut
         .iter()
         .map(|node| (**node).clone().into_text().to_string())
         .collect();
-    for (i, line) in source.split(['\n', '\r']).enumerate() {
-        ctx.push_line(&format!("% {}{line}", if i == 0 { "#" } else { "" }));
-    }
-    // Keep a nested closing brace outside the final comment.
-    ctx.push_line("\\relax{}");
+    preserve_typst_source(&format!("#{source}"), ctx);
 }
 
 // ============================================================================

@@ -1452,6 +1452,9 @@ pub(crate) fn render_math_segments_to_typst_source(segments: &[MathSegment]) -> 
 }
 
 fn render_func_call_source(name: &str, args: &[Arg], prefix_hash: bool, in_math: bool) -> String {
+    // The arguments of a `#` call are code even inside math: `#box(a/b)` divides,
+    // so math content must stay `[$a/b$]`.
+    let in_math = in_math && !prefix_hash;
     let args_str: Vec<String> = args
         .iter()
         .map(|arg| match arg {
@@ -1528,11 +1531,25 @@ fn value_to_typst_math_arg(value: &Value) -> String {
     }
 }
 
+fn escape_typst_markup_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(
+            ch,
+            '\\' | '$' | '#' | '[' | ']' | '*' | '_' | '`' | '<' | '>' | '@'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 impl ContentNode {
     /// Convert this content node back to Typst source code.
     pub fn to_typst(&self) -> String {
         match self {
-            ContentNode::Text(s) => s.clone(),
+            ContentNode::Text(s) => escape_typst_markup_text(s),
             ContentNode::Space => " ".to_string(),
             ContentNode::Linebreak => "\\\n".to_string(),
             ContentNode::Parbreak => "\n\n".to_string(),
@@ -2064,6 +2081,7 @@ mod tests {
 
         assert_eq!(fixed, "#h(1cm)");
         assert_eq!(flex, "#h(1fr)");
-        assert_eq!(plain, "#h(foo)");
+        // The arguments of a `#` call are code, where bare `foo` is a variable.
+        assert_eq!(plain, "#h([foo])");
     }
 }

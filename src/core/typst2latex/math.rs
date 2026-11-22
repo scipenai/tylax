@@ -2,31 +2,27 @@
 //!
 //! Handles mathematical expressions, formulas, and math-specific constructs.
 
-use super::context::{ConvertContext, T2LOptions, TokenType};
+use super::context::{ConvertContext, T2LOptions};
 use super::math_emit::emit_math_ir;
-use super::math_ir::{build_math_ir, normalize_math_ir};
+use super::math_ir::{
+    build_math_ir_with_env, collect_math_warnings, current_math_build_env, normalize_math_ir,
+    MathBuildEnv, MathIr,
+};
 use super::utils::{is_content_node, FuncArgs};
 use crate::data::maps::DELIMITER_MAP;
 use typst_syntax::{SyntaxKind, SyntaxNode};
 
 /// Convert a math node to LaTeX.
 pub fn convert_math_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
-    let ir = normalize_math_ir(build_math_ir(node, &ctx.options));
+    let env = current_math_build_env();
+    let ir = normalize_math_ir(build_math_ir_with_env(node, &ctx.options, &env));
+    collect_math_warnings(&ir, &mut ctx.warnings);
     emit_math_ir(&ir, ctx);
 }
 
 /// Convert a math-mode Typst function call to LaTeX.
 pub fn convert_func_call(node: &SyntaxNode, ctx: &mut ConvertContext) {
-    let ir = normalize_math_ir(build_math_ir(node, &ctx.options));
-    emit_math_ir(&ir, ctx);
-}
-
-pub(crate) fn render_lr_to_latex_string(args_node: &SyntaxNode, options: &T2LOptions) -> String {
-    let mut ctx = ConvertContext::new();
-    ctx.options = options.clone();
-    ctx.in_math = true;
-    convert_lr_to_latex(args_node, &mut ctx);
-    ctx.finalize()
+    convert_math_node(node, ctx);
 }
 
 // =============================================================================
@@ -50,53 +46,25 @@ fn get_latex_delimiter(text: &str, is_left: bool) -> &'static str {
         .unwrap_or(if is_left { "(" } else { ")" })
 }
 
-/// Update last token type after emitting a delimiter
-fn set_last_token_after_delimiter(ctx: &mut ConvertContext, delim: &str) {
-    if delim.starts_with('\\') {
-        ctx.last_token = TokenType::Command;
-    } else {
-        ctx.last_token = TokenType::OpenParen;
-    }
-}
-
 // =============================================================================
 // lr() Conversion Functions
 // =============================================================================
 
-/// Convert Typst lr() function to LaTeX \left...\right
-/// Extracted to a separate function for clarity and maintainability
-fn convert_lr_to_latex(args_node: &SyntaxNode, ctx: &mut ConvertContext) {
+/// Keep lr contents in the IR so nested diagnostics survive.
+pub(crate) fn build_lr_ir(
+    args_node: &SyntaxNode,
+    options: &T2LOptions,
+    env: &MathBuildEnv,
+) -> MathIr {
     let raw_args: Vec<&SyntaxNode> = args_node.children().collect();
     let args = FuncArgs::from_args_node(args_node);
     let parsed = parse_lr_args(&raw_args, &args);
 
     if parsed.has_unknown_named_args {
-        let content_nodes = parsed.alternate_content_nodes;
-
-        if content_nodes.is_empty() {
-            ctx.push("\\left(\\right)");
-            return;
-        }
-
-        convert_lr_content_nodes(&content_nodes, ctx);
-        return;
+        return build_lr_content(&parsed.alternate_content_nodes, None, options, env);
     }
 
-    if parsed.content_nodes.is_empty() {
-        if let Some(size) = parsed.size {
-            emit_fixed_lr_delimiter(ctx, "(", true, size);
-            emit_fixed_lr_delimiter(ctx, ")", false, size);
-        } else {
-            ctx.push("\\left(\\right)");
-        }
-        return;
-    }
-
-    if let Some(size) = parsed.size {
-        convert_lr_content_nodes_fixed_size(&parsed.content_nodes, size, ctx);
-    } else {
-        convert_lr_content_nodes(&parsed.content_nodes, ctx);
-    }
+    build_lr_content(&parsed.content_nodes, parsed.size, options, env)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,9 +197,17 @@ fn parse_lr_size_percent(text: &str) -> Option<LrDelimiterSize> {
     })
 }
 
+/// Push the children of an `lr` argument, opening a delimited group at either
+/// edge so its brackets can be the `\left` and `\right` delimiters. A group
+/// inside stays whole: split up, its `{` and `}` became a LaTeX group.
 fn push_lr_inner_nodes<'a>(node: &'a SyntaxNode, content: &mut Vec<&'a SyntaxNode>) {
-    for inner in node.children().filter(|n| n.kind() != SyntaxKind::Space) {
-        if inner.kind() == SyntaxKind::MathDelimited {
+    let inner: Vec<_> = node
+        .children()
+        .filter(|n| n.kind() != SyntaxKind::Space)
+        .collect();
+    let last = inner.len().saturating_sub(1);
+    for (idx, inner) in inner.into_iter().enumerate() {
+        if inner.kind() == SyntaxKind::MathDelimited && (idx == 0 || idx == last) {
             for nested in inner.children().filter(|n| n.kind() != SyntaxKind::Space) {
                 content.push(nested);
             }
@@ -241,119 +217,58 @@ fn push_lr_inner_nodes<'a>(node: &'a SyntaxNode, content: &mut Vec<&'a SyntaxNod
     }
 }
 
-/// Convert lr() content nodes with delimiter detection.
+/// Convert lr() content nodes with delimiter detection, as `\left`…`\right`
+/// or, given a size, as fixed-size delimiters.
 /// Only looks at edge nodes for delimiters - does NOT scan interior to avoid
 /// mistakenly treating inner symbols as delimiters and losing content.
-fn convert_lr_content_nodes(content: &[&SyntaxNode], ctx: &mut ConvertContext) {
-    let left_delim = find_lr_edge_delimiter(content, true);
-    let right_delim = find_lr_edge_delimiter(content, false);
-
-    if left_delim.is_some() || right_delim.is_some() {
-        let left_text = left_delim
-            .as_ref()
-            .map(|delim| delim.text.as_str())
-            .unwrap_or(".");
-        let right_text = right_delim
-            .as_ref()
-            .map(|delim| delim.text.as_str())
-            .unwrap_or(".");
-
-        // Output \left<first_delim>
-        ctx.push("\\left");
-        let left_latex = get_latex_delimiter(left_text, true);
-        ctx.push(left_latex);
-        set_last_token_after_delimiter(ctx, left_latex);
-
-        for (idx, child) in content.iter().enumerate() {
-            if should_skip_lr_index(idx, left_delim.as_ref(), right_delim.as_ref()) {
-                continue;
-            }
-            convert_math_node(child, ctx);
-        }
-
-        // Output \right<last_delim>
-        ctx.push("\\right");
-        ctx.push(get_latex_delimiter(right_text, false));
-    } else {
-        // No recognizable delimiters at edges, use default parentheses
-        // and output ALL content (safe default path, no data loss)
-        ctx.push("\\left(");
-        for child in content {
-            convert_math_node(child, ctx);
-        }
-        ctx.push("\\right)");
-    }
-}
-
-fn convert_lr_content_nodes_fixed_size(
+fn build_lr_content(
     content: &[&SyntaxNode],
-    size: LrDelimiterSize,
-    ctx: &mut ConvertContext,
-) {
+    size: Option<LrDelimiterSize>,
+    options: &T2LOptions,
+    env: &MathBuildEnv,
+) -> MathIr {
     let left_delim = find_lr_edge_delimiter(content, true);
     let right_delim = find_lr_edge_delimiter(content, false);
 
-    let (left_text, right_text) = if left_delim.is_some() || right_delim.is_some() {
-        (
-            left_delim
-                .as_ref()
-                .map(|delim| delim.text.as_str())
-                .unwrap_or("."),
-            right_delim
-                .as_ref()
-                .map(|delim| delim.text.as_str())
-                .unwrap_or("."),
-        )
-    } else {
-        ("(", ")")
-    };
-
-    emit_fixed_lr_delimiter(ctx, left_text, true, size);
-
-    for (idx, child) in content.iter().enumerate() {
-        if should_skip_lr_index(idx, left_delim.as_ref(), right_delim.as_ref()) {
-            continue;
-        }
-        convert_math_node(child, ctx);
+    // A missing edge delimiter is `.`; Typst draws none (`lr(a)` is `a`).
+    let default_left = if content.is_empty() { "(" } else { "." };
+    let default_right = if content.is_empty() { ")" } else { "." };
+    let left_text = left_delim
+        .as_ref()
+        .map_or(default_left, |delim| delim.text.as_str());
+    let right_text = right_delim
+        .as_ref()
+        .map_or(default_right, |delim| delim.text.as_str());
+    MathIr::Delimited {
+        open: lr_delimiter(left_text, true, size),
+        content: Box::new(MathIr::Seq(
+            content
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| {
+                    !should_skip_lr_index(*idx, left_delim.as_ref(), right_delim.as_ref())
+                })
+                .map(|(_, child)| build_math_ir_with_env(child, options, env))
+                .collect(),
+        )),
+        close: lr_delimiter(right_text, false, size),
     }
-
-    emit_fixed_lr_delimiter(ctx, right_text, false, size);
 }
 
-fn emit_fixed_lr_delimiter(
-    ctx: &mut ConvertContext,
-    delim_text: &str,
-    is_left: bool,
-    size: LrDelimiterSize,
-) {
+fn lr_delimiter(delim_text: &str, is_left: bool, size: Option<LrDelimiterSize>) -> String {
     let latex = get_latex_delimiter(delim_text, is_left);
 
-    match size {
-        LrDelimiterSize::Plain => {
-            ctx.push(latex);
-            set_last_token_after_delimiter(ctx, latex);
-        }
-        LrDelimiterSize::Big => {
-            ctx.push("\\big");
-            ctx.push(latex);
-            set_last_token_after_delimiter(ctx, latex);
-        }
-        LrDelimiterSize::BigLarge => {
-            ctx.push("\\Big");
-            ctx.push(latex);
-            set_last_token_after_delimiter(ctx, latex);
-        }
-        LrDelimiterSize::BigGl => {
-            ctx.push("\\bigg");
-            ctx.push(latex);
-            set_last_token_after_delimiter(ctx, latex);
-        }
-        LrDelimiterSize::BigGLarge => {
-            ctx.push("\\Bigg");
-            ctx.push(latex);
-            set_last_token_after_delimiter(ctx, latex);
-        }
-    }
+    let prefix = match size {
+        None if is_left => "\\left",
+        None => "\\right",
+        Some(LrDelimiterSize::Plain) if latex == "." => return String::new(),
+        Some(LrDelimiterSize::Plain) => "",
+        Some(LrDelimiterSize::Big) => "\\big",
+        Some(LrDelimiterSize::BigLarge) => "\\Big",
+        Some(LrDelimiterSize::BigGl) => "\\bigg",
+        Some(LrDelimiterSize::BigGLarge) => "\\Bigg",
+    };
+    format!("{prefix}{latex}")
 }
 
 /// Represents a detected delimiter in lr() content.

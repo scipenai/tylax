@@ -1,13 +1,65 @@
 use super::context::T2LOptions;
-use super::math::render_lr_to_latex_string;
+use super::math::build_lr_ir;
 use super::utils::{
-    get_simple_text, is_content_node, normalize_typst_color_expr, parse_spacing_spec, FuncArgs,
-    SpacingSpec, UNICODE_TO_LATEX,
+    escape_latex_text, extract_length_value, get_simple_text, is_content_node,
+    normalize_typst_color_expr, parse_spacing_spec, FuncArgs, SpacingSpec, UNICODE_TO_LATEX,
 };
 use crate::data::maps::{DELIMITER_MAP, TYPST_TO_TEX};
 use crate::data::typst_compat::{MathHandler, TYPST_MATH_HANDLERS};
-use typst_syntax::ast::{AstNode, Escape};
-use typst_syntax::{SyntaxKind, SyntaxNode};
+use std::cell::RefCell;
+use typst_syntax::ast::{self, AstNode, Escape};
+use typst_syntax::{LinkedNode, SyntaxKind, SyntaxNode};
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MathBuildEnv {
+    pub(crate) shadowed_context_marker: Option<String>,
+}
+
+impl MathBuildEnv {
+    pub(crate) fn is_shadowed_context(&self, node: &SyntaxNode) -> bool {
+        let Some(marker) = self.shadowed_context_marker.as_deref() else {
+            return false;
+        };
+        node.children()
+            .any(|child| child.kind() == SyntaxKind::BlockComment && child.text() == marker)
+    }
+
+    pub(crate) fn clean_context_source(&self, node: &SyntaxNode) -> String {
+        let raw = format!("#{}", SyntaxNode::clone(node).into_text());
+        match self.shadowed_context_marker.as_deref() {
+            Some(marker) if raw.contains(marker) => raw.replace(marker, ""),
+            _ => raw,
+        }
+    }
+}
+
+// A block comment marks shadowed `#context` through
+// preprocessing and reparsing. The conversion-scoped environment identifies
+// that marker. The IR builder strips it from retained source, and the
+// conversion entry points remove any marker left in the output.
+thread_local! {
+    static MATH_BUILD_ENV: RefCell<Vec<MathBuildEnv>> = const { RefCell::new(Vec::new()) };
+}
+
+struct MathBuildEnvGuard;
+
+impl Drop for MathBuildEnvGuard {
+    fn drop(&mut self) {
+        MATH_BUILD_ENV.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+}
+
+pub(crate) fn with_math_build_env<R>(env: MathBuildEnv, f: impl FnOnce() -> R) -> R {
+    MATH_BUILD_ENV.with(|stack| stack.borrow_mut().push(env));
+    let _guard = MathBuildEnvGuard;
+    f()
+}
+
+pub(crate) fn current_math_build_env() -> MathBuildEnv {
+    MATH_BUILD_ENV.with(|stack| stack.borrow().last().cloned().unwrap_or_default())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MathSpacing {
@@ -26,18 +78,15 @@ pub struct MathCommand {
     pub latex: String,
     pub args: Vec<MathIr>,
     pub optional_arg: Option<Box<MathIr>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MathCaseRow {
-    pub value: MathIr,
-    pub condition: Option<MathIr>,
+    pub preserve_empty_args: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MathStyleMode {
     Display,
     Inline,
+    Script,
+    ScriptScript,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,10 +94,22 @@ pub enum MathEnvironment {
     Matrix {
         name: String,
         rows: Vec<Vec<MathIr>>,
+        /// Lines and alignment that need an `array`, from `mat(augment:, align:)`.
+        layout: Option<ArrayLayout>,
     },
     Cases {
-        rows: Vec<MathCaseRow>,
+        rows: Vec<MathIr>,
     },
+}
+
+/// The `array` form of a matrix with rules or a non-centred alignment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrayLayout {
+    /// The column alignment letter: `l`, `c` or `r`.
+    pub align: char,
+    /// Rules after these columns and rows, counted from 1.
+    pub vlines: Vec<usize>,
+    pub hlines: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,10 +150,16 @@ pub enum MathIr {
         sub: Option<Box<MathIr>>,
         sup: Option<Box<MathIr>>,
         primes: usize,
+        /// The superscript came first in the source (`x^a_b`); LaTeX keeps that order.
+        sup_first: bool,
     },
     Command(MathCommand),
     Environment(MathEnvironment),
     RawLiteral(String),
+    PreservedSource {
+        source: String,
+        reason: &'static str,
+    },
 }
 
 fn normalize_package_sensitive_math_tex(tex: &str) -> &str {
@@ -109,6 +176,26 @@ impl MathIr {
         MathIr::Seq(vec![])
     }
 
+    /// A LaTeX command with no optional argument.
+    pub fn command(latex: &str, args: Vec<MathIr>) -> Self {
+        MathIr::Command(MathCommand {
+            latex: latex.to_string(),
+            args,
+            optional_arg: None,
+            preserve_empty_args: false,
+        })
+    }
+
+    /// A LaTeX command whose positional brace groups are mandatory even when empty.
+    pub fn required_command(latex: &str, args: Vec<MathIr>) -> Self {
+        MathIr::Command(MathCommand {
+            latex: latex.to_string(),
+            args,
+            optional_arg: None,
+            preserve_empty_args: true,
+        })
+    }
+
     pub fn is_empty(&self) -> bool {
         match self {
             MathIr::Seq(items) => items.is_empty(),
@@ -118,17 +205,21 @@ impl MathIr {
     }
 }
 
-pub fn build_math_ir(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
+pub(crate) fn build_math_ir_with_env(
+    node: &SyntaxNode,
+    options: &T2LOptions,
+    env: &MathBuildEnv,
+) -> MathIr {
     match node.kind() {
         SyntaxKind::MathIdent => build_math_ident(node),
         SyntaxKind::FieldAccess => build_field_access(node),
         SyntaxKind::Space => MathIr::Spacing(MathSpacing::Soft),
         SyntaxKind::Escape => build_escape(node),
         SyntaxKind::Linebreak => MathIr::Linebreak,
-        SyntaxKind::MathAttach => build_math_attach(node, options),
-        SyntaxKind::FuncCall => build_func_call(node, options),
-        SyntaxKind::MathFrac => build_math_frac(node, options),
-        SyntaxKind::MathRoot => build_math_root(node, options),
+        SyntaxKind::MathAttach => build_math_attach(node, options, env),
+        SyntaxKind::FuncCall => build_func_call(node, options, env),
+        SyntaxKind::MathFrac => build_math_frac(node, options, env),
+        SyntaxKind::MathRoot => build_math_root(node, options, env),
         SyntaxKind::LeftParen => MathIr::RawLiteral("(".to_string()),
         SyntaxKind::RightParen => MathIr::RawLiteral(")".to_string()),
         SyntaxKind::LeftBracket => MathIr::RawLiteral("[".to_string()),
@@ -150,19 +241,33 @@ pub fn build_math_ir(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
         SyntaxKind::Semicolon => MathIr::Punctuation(';'),
         SyntaxKind::Dots => MathIr::RawLiteral("\\dots".to_string()),
         SyntaxKind::Int | SyntaxKind::Float => MathIr::Number(node.text().to_string()),
-        SyntaxKind::Str => MathIr::Command(MathCommand {
-            latex: "\\text".to_string(),
-            args: vec![MathIr::RawLiteral(
-                node.text().trim_matches('"').to_string(),
-            )],
-            optional_arg: None,
-        }),
-        SyntaxKind::MathDelimited => build_math_delimited(node, options),
+        // Resolve the string's escapes (`\"`), then escape what LaTeX text mode
+        // treats specially. An empty string is how L -> T writes an empty base
+        // (`""_(a)`), and `\text{}_a` would lose its argument.
+        SyntaxKind::Str => {
+            let text = str_value(node);
+            if text.is_empty() {
+                MathIr::RawLiteral("{}".to_string())
+            } else {
+                MathIr::command(
+                    "\\text",
+                    vec![MathIr::RawLiteral(escape_latex_math_text(&text))],
+                )
+            }
+        }
+        SyntaxKind::Raw => build_raw_math_text(node),
+        SyntaxKind::MathDelimited => build_math_delimited(node, options, env),
+        SyntaxKind::ContentBlock => build_content_block(node, options, env),
+        // An equation passed as an argument, as in `#box(width: 0pt, $x$)`.
+        SyntaxKind::Equation => child_of_kind(node, SyntaxKind::Math)
+            .map_or_else(MathIr::empty, |math| {
+                build_math_ir_with_env(math, options, env)
+            }),
         SyntaxKind::MathPrimes => {
             let count = count_math_primes(node);
             MathIr::RawLiteral("'".repeat(count))
         }
-        _ => build_generic(node, options),
+        _ => build_generic(node, options, env),
     }
 }
 
@@ -232,18 +337,21 @@ pub fn normalize_math_ir(ir: MathIr) -> MathIr {
             sub,
             sup,
             primes,
+            sup_first,
         } => MathIr::Script {
             base: Box::new(normalize_math_ir(*base)),
             sub: sub.map(|item| Box::new(normalize_math_ir(*item))),
             sup: sup.map(|item| Box::new(normalize_math_ir(*item))),
             primes,
+            sup_first,
         },
         MathIr::Command(mut command) => {
+            let preserve_empty = command.preserve_empty_args;
             command.args = command
                 .args
                 .into_iter()
                 .map(normalize_math_ir)
-                .filter(|arg| !arg.is_empty())
+                .filter(|arg| preserve_empty || !arg.is_empty())
                 .collect();
             command.optional_arg = command
                 .optional_arg
@@ -251,9 +359,10 @@ pub fn normalize_math_ir(ir: MathIr) -> MathIr {
             MathIr::Command(command)
         }
         MathIr::Environment(environment) => match environment {
-            MathEnvironment::Matrix { name, rows } => {
+            MathEnvironment::Matrix { name, rows, layout } => {
                 MathIr::Environment(MathEnvironment::Matrix {
                     name,
+                    layout,
                     rows: rows
                         .into_iter()
                         .map(|row| {
@@ -269,11 +378,8 @@ pub fn normalize_math_ir(ir: MathIr) -> MathIr {
             MathEnvironment::Cases { rows } => MathIr::Environment(MathEnvironment::Cases {
                 rows: rows
                     .into_iter()
-                    .map(|row| MathCaseRow {
-                        value: normalize_math_ir(row.value),
-                        condition: row.condition.map(normalize_math_ir),
-                    })
-                    .filter(|row| !row.value.is_empty())
+                    .map(normalize_math_ir)
+                    .filter(|row| !row.is_empty())
                     .collect(),
             }),
         },
@@ -285,11 +391,13 @@ fn build_math_ident(node: &SyntaxNode) -> MathIr {
     let text = node.text();
     let text_str = text.as_str();
 
-    if matches!(text_str, "zws" | "zwsp" | "nbsp" | "wj" | "shy") {
-        return MathIr::empty();
-    }
-
     match text_str {
+        // `zws` is how L -> T writes an empty group (`{}_a`). Dropping it let the
+        // next token take its place as a base, script or matrix cell.
+        "zws" | "zwsp" => return MathIr::RawLiteral("{}".to_string()),
+        "nbsp" => return MathIr::RawLiteral("~".to_string()),
+        "wj" => return MathIr::RawLiteral(r"\nobreak".to_string()),
+        "shy" => return MathIr::RawLiteral(r"\-".to_string()),
         "quad" => return MathIr::Spacing(MathSpacing::Quad),
         "qquad" => return MathIr::Spacing(MathSpacing::Qquad),
         "space" | "sp" => return MathIr::Spacing(MathSpacing::Space),
@@ -353,6 +461,11 @@ fn build_escape(node: &SyntaxNode) -> MathIr {
         '+' | '-' | '=' | '<' | '>' | '|' | '/' | '*' => MathIr::Operator(escaped.to_string()),
         ch if ch.is_ascii_digit() => MathIr::Number(ch.to_string()),
         ch if ch.is_alphabetic() => MathIr::Ident(ch.to_string()),
+        // Escape LaTeX-active characters so math escapes stay literal.
+        '{' | '}' | '$' | '%' | '#' | '&' | '_' => MathIr::RawLiteral(format!("\\{escaped}")),
+        '\\' => MathIr::Symbol(r"\backslash".to_string()),
+        '^' => MathIr::RawLiteral(r"\text{\textasciicircum{}}".to_string()),
+        '~' => MathIr::RawLiteral(r"\text{\textasciitilde{}}".to_string()),
         ch => {
             if let Some(latex) = UNICODE_TO_LATEX.get(&ch) {
                 MathIr::Symbol((*latex).to_string())
@@ -363,7 +476,57 @@ fn build_escape(node: &SyntaxNode) -> MathIr {
     }
 }
 
-fn build_math_attach(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
+/// A script operand. The emitter strips grouping parentheses from the
+/// rendered script, which cannot tell an escaped `\)` from a real one, so a
+/// group holding an escaped delimiter (`x^(a\))`) is unwrapped here.
+fn build_script(node: &SyntaxNode, options: &T2LOptions, env: &MathBuildEnv) -> MathIr {
+    fn holds_escaped_delimiter(node: &SyntaxNode) -> bool {
+        node.children().any(|child| {
+            (child.kind() == SyntaxKind::Escape
+                && matches!(child.text().as_str(), "\\(" | "\\)" | "\\[" | "\\]"))
+                || holds_escaped_delimiter(child)
+        })
+    }
+    if holds_escaped_delimiter(node) {
+        let only = [node];
+        let inner = strip_grouping_parens(&only);
+        if inner.len() != 1 || !std::ptr::eq(inner[0], node) {
+            let inner: Vec<&SyntaxNode> = inner
+                .into_iter()
+                .filter(|child| child.kind() != SyntaxKind::Space)
+                .collect();
+            let content = seq_or_single(
+                inner
+                    .iter()
+                    .map(|child| build_math_ir_with_env(child, options, env))
+                    .collect(),
+            );
+            // `x^(\(a\))`: braces stop the emitter stripping `(a)` again.
+            let first_text = inner.first().map(|child| first_leaf_text(child));
+            if matches!(first_text.as_deref(), Some("\\(" | "(")) {
+                return MathIr::Delimited {
+                    open: "{".to_string(),
+                    content: Box::new(content),
+                    close: "}".to_string(),
+                };
+            }
+            return content;
+        }
+    }
+    build_math_ir_with_env(node, options, env)
+}
+
+fn first_leaf_text(node: &SyntaxNode) -> String {
+    match node
+        .children()
+        .find(|child| child.kind() != SyntaxKind::Space)
+    {
+        Some(child) => first_leaf_text(child),
+        None => node.text().to_string(),
+    }
+}
+
+fn build_math_attach(node: &SyntaxNode, options: &T2LOptions, env: &MathBuildEnv) -> MathIr {
     let children: Vec<&SyntaxNode> = node
         .children()
         .filter(|child| child.kind() != SyntaxKind::Space)
@@ -387,12 +550,13 @@ fn build_math_attach(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
 
     let base = Box::new(
         base_idx
-            .map(|index| build_math_ir(children[index], options))
+            .map(|index| build_math_ir_with_env(children[index], options, env))
             .unwrap_or_else(MathIr::empty),
     );
     let mut sub = None;
     let mut sup = None;
     let mut primes = 0usize;
+    let mut sup_first = false;
 
     let mut index = 0;
     while index < children.len() {
@@ -407,7 +571,8 @@ fn build_math_attach(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
                     && children[index + 1].kind() != SyntaxKind::Hat
                     && children[index + 1].kind() != SyntaxKind::Underscore =>
             {
-                sup = Some(Box::new(build_math_ir(children[index + 1], options)));
+                sup = Some(Box::new(build_script(children[index + 1], options, env)));
+                sup_first |= sub.is_none();
                 index += 2;
                 continue;
             }
@@ -416,7 +581,7 @@ fn build_math_attach(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
                     && children[index + 1].kind() != SyntaxKind::Hat
                     && children[index + 1].kind() != SyntaxKind::Underscore =>
             {
-                sub = Some(Box::new(build_math_ir(children[index + 1], options)));
+                sub = Some(Box::new(build_script(children[index + 1], options, env)));
                 index += 2;
                 continue;
             }
@@ -436,6 +601,7 @@ fn build_math_attach(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
         sub,
         sup,
         primes,
+        sup_first,
     }
 }
 
@@ -445,7 +611,7 @@ fn count_math_primes(node: &SyntaxNode) -> usize {
         .unwrap_or_else(|| node.text().chars().filter(|&c| c == '\'').count())
 }
 
-fn build_func_call(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
+fn build_func_call(node: &SyntaxNode, options: &T2LOptions, env: &MathBuildEnv) -> MathIr {
     let children: Vec<&SyntaxNode> = node.children().collect();
     if children.is_empty() {
         return MathIr::empty();
@@ -461,24 +627,25 @@ fn build_func_call(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
         return build_callable_ir(&func_str, vec![]);
     };
 
+    // `upright(bold(x))` is how L -> T writes `\mathbf{x}`. Converting each wrapper
+    // gives `\mathrm{\boldsymbol{x}}`, which reads back one `upright` deeper.
+    // `bold(upright(x))` is how it writes `\boldsymbol{\mathrm{x}}`, so it stays.
+    if let Some(inner_args) = (func_str == "upright")
+        .then(|| sole_call_args(args_node, "bold"))
+        .flatten()
+    {
+        return MathIr::command(r"\mathbf", build_args(inner_args, options, env));
+    }
+
     if let Some(handler) = TYPST_MATH_HANDLERS.get(func_str.as_str()) {
         match handler {
             MathHandler::Command { latex_cmd } => {
-                let args = build_args(args_node, options);
-                return MathIr::Command(MathCommand {
-                    latex: (*latex_cmd).to_string(),
-                    args,
-                    optional_arg: None,
-                });
+                return MathIr::command(latex_cmd, build_positional_args(args_node, options, env));
             }
             MathHandler::CommandWithOpt { latex_cmd } => {
-                let args = build_args(args_node, options);
+                let args = build_positional_args(args_node, options, env);
                 if args.is_empty() {
-                    return MathIr::Command(MathCommand {
-                        latex: (*latex_cmd).to_string(),
-                        args: vec![],
-                        optional_arg: None,
-                    });
+                    return MathIr::command(latex_cmd, vec![]);
                 }
 
                 let (optional_arg, regular_args) = if args.len() >= 2 {
@@ -494,33 +661,66 @@ fn build_func_call(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
                     latex: (*latex_cmd).to_string(),
                     args: regular_args,
                     optional_arg,
+                    preserve_empty_args: false,
                 });
             }
             MathHandler::Delimiters { open, close } => {
                 return MathIr::Delimited {
                     open: (*open).to_string(),
-                    content: Box::new(seq_or_single(build_args(args_node, options))),
+                    content: Box::new(seq_or_single(build_args(args_node, options, env))),
                     close: (*close).to_string(),
                 };
             }
             MathHandler::BigOperator { latex_cmd } => {
                 return MathIr::Apply {
                     callee: Box::new(MathIr::Symbol((*latex_cmd).to_string())),
-                    args: build_args(args_node, options),
+                    args: build_args(args_node, options, env),
                 };
             }
             MathHandler::Environment { name } => {
-                return build_environment(args_node, name, options);
+                return build_environment(args_node, name, options, env);
             }
             MathHandler::Special => {
-                if let Some(ir) = build_special_func_call(func_str.as_str(), args_node, options) {
+                if let Some(ir) = build_special_func_call(
+                    func_str.as_str(),
+                    args_node,
+                    options,
+                    children[0].kind() == SyntaxKind::MathIdent,
+                    env,
+                ) {
                     return ir;
                 }
             }
         }
     }
 
-    build_callable_ir(&func_str, build_args(args_node, options))
+    build_callable_ir(&func_str, build_args(args_node, options, env))
+}
+
+/// The argument list of the call `name(…)` when it is the only argument in `args_node`.
+fn sole_call_args<'a>(args_node: &'a SyntaxNode, name: &str) -> Option<&'a SyntaxNode> {
+    let mut args = args_node.children().filter(|child| is_content_node(child));
+    let mut arg = args.next()?;
+    if args.next().is_some() {
+        return None;
+    }
+    while arg.kind() == SyntaxKind::Math {
+        let mut children = arg
+            .children()
+            .filter(|child| child.kind() != SyntaxKind::Space);
+        arg = children.next()?;
+        if children.next().is_some() {
+            return None;
+        }
+    }
+    if arg.kind() != SyntaxKind::FuncCall {
+        return None;
+    }
+    let mut children = arg.children();
+    if get_math_func_name(children.next()?) != name {
+        return None;
+    }
+    children.find(|child| child.kind() == SyntaxKind::Args)
 }
 
 fn build_callable_ir(func_str: &str, args: Vec<MathIr>) -> MathIr {
@@ -529,11 +729,10 @@ fn build_callable_ir(func_str: &str, args: Vec<MathIr>) -> MathIr {
             normalize_package_sensitive_math_tex(tex),
         ))
     } else {
-        MathIr::Command(MathCommand {
-            latex: r"\operatorname".to_string(),
-            args: vec![MathIr::RawLiteral(func_str.to_string())],
-            optional_arg: None,
-        })
+        MathIr::command(
+            r"\operatorname",
+            vec![MathIr::RawLiteral(func_str.to_string())],
+        )
     };
 
     if args.is_empty() {
@@ -550,30 +749,40 @@ fn build_special_func_call(
     func_str: &str,
     args_node: &SyntaxNode,
     options: &T2LOptions,
+    math_args: bool,
+    env: &MathBuildEnv,
 ) -> Option<MathIr> {
     let args: Vec<&SyntaxNode> = args_node
         .children()
         .filter(|child| is_content_node(child))
         .collect();
+    let all_args = || {
+        seq_or_single(
+            args.iter()
+                .map(|arg| build_math_ir_with_env(arg, options, env))
+                .collect(),
+        )
+    };
 
     match func_str {
-        "math.vec" => Some(build_math_vec_ir(args_node, options)),
-        "lr" => Some(MathIr::RawLiteral(render_lr_to_latex_string(
-            args_node, options,
-        ))),
-        "attach" => Some(build_attach_ir(args_node, options)),
-        "scripts" => Some(MathIr::Style {
-            mode: MathStyleMode::Display,
-            content: Box::new(seq_or_single(
-                args.iter().map(|arg| build_math_ir(arg, options)).collect(),
-            )),
+        "math.vec" => Some(build_math_vec_ir(args_node, options, env)),
+        "lr" => Some(build_lr_ir(args_node, options, env)),
+        "attach" => Some(build_attach_ir(args_node, options, env)),
+        "scripts" | "display" | "inline" | "script" | "sscript" => Some(MathIr::Style {
+            mode: match func_str {
+                "inline" => MathStyleMode::Inline,
+                "script" => MathStyleMode::Script,
+                "sscript" => MathStyleMode::ScriptScript,
+                _ => MathStyleMode::Display,
+            },
+            content: Box::new(all_args()),
         }),
         "primes" => Some(build_primes_ir(args_node)),
-        "stretch" => Some(build_stretch_ir(args_node, options)),
+        "stretch" => Some(build_stretch_ir(args_node, options, env)),
         "mid" => Some(MathIr::Symbol(r"\mid".to_string())),
         "circle" => args.first().map(|arg| MathIr::Delimited {
             open: r"\mathring{".to_string(),
-            content: Box::new(build_math_ir(arg, options)),
+            content: Box::new(build_math_ir_with_env(arg, options, env)),
             close: "}".to_string(),
         }),
         "divergence" => Some(MathIr::Seq(vec![
@@ -581,94 +790,110 @@ fn build_special_func_call(
             MathIr::Spacing(MathSpacing::Soft),
             MathIr::Symbol(r"\cdot".to_string()),
             MathIr::Spacing(MathSpacing::Soft),
-            seq_or_single(args.iter().map(|arg| build_math_ir(arg, options)).collect()),
+            all_args(),
         ])),
         "curl" => Some(MathIr::Seq(vec![
             MathIr::Symbol(r"\nabla".to_string()),
             MathIr::Spacing(MathSpacing::Soft),
             MathIr::Symbol(r"\times".to_string()),
             MathIr::Spacing(MathSpacing::Soft),
-            seq_or_single(args.iter().map(|arg| build_math_ir(arg, options)).collect()),
+            all_args(),
         ])),
         "limits" => args
             .first()
-            .map(|arg| MathIr::Limits(Box::new(build_math_ir(arg, options)))),
-        "display" => Some(MathIr::Style {
-            mode: MathStyleMode::Display,
-            content: Box::new(seq_or_single(
-                args.iter().map(|arg| build_math_ir(arg, options)).collect(),
-            )),
-        }),
-        "inline" => Some(MathIr::Style {
-            mode: MathStyleMode::Inline,
-            content: Box::new(seq_or_single(
-                args.iter().map(|arg| build_math_ir(arg, options)).collect(),
-            )),
-        }),
+            .map(|arg| MathIr::Limits(Box::new(build_math_ir_with_env(arg, options, env)))),
+        "box" => Some(build_box_ir(args_node, options, math_args, env)),
+        "text" => Some(build_text_markup_ir(
+            r"\text", args_node, options, math_args, env,
+        )),
+        "emph" => Some(build_text_markup_ir(
+            r"\textit", args_node, options, math_args, env,
+        )),
+        "strong" => Some(build_text_markup_ir(
+            r"\textbf", args_node, options, math_args, env,
+        )),
+        // A sum such as `1em + 2pt` becomes one `\hspace` per term.
         "h" => args.first().and_then(|arg| {
             let arg_text = get_simple_text(arg);
-            match parse_spacing_spec(&arg_text) {
-                Some(SpacingSpec::Fixed(value)) => Some(MathIr::Command(MathCommand {
-                    latex: r"\hspace".to_string(),
-                    args: vec![MathIr::RawLiteral(value)],
-                    optional_arg: None,
-                })),
-                Some(SpacingSpec::Flex(_)) | None => None,
-            }
+            let terms = arg_text
+                .split('+')
+                .map(|term| match parse_spacing_spec(term) {
+                    Some(SpacingSpec::Fixed(value)) => {
+                        Some(MathIr::command(r"\hspace", vec![MathIr::RawLiteral(value)]))
+                    }
+                    Some(SpacingSpec::Flex(_)) | None => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(seq_or_single(terms))
         }),
         "op" => {
-            let name = args
-                .first()
-                .map(|arg| get_simple_text(arg).trim_matches('"').to_string())
-                .unwrap_or_default();
-            Some(MathIr::Command(MathCommand {
-                latex: r"\operatorname".to_string(),
-                args: vec![MathIr::RawLiteral(name)],
-                optional_arg: None,
-            }))
+            // A string is the operator's name; other content is math. The
+            // Unicode spaces that L → T keeps for `\,`, `\:` and `\;` turn back.
+            let name = match args.first() {
+                Some(arg) if arg.kind() == SyntaxKind::Str => {
+                    let name = str_value(arg);
+                    let mut latex = String::with_capacity(name.len());
+                    for ch in name.chars() {
+                        match ch {
+                            '\u{2009}' => latex.push_str(r"\,"),
+                            '\u{205F}' => latex.push_str(r"\:"),
+                            '\u{2004}' => latex.push_str(r"\;"),
+                            // `\operatorname{a_b}` would read `b` as a subscript.
+                            '_' | '&' | '%' | '#' | '$' | '{' | '}' => {
+                                latex.push('\\');
+                                latex.push(ch);
+                            }
+                            _ => latex.push(ch),
+                        }
+                    }
+                    MathIr::RawLiteral(latex)
+                }
+                Some(arg) => build_math_ir_with_env(arg, options, env),
+                None => MathIr::empty(),
+            };
+            Some(MathIr::command(r"\operatorname", vec![name]))
         }
-        "class" => build_class_ir(&args, options),
+        "class" => build_class_ir(&args, options, env),
         "set" | "Set" => Some(MathIr::Delimited {
             open: r"\left\{".to_string(),
-            content: Box::new(seq_or_single(
-                args.iter().map(|arg| build_math_ir(arg, options)).collect(),
-            )),
+            content: Box::new(all_args()),
             close: r"\right\}".to_string(),
         }),
         "arrow" => args.first().map(|arg| MathIr::Delimited {
             open: r"\overrightarrow{".to_string(),
-            content: Box::new(build_math_ir(arg, options)),
+            content: Box::new(build_math_ir_with_env(arg, options, env)),
             close: "}".to_string(),
         }),
-        "accent" => build_accent_ir(&args, options),
-        "color" => build_color_ir(&args, options),
+        "accent" => build_accent_ir(&args, options, env),
+        "color" => build_color_ir(&args, options, env),
         _ => None,
     }
 }
 
-fn build_math_vec_ir(args_node: &SyntaxNode, options: &T2LOptions) -> MathIr {
+fn build_math_vec_ir(args_node: &SyntaxNode, options: &T2LOptions, env: &MathBuildEnv) -> MathIr {
     let rows = args_node
         .children()
         .filter(|child| is_content_node(child))
-        .map(|child| vec![build_math_ir(child, options)])
+        .map(|child| vec![build_math_ir_with_env(child, options, env)])
         .collect();
 
     MathIr::Environment(MathEnvironment::Matrix {
         name: "pmatrix".to_string(),
         rows,
+        layout: None,
     })
 }
 
-fn build_attach_ir(args_node: &SyntaxNode, options: &T2LOptions) -> MathIr {
+fn build_attach_ir(args_node: &SyntaxNode, options: &T2LOptions, env: &MathBuildEnv) -> MathIr {
     let args = FuncArgs::from_args_node(args_node);
     let base = args
         .positional_node(0)
-        .map(|node| build_math_ir(node, options))
+        .map(|node| build_math_ir_with_env(node, options, env))
         .unwrap_or_else(MathIr::empty);
 
     let named = |key: &str| {
         args.named_node(key)
-            .map(|node| Box::new(build_math_ir(node, options)))
+            .map(|node| Box::new(build_math_ir_with_env(node, options, env)))
     };
 
     MathIr::Attachment {
@@ -692,7 +917,7 @@ fn build_primes_ir(args_node: &SyntaxNode) -> MathIr {
     MathIr::RawLiteral("'".repeat(count))
 }
 
-fn build_stretch_ir(args_node: &SyntaxNode, options: &T2LOptions) -> MathIr {
+fn build_stretch_ir(args_node: &SyntaxNode, options: &T2LOptions, env: &MathBuildEnv) -> MathIr {
     let Some(first_arg) = args_node.children().find(|child| is_content_node(child)) else {
         return MathIr::empty();
     };
@@ -704,11 +929,15 @@ fn build_stretch_ir(args_node: &SyntaxNode, options: &T2LOptions) -> MathIr {
         "arrow.l.r" | "<->" => MathIr::RawLiteral(r"\xleftrightarrow{}".to_string()),
         "brace.t" => MathIr::RawLiteral(r"\overbrace{}".to_string()),
         "brace.b" => MathIr::RawLiteral(r"\underbrace{}".to_string()),
-        _ => build_math_ir(first_arg, options),
+        _ => build_math_ir_with_env(first_arg, options, env),
     }
 }
 
-fn build_class_ir(args: &[&SyntaxNode], options: &T2LOptions) -> Option<MathIr> {
+fn build_class_ir(
+    args: &[&SyntaxNode],
+    options: &T2LOptions,
+    env: &MathBuildEnv,
+) -> Option<MathIr> {
     if args.len() < 2 {
         return None;
     }
@@ -724,7 +953,7 @@ fn build_class_ir(args: &[&SyntaxNode], options: &T2LOptions) -> Option<MathIr> 
         _ => None,
     };
 
-    let content = build_math_ir(args[1], options);
+    let content = build_math_ir_with_env(args[1], options, env);
     Some(match latex_cmd {
         Some(cmd) => MathIr::Delimited {
             open: format!("{}{{", cmd),
@@ -735,7 +964,11 @@ fn build_class_ir(args: &[&SyntaxNode], options: &T2LOptions) -> Option<MathIr> 
     })
 }
 
-fn build_accent_ir(args: &[&SyntaxNode], options: &T2LOptions) -> Option<MathIr> {
+fn build_accent_ir(
+    args: &[&SyntaxNode],
+    options: &T2LOptions,
+    env: &MathBuildEnv,
+) -> Option<MathIr> {
     if args.len() < 2 {
         return None;
     }
@@ -761,12 +994,16 @@ fn build_accent_ir(args: &[&SyntaxNode], options: &T2LOptions) -> Option<MathIr>
 
     Some(MathIr::Delimited {
         open: format!("{}{{", latex_cmd),
-        content: Box::new(build_math_ir(args[0], options)),
+        content: Box::new(build_math_ir_with_env(args[0], options, env)),
         close: "}".to_string(),
     })
 }
 
-fn build_color_ir(args: &[&SyntaxNode], options: &T2LOptions) -> Option<MathIr> {
+fn build_color_ir(
+    args: &[&SyntaxNode],
+    options: &T2LOptions,
+    env: &MathBuildEnv,
+) -> Option<MathIr> {
     if args.len() < 2 {
         return None;
     }
@@ -776,12 +1013,12 @@ fn build_color_ir(args: &[&SyntaxNode], options: &T2LOptions) -> Option<MathIr> 
 
     Some(MathIr::Delimited {
         open: format!(r"{{\color{{{}}}", normalized_color),
-        content: Box::new(build_math_ir(args[1], options)),
+        content: Box::new(build_math_ir_with_env(args[1], options, env)),
         close: "}".to_string(),
     })
 }
 
-fn build_math_frac(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
+fn build_math_frac(node: &SyntaxNode, options: &T2LOptions, env: &MathBuildEnv) -> MathIr {
     let children: Vec<&SyntaxNode> = node.children().collect();
     let slash_pos = children
         .iter()
@@ -791,7 +1028,7 @@ fn build_math_frac(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
         let stripped = strip_grouping_parens(side);
         let items: Vec<MathIr> = stripped
             .iter()
-            .map(|child| build_math_ir(child, options))
+            .map(|child| build_math_ir_with_env(child, options, env))
             .collect();
         seq_or_single(items)
     };
@@ -810,11 +1047,7 @@ fn build_math_frac(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
         (MathIr::empty(), MathIr::empty())
     };
 
-    MathIr::Command(MathCommand {
-        latex: "\\frac".to_string(),
-        args: vec![numerator, denominator],
-        optional_arg: None,
-    })
+    MathIr::command("\\frac", vec![numerator, denominator])
 }
 
 /// When a fraction's numerator or denominator is a single parenthesized
@@ -850,37 +1083,37 @@ fn strip_grouping_parens<'a>(children: &'a [&'a SyntaxNode]) -> Vec<&'a SyntaxNo
     children.to_vec()
 }
 
-fn build_math_root(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
+fn build_math_root(node: &SyntaxNode, options: &T2LOptions, env: &MathBuildEnv) -> MathIr {
     let content_children: Vec<&SyntaxNode> = node
         .children()
         .filter(|child| is_content_node(child))
         .collect();
 
     match content_children.len() {
-        0 => MathIr::Command(MathCommand {
-            latex: "\\sqrt".to_string(),
-            args: vec![MathIr::empty()],
-            optional_arg: None,
-        }),
-        1 => MathIr::Command(MathCommand {
-            latex: "\\sqrt".to_string(),
-            args: vec![build_math_ir(content_children[0], options)],
-            optional_arg: None,
-        }),
+        0 => MathIr::command("\\sqrt", vec![MathIr::empty()]),
+        1 => MathIr::command(
+            "\\sqrt",
+            vec![build_math_ir_with_env(content_children[0], options, env)],
+        ),
         _ => MathIr::Command(MathCommand {
             latex: "\\sqrt".to_string(),
             args: vec![seq_or_single(
                 content_children[1..]
                     .iter()
-                    .map(|child| build_math_ir(child, options))
+                    .map(|child| build_math_ir_with_env(child, options, env))
                     .collect(),
             )],
-            optional_arg: Some(Box::new(build_math_ir(content_children[0], options))),
+            optional_arg: Some(Box::new(build_math_ir_with_env(
+                content_children[0],
+                options,
+                env,
+            ))),
+            preserve_empty_args: false,
         }),
     }
 }
 
-fn build_math_delimited(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
+fn build_math_delimited(node: &SyntaxNode, options: &T2LOptions, env: &MathBuildEnv) -> MathIr {
     let children: Vec<&SyntaxNode> = node
         .children()
         .filter(|child| child.kind() != SyntaxKind::Space)
@@ -901,7 +1134,7 @@ fn build_math_delimited(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
             content: Box::new(seq_or_single(
                 children[1..children.len() - 1]
                     .iter()
-                    .map(|child| build_math_ir(child, options))
+                    .map(|child| build_math_ir_with_env(child, options, env))
                     .collect(),
             )),
             close: format!("\\right{}", get_latex_delimiter(&last_text, false)),
@@ -911,12 +1144,12 @@ fn build_math_delimited(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
     seq_or_single(
         children
             .into_iter()
-            .map(|child| build_math_ir(child, options))
+            .map(|child| build_math_ir_with_env(child, options, env))
             .collect(),
     )
 }
 
-fn build_generic(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
+fn build_generic(node: &SyntaxNode, options: &T2LOptions, env: &MathBuildEnv) -> MathIr {
     let children: Vec<&SyntaxNode> = node.children().collect();
     if !children.is_empty() {
         let mut items = Vec::new();
@@ -927,13 +1160,23 @@ fn build_generic(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
             if child.kind() == SyntaxKind::Hash && index + 1 < children.len() {
                 let next = children[index + 1];
                 if next.kind() == SyntaxKind::FuncCall {
-                    items.push(build_math_ir(next, options));
+                    items.push(build_math_ir_with_env(next, options, env));
+                    index += 2;
+                    continue;
+                }
+                if next.kind() == SyntaxKind::Contextual {
+                    items.push(build_contextual(next, options, env));
+                    index += 2;
+                    continue;
+                }
+                if next.kind() == SyntaxKind::Ident {
+                    items.push(MathIr::Ident(next.text().to_string()));
                     index += 2;
                     continue;
                 }
             }
 
-            items.push(build_math_ir(child, options));
+            items.push(build_math_ir_with_env(child, options, env));
             index += 1;
         }
 
@@ -942,8 +1185,23 @@ fn build_generic(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
 
     let text = node.text();
     let text_str = text.as_str();
-    if matches!(text_str, "zws" | "zwsp" | "nbsp" | "wj" | "shy") || text_str.trim().is_empty() {
+    if text_str.trim().is_empty() {
         return MathIr::empty();
+    }
+    // A lone brace is a literal one: an `lr` edge group split into its brackets
+    // (`lr(a { b })`) leaves one inside the content, where `{` would open a group.
+    // Bare `%`, `$`, and literal `#` text also need escaping before reaching LaTeX.
+    match text_str {
+        "{" => return MathIr::RawLiteral(r"\{".to_string()),
+        "}" => return MathIr::RawLiteral(r"\}".to_string()),
+        "%" => return MathIr::RawLiteral(r"\%".to_string()),
+        "$" => return MathIr::RawLiteral(r"\$".to_string()),
+        "#" if node.kind() == SyntaxKind::MathText => return MathIr::RawLiteral(r"\#".to_string()),
+        _ => {}
+    }
+
+    if node.kind() == SyntaxKind::Ident {
+        return MathIr::Ident(text_str.to_string());
     }
 
     if let Some(tex) = TYPST_TO_TEX.get(text_str) {
@@ -955,42 +1213,31 @@ fn build_generic(node: &SyntaxNode, options: &T2LOptions) -> MathIr {
     MathIr::Ident(convert_unicode_in_text(text_str))
 }
 
-fn build_environment(args_node: &SyntaxNode, name: &str, options: &T2LOptions) -> MathIr {
+fn build_environment(
+    args_node: &SyntaxNode,
+    name: &str,
+    options: &T2LOptions,
+    env: &MathBuildEnv,
+) -> MathIr {
     if name == "cases" {
-        let items: Vec<MathIr> = args_node
-            .children()
-            .filter(|child| is_content_node(child))
-            .map(|child| build_math_ir(child, options))
-            .collect();
-
-        let mut rows = Vec::new();
-        let mut index = 0;
-        while index < items.len() {
-            let value = items[index].clone();
-            let mut condition = None;
-            if index + 1 < items.len() && is_cases_condition(&items[index + 1]) {
-                condition = Some(strip_cases_condition_prefix(items[index + 1].clone()));
-                index += 2;
-            } else {
-                index += 1;
-            }
-            rows.push(MathCaseRow { value, condition });
-        }
-
+        // Every argument is a row, as in Typst: `cases(a, & b)` has two rows,
+        // the second with an empty first column.
+        let rows = build_args(args_node, options, env);
         return MathIr::Environment(MathEnvironment::Cases { rows });
     }
 
     let args = FuncArgs::from_args_node(args_node);
-    let actual_name = if let Some(delim) = args
-        .named_text("delim")
-        .map(|value| value.trim().trim_matches('"').trim_matches('\''))
-    {
+    let delimiter = named_expr(&args, "delim").map(|expr| match expr {
+        ast::Expr::Str(string) => string.get().to_string(),
+        expr => get_simple_text(expr.to_untyped()),
+    });
+    let actual_name = if let Some(delim) = delimiter.as_deref() {
         match delim {
             "[" => "bmatrix",
             "(" => "pmatrix",
             "{" => "Bmatrix",
-            "|" => "vmatrix",
-            "||" => "Vmatrix",
+            "|" | "bar.v" => "vmatrix",
+            "||" | "‖" | "bar.v.double" => "Vmatrix",
             _ => name,
         }
     } else {
@@ -1025,13 +1272,15 @@ fn build_environment(args_node: &SyntaxNode, name: &str, options: &T2LOptions) -
                     match arr_child.kind() {
                         SyntaxKind::Comma | SyntaxKind::Space => {}
                         _ if is_content_node(arr_child) => {
-                            current_row.push(build_math_ir(arr_child, options))
+                            current_row.push(build_math_ir_with_env(arr_child, options, env))
                         }
                         _ => {}
                     }
                 }
             }
-            _ if is_content_node(child) => current_row.push(build_math_ir(child, options)),
+            _ if is_content_node(child) => {
+                current_row.push(build_math_ir_with_env(child, options, env))
+            }
             _ => {}
         }
     }
@@ -1040,18 +1289,988 @@ fn build_environment(args_node: &SyntaxNode, name: &str, options: &T2LOptions) -
         rows.push(current_row);
     }
 
+    let layout = array_layout(&args);
     MathIr::Environment(MathEnvironment::Matrix {
         name: actual_name.to_string(),
         rows,
+        layout,
     })
 }
 
-fn build_args(args_node: &SyntaxNode, options: &T2LOptions) -> Vec<MathIr> {
+/// The `array` layout for `mat(augment: …, align: …)`, if either needs one.
+/// Resolve non-negative literal indices; other layouts remain unsupported.
+fn array_layout(args: &FuncArgs) -> Option<ArrayLayout> {
+    let align = match named_expr(args, "align") {
+        Some(ast::Expr::Ident(name)) if matches!(name.get().as_str(), "left" | "start") => 'l',
+        Some(ast::Expr::Ident(name)) if matches!(name.get().as_str(), "right" | "end") => 'r',
+        _ => 'c',
+    };
+    let (mut hlines, mut vlines) = (Vec::new(), Vec::new());
+    if let Some(augment) = named_expr(args, "augment") {
+        if let ast::Expr::Dict(dict) = augment {
+            for item in dict.items() {
+                let (key, value) = match item {
+                    ast::DictItem::Named(named) => (named.name().get().to_string(), named.expr()),
+                    ast::DictItem::Keyed(keyed) => match literal_text(keyed.key()) {
+                        Some(key) => (key, keyed.expr()),
+                        None => continue,
+                    },
+                    ast::DictItem::Spread(_) => continue,
+                };
+                match key.as_str() {
+                    "hline" => hlines = augmentation_indices(value),
+                    "vline" => vlines = augmentation_indices(value),
+                    _ => {}
+                }
+            }
+        } else {
+            vlines = augmentation_indices(augment);
+        }
+    }
+    if align == 'c' && hlines.is_empty() && vlines.is_empty() {
+        return None;
+    }
+    Some(ArrayLayout {
+        align,
+        vlines,
+        hlines,
+    })
+}
+
+fn named_expr<'a>(args: &FuncArgs<'a>, key: &str) -> Option<ast::Expr<'a>> {
+    args.named_arg(key)?
+        .node
+        .cast::<ast::Named>()
+        .map(|named| ungroup_expr(named.expr()))
+}
+
+fn augmentation_indices(expr: ast::Expr<'_>) -> Vec<usize> {
+    match ungroup_expr(expr) {
+        ast::Expr::Array(array) => array
+            .items()
+            .filter_map(|item| match item {
+                ast::ArrayItem::Pos(expr) => augmentation_index(expr),
+                ast::ArrayItem::Spread(_) => None,
+            })
+            .collect(),
+        expr => augmentation_index(expr).into_iter().collect(),
+    }
+}
+
+fn augmentation_index(expr: ast::Expr<'_>) -> Option<usize> {
+    match ungroup_expr(expr) {
+        ast::Expr::Int(index) => usize::try_from(index.get()).ok(),
+        ast::Expr::Unary(unary) if unary.op() == ast::UnOp::Pos => augmentation_index(unary.expr()),
+        _ => None,
+    }
+}
+
+fn build_args(args_node: &SyntaxNode, options: &T2LOptions, env: &MathBuildEnv) -> Vec<MathIr> {
     args_node
         .children()
         .filter(|child| is_content_node(child))
-        .map(|child| build_math_ir(child, options))
+        .map(|child| build_math_ir_with_env(child, options, env))
         .collect()
+}
+
+/// Recognize the measured negative skip used by L → T for `\llap`.
+fn build_contextual(node: &SyntaxNode, options: &T2LOptions, env: &MathBuildEnv) -> MathIr {
+    if let Some(body) = llap_body(node) {
+        if !env.is_shadowed_context(node) {
+            return MathIr::required_command(r"\llap", vec![box_math_arg(body, options, env)]);
+        }
+        return MathIr::PreservedSource {
+            source: env.clean_context_source(node),
+            reason: "cannot confirm built-in h/measure bindings in context expression; Typst retained as comments below",
+        };
+    }
+    MathIr::PreservedSource {
+        source: env.clean_context_source(node),
+        reason: "unsupported context expression; Typst retained as comments below",
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ScopeBindings {
+    h_shadowed: bool,
+    measure_shadowed: bool,
+}
+
+pub(crate) fn unique_shadowed_context_marker(input: &str) -> String {
+    let mut idx = 0usize;
+    loop {
+        let candidate = format!("/*__tylax_shadowed_ctx_{idx}__*/");
+        if !input.contains(&candidate) {
+            return candidate;
+        }
+        idx += 1;
+    }
+}
+
+pub(crate) fn mark_shadowed_context_source(node: &SyntaxNode, marker: &str) -> Option<String> {
+    llap_body(node)?;
+    let mut out = String::from("#");
+    let mut marked = false;
+    for child in node.children() {
+        out.push_str(SyntaxNode::clone(child).into_text().as_str());
+        if !marked && child.kind() == SyntaxKind::Context {
+            out.push_str(marker);
+            marked = true;
+        }
+    }
+    marked.then_some(out)
+}
+
+pub(crate) fn annotate_shadowed_llap_contexts(
+    input: &str,
+    math_only: bool,
+    marker: &str,
+) -> String {
+    let root = if math_only {
+        typst_syntax::parse_math(input)
+    } else {
+        typst_syntax::parse(input)
+    };
+    let linked = LinkedNode::new(&root);
+    annotate_llap_scopes_in_linked(&linked, input, false, false, marker)
+        .unwrap_or_else(|| input.to_string())
+}
+
+pub(crate) fn annotate_shadowed_llap_contexts_in_node(
+    node: &SyntaxNode,
+    h_shadowed: bool,
+    measure_shadowed: bool,
+    marker: &str,
+) -> Option<String> {
+    let source = SyntaxNode::clone(node).into_text().to_string();
+    let linked = LinkedNode::new(node);
+    annotate_llap_scopes_in_linked(&linked, &source, h_shadowed, measure_shadowed, marker)
+        .map(|annotated| format!("#{annotated}"))
+}
+
+fn annotate_llap_scopes_in_linked(
+    root: &LinkedNode<'_>,
+    source: &str,
+    h_shadowed: bool,
+    measure_shadowed: bool,
+    marker: &str,
+) -> Option<String> {
+    let mut scopes = vec![ScopeBindings {
+        h_shadowed,
+        measure_shadowed,
+    }];
+    let mut offsets = Vec::new();
+    walk_llap_scopes(root, &mut scopes, &mut offsets);
+    if offsets.is_empty() {
+        return None;
+    }
+    Some(splice_marker_at_offsets(source, &offsets, marker))
+}
+
+fn splice_marker_at_offsets(source: &str, offsets: &[usize], marker: &str) -> String {
+    let mut sorted = offsets.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut out = String::with_capacity(source.len() + sorted.len() * marker.len());
+    let mut last = 0usize;
+    for offset in sorted {
+        if offset >= last && offset <= source.len() && source.is_char_boundary(offset) {
+            out.push_str(&source[last..offset]);
+            out.push_str(marker);
+            last = offset;
+        }
+    }
+    out.push_str(&source[last..]);
+    out
+}
+
+fn is_shadowed(scopes: &[ScopeBindings]) -> bool {
+    scopes
+        .iter()
+        .any(|scope| scope.h_shadowed || scope.measure_shadowed)
+}
+
+fn mark_binding(name: &str, scope: &mut ScopeBindings) {
+    match name {
+        "h" => scope.h_shadowed = true,
+        "measure" => scope.measure_shadowed = true,
+        _ => {}
+    }
+}
+
+fn record_pattern_bindings(pattern: ast::Pattern<'_>, scope: &mut ScopeBindings) {
+    match pattern {
+        ast::Pattern::Normal(ast::Expr::Ident(ident)) => {
+            mark_binding(ident.get().as_str(), scope);
+        }
+        ast::Pattern::Parenthesized(paren) => {
+            record_pattern_bindings(paren.pattern(), scope);
+        }
+        ast::Pattern::Destructuring(destruct) => {
+            for item in destruct.items() {
+                match item {
+                    ast::DestructuringItem::Pattern(inner) => {
+                        record_pattern_bindings(inner, scope);
+                    }
+                    ast::DestructuringItem::Named(named) => {
+                        record_pattern_bindings(named.pattern(), scope);
+                    }
+                    ast::DestructuringItem::Spread(spread) => {
+                        if let Some(ast::Expr::Ident(ident)) = spread.sink_expr() {
+                            mark_binding(ident.get().as_str(), scope);
+                        }
+                    }
+                }
+            }
+        }
+        ast::Pattern::Placeholder(_) | ast::Pattern::Normal(_) => {}
+    }
+}
+
+fn record_params_bindings(params: ast::Params<'_>, scope: &mut ScopeBindings) {
+    for param in params.children() {
+        match param {
+            ast::Param::Pos(pattern) => record_pattern_bindings(pattern, scope),
+            ast::Param::Named(named) => mark_binding(named.name().get().as_str(), scope),
+            ast::Param::Spread(spread) => {
+                if let Some(ident) = spread.sink_ident() {
+                    mark_binding(ident.get().as_str(), scope);
+                }
+            }
+        }
+    }
+}
+
+fn default_import_binding_name(source: &str) -> Option<&str> {
+    if source.starts_with('@') {
+        let name = source.split('/').nth(1)?.split(':').next()?;
+        (!name.is_empty()).then_some(name)
+    } else {
+        let file = source.rsplit(['/', '\\']).next()?;
+        let stem = file.strip_suffix(".typ").unwrap_or(file);
+        (!stem.is_empty()).then_some(stem)
+    }
+}
+
+fn record_import_bindings(import: ast::ModuleImport<'_>, scope: &mut ScopeBindings) {
+    if let Some(alias) = import.new_name() {
+        mark_binding(alias.get().as_str(), scope);
+    }
+
+    if let Some(imports) = import.imports() {
+        match imports {
+            ast::Imports::Wildcard => {
+                scope.h_shadowed = true;
+                scope.measure_shadowed = true;
+            }
+            ast::Imports::Items(items) => {
+                for item in items.iter() {
+                    mark_binding(item.bound_name().get().as_str(), scope);
+                }
+            }
+        }
+    } else if import.new_name().is_none() {
+        match ungroup_expr(import.source()) {
+            ast::Expr::Str(source) => {
+                if let Some(name) = default_import_binding_name(source.get().as_str()) {
+                    mark_binding(name, scope);
+                } else {
+                    scope.h_shadowed = true;
+                    scope.measure_shadowed = true;
+                }
+            }
+            _ => {
+                scope.h_shadowed = true;
+                scope.measure_shadowed = true;
+            }
+        }
+    }
+}
+
+fn walk_scoped_body<F>(
+    node: &LinkedNode<'_>,
+    body: &SyntaxNode,
+    record_bindings: F,
+    scopes: &mut Vec<ScopeBindings>,
+    offsets: &mut Vec<usize>,
+) where
+    F: FnOnce(&mut ScopeBindings),
+{
+    let children: Vec<_> = node.children().collect();
+    let body_ptr = body as *const SyntaxNode;
+    let body_pos = children
+        .iter()
+        .position(|child| std::ptr::eq(child.get(), body_ptr));
+    if let Some(pos) = body_pos {
+        for child in &children[..pos] {
+            walk_llap_scopes(child, scopes, offsets);
+        }
+        scopes.push(ScopeBindings::default());
+        if let Some(scope) = scopes.last_mut() {
+            record_bindings(scope);
+        }
+        for child in &children[pos..] {
+            walk_llap_scopes(child, scopes, offsets);
+        }
+        scopes.pop();
+    } else {
+        scopes.push(ScopeBindings::default());
+        if let Some(scope) = scopes.last_mut() {
+            record_bindings(scope);
+        }
+        for child in &children {
+            walk_llap_scopes(child, scopes, offsets);
+        }
+        scopes.pop();
+    }
+}
+
+fn walk_llap_scopes(
+    node: &LinkedNode<'_>,
+    scopes: &mut Vec<ScopeBindings>,
+    offsets: &mut Vec<usize>,
+) {
+    match node.kind() {
+        SyntaxKind::Contextual => {
+            if is_shadowed(scopes) && llap_body(node.get()).is_some() {
+                if let Some(kw) = node
+                    .children()
+                    .find(|child| child.kind() == SyntaxKind::Context)
+                {
+                    offsets.push(kw.range().end);
+                }
+            }
+            for child in node.children() {
+                walk_llap_scopes(&child, scopes, offsets);
+            }
+        }
+        SyntaxKind::LetBinding => {
+            if let Some(binding) = node.get().cast::<ast::LetBinding>() {
+                match binding.kind() {
+                    ast::LetBindingKind::Closure(ident) => {
+                        if let Some(scope) = scopes.last_mut() {
+                            mark_binding(ident.get().as_str(), scope);
+                        }
+                        for child in node.children() {
+                            walk_llap_scopes(&child, scopes, offsets);
+                        }
+                    }
+                    ast::LetBindingKind::Normal(pattern) => {
+                        for child in node.children() {
+                            walk_llap_scopes(&child, scopes, offsets);
+                        }
+                        if let Some(scope) = scopes.last_mut() {
+                            record_pattern_bindings(pattern, scope);
+                        }
+                    }
+                }
+            }
+        }
+        SyntaxKind::Closure => {
+            if let Some(closure) = node.get().cast::<ast::Closure>() {
+                walk_scoped_body(
+                    node,
+                    closure.body().to_untyped(),
+                    |scope| record_params_bindings(closure.params(), scope),
+                    scopes,
+                    offsets,
+                );
+            }
+        }
+        SyntaxKind::ForLoop => {
+            if let Some(for_loop) = node.get().cast::<ast::ForLoop>() {
+                walk_scoped_body(
+                    node,
+                    for_loop.body().to_untyped(),
+                    |scope| record_pattern_bindings(for_loop.pattern(), scope),
+                    scopes,
+                    offsets,
+                );
+            }
+        }
+        SyntaxKind::ModuleImport => {
+            if let Some(import) = node.get().cast::<ast::ModuleImport>() {
+                for child in node.children() {
+                    walk_llap_scopes(&child, scopes, offsets);
+                }
+                if let Some(scope) = scopes.last_mut() {
+                    record_import_bindings(import, scope);
+                }
+            }
+        }
+        SyntaxKind::CodeBlock | SyntaxKind::ContentBlock | SyntaxKind::WhileLoop => {
+            scopes.push(ScopeBindings::default());
+            for child in node.children() {
+                walk_llap_scopes(&child, scopes, offsets);
+            }
+            scopes.pop();
+        }
+        _ => {
+            for child in node.children() {
+                walk_llap_scopes(&child, scopes, offsets);
+            }
+        }
+    }
+}
+
+fn llap_body(node: &SyntaxNode) -> Option<&SyntaxNode> {
+    let contextual = node.cast::<ast::Contextual>()?;
+    let ast::Expr::CodeBlock(block) = ungroup_expr(contextual.body()) else {
+        return None;
+    };
+    let mut exprs = block.body().exprs();
+    let skip = named_call(exprs.next()?, "h")?;
+    let body = ungroup_expr(exprs.next()?);
+    let ast::Expr::Equation(equation) = body else {
+        return None;
+    };
+    if exprs.next().is_some() || equation.block() {
+        return None;
+    }
+    let ast::Expr::Unary(negative) = ungroup_expr(single_positional_arg(skip.args())?) else {
+        return None;
+    };
+    if negative.op() != ast::UnOp::Neg {
+        return None;
+    }
+    let ast::Expr::FieldAccess(width) = ungroup_expr(negative.expr()) else {
+        return None;
+    };
+    if width.field().get() != "width" {
+        return None;
+    }
+    let measure = named_call(width.target(), "measure")?;
+    let measured = ungroup_expr(single_positional_arg(measure.args())?);
+    // Measuring one expression and displaying another is not an llap.
+    same_syntax(measured.to_untyped(), body.to_untyped()).then(|| body.to_untyped())
+}
+
+fn named_call<'a>(expr: ast::Expr<'a>, name: &str) -> Option<ast::FuncCall<'a>> {
+    let ast::Expr::FuncCall(call) = ungroup_expr(expr) else {
+        return None;
+    };
+    matches!(ungroup_expr(call.callee()), ast::Expr::Ident(ident) if ident.get() == name)
+        .then_some(call)
+}
+
+fn single_positional_arg(args: ast::Args<'_>) -> Option<ast::Expr<'_>> {
+    let mut items = args.items();
+    let ast::Arg::Pos(expr) = items.next()? else {
+        return None;
+    };
+    items.next().is_none().then_some(expr)
+}
+
+fn same_syntax(left: &SyntaxNode, right: &SyntaxNode) -> bool {
+    let mut pending = vec![(left, right)];
+    while let Some((left, right)) = pending.pop() {
+        if left.kind() != right.kind() {
+            return false;
+        }
+        if let (Some(left), Some(right)) =
+            (left.cast::<ast::Equation>(), right.cast::<ast::Equation>())
+        {
+            if left.block() != right.block() {
+                return false;
+            }
+        }
+        let mut lhs = left.children().filter(|node| !node.kind().is_trivia());
+        let mut rhs = right.children().filter(|node| !node.kind().is_trivia());
+        if left.children().next().is_none() && left.text() != right.text() {
+            return false;
+        }
+        loop {
+            match (lhs.next(), rhs.next()) {
+                (Some(left), Some(right)) => pending.push((left, right)),
+                (None, None) => break,
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
+fn box_math_arg(math: &SyntaxNode, options: &T2LOptions, env: &MathBuildEnv) -> MathIr {
+    MathIr::Delimited {
+        open: "$".to_string(),
+        content: Box::new(build_math_ir_with_env(math, options, env)),
+        close: "$".to_string(),
+    }
+}
+
+/// `#text[…]`, `#emph[…]` or `#strong[…]` in math as a LaTeX text command.
+fn build_text_markup_ir(
+    latex: &str,
+    args_node: &SyntaxNode,
+    options: &T2LOptions,
+    math_args: bool,
+    env: &MathBuildEnv,
+) -> MathIr {
+    MathIr::required_command(
+        latex,
+        vec![text_markup_arg(args_node, options, math_args, env)],
+    )
+}
+
+/// The body of a text call in math as a LaTeX text argument. It stays text,
+/// with each equation in it as `$…$`: `#text[if $x > 0$]` → `if $x > 0$`.
+/// Named arguments are dropped.
+fn text_markup_arg(
+    args_node: &SyntaxNode,
+    options: &T2LOptions,
+    math_args: bool,
+    env: &MathBuildEnv,
+) -> MathIr {
+    let mut parts = Vec::new();
+    for child in args_node.children() {
+        match child.kind() {
+            SyntaxKind::ContentBlock => {
+                if let Some(markup) = child_of_kind(child, SyntaxKind::Markup) {
+                    push_markup_as_text(markup, &mut parts, options, env);
+                }
+            }
+            SyntaxKind::Str => parts.push(MathIr::RawLiteral(escape_latex_math_text(&str_value(
+                child,
+            )))),
+            SyntaxKind::MathText => {
+                parts.push(MathIr::RawLiteral(escape_latex_math_text(child.text())))
+            }
+            _ if (math_args || child.kind() == SyntaxKind::Equation)
+                && !child.kind().is_trivia()
+                && is_content_node(child)
+                && child.kind() != SyntaxKind::Named =>
+            {
+                parts.push(box_math_arg(child, options, env));
+            }
+            _ if !child.kind().is_trivia()
+                && is_content_node(child)
+                && child.kind() != SyntaxKind::Named =>
+            {
+                let converted = child
+                    .cast::<ast::Expr>()
+                    .and_then(|expr| push_literal_text_expr(expr, &mut parts, options, env));
+                if converted.is_none() {
+                    parts.push(MathIr::PreservedSource {
+                        source: child.clone().into_text().to_string(),
+                        reason:
+                            "could not convert a text argument; Typst retained as comments below",
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    MathIr::Seq(parts)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LiteralTextKind {
+    Str,
+    Content,
+}
+
+fn sanitize_math_text_newlines(text: &str) -> String {
+    if !text.contains(['\n', '\r']) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    for line in normalized.split('\n') {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with(' ') && !line.starts_with(' ') {
+            out.push(' ');
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+fn escape_latex_math_text(text: &str) -> String {
+    escape_latex_text(&sanitize_math_text_newlines(text))
+}
+
+fn build_raw_math_text(node: &SyntaxNode) -> MathIr {
+    let raw_text = node
+        .cast::<ast::Raw>()
+        .map(|raw| {
+            raw.lines()
+                .map(|line| line.get().as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_else(|| SyntaxNode::clone(node).into_text().to_string());
+    MathIr::required_command(
+        r"\texttt",
+        vec![MathIr::RawLiteral(escape_latex_math_text(&raw_text))],
+    )
+}
+
+fn push_literal_text_expr(
+    expr: ast::Expr<'_>,
+    parts: &mut Vec<MathIr>,
+    options: &T2LOptions,
+    env: &MathBuildEnv,
+) -> Option<LiteralTextKind> {
+    match ungroup_expr(expr) {
+        ast::Expr::Str(string) => {
+            parts.push(MathIr::RawLiteral(escape_latex_math_text(
+                string.get().as_str(),
+            )));
+            Some(LiteralTextKind::Str)
+        }
+        ast::Expr::Raw(raw) => {
+            parts.push(build_raw_math_text(raw.to_untyped()));
+            Some(LiteralTextKind::Content)
+        }
+        ast::Expr::ContentBlock(block) => {
+            push_markup_as_text(block.body().to_untyped(), parts, options, env);
+            Some(LiteralTextKind::Content)
+        }
+        ast::Expr::Equation(equation) => {
+            parts.push(box_math_arg(equation.body().to_untyped(), options, env));
+            Some(LiteralTextKind::Content)
+        }
+        ast::Expr::Binary(binary) if binary.op() == ast::BinOp::Add => {
+            let mut lhs_parts = Vec::new();
+            let mut rhs_parts = Vec::new();
+            let lhs_kind = push_literal_text_expr(binary.lhs(), &mut lhs_parts, options, env)?;
+            let rhs_kind = push_literal_text_expr(binary.rhs(), &mut rhs_parts, options, env)?;
+            if lhs_kind == rhs_kind {
+                parts.extend(lhs_parts);
+                parts.extend(rhs_parts);
+                Some(lhs_kind)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn literal_text(expr: ast::Expr<'_>) -> Option<String> {
+    match ungroup_expr(expr) {
+        ast::Expr::Str(string) => Some(string.get().to_string()),
+        ast::Expr::Binary(binary) if binary.op() == ast::BinOp::Add => {
+            Some(literal_text(binary.lhs())? + &literal_text(binary.rhs())?)
+        }
+        _ => None,
+    }
+}
+
+fn is_visible_markup_child(node: &SyntaxNode) -> bool {
+    !matches!(
+        node.kind(),
+        SyntaxKind::Parbreak
+            | SyntaxKind::Space
+            | SyntaxKind::LineComment
+            | SyntaxKind::BlockComment
+    )
+}
+
+/// Markup as the pieces of a LaTeX text argument.
+fn push_markup_as_text(
+    markup: &SyntaxNode,
+    parts: &mut Vec<MathIr>,
+    options: &T2LOptions,
+    env: &MathBuildEnv,
+) {
+    let children: Vec<&SyntaxNode> = markup.children().collect();
+    for (idx, child) in children.iter().enumerate() {
+        match child.kind() {
+            SyntaxKind::Equation => {
+                if let Some(math) = child_of_kind(child, SyntaxKind::Math) {
+                    parts.push(box_math_arg(math, options, env));
+                }
+            }
+            SyntaxKind::Strong | SyntaxKind::Emph => {
+                let latex = if child.kind() == SyntaxKind::Strong {
+                    r"\textbf"
+                } else {
+                    r"\textit"
+                };
+                let mut inner = Vec::new();
+                if let Some(body) = child_of_kind(child, SyntaxKind::Markup) {
+                    push_markup_as_text(body, &mut inner, options, env);
+                }
+                parts.push(MathIr::required_command(latex, vec![MathIr::Seq(inner)]));
+            }
+            SyntaxKind::Parbreak => {
+                let has_before = children[..idx].iter().any(|c| is_visible_markup_child(c));
+                let has_after = children[idx + 1..]
+                    .iter()
+                    .any(|c| is_visible_markup_child(c));
+                if has_before && has_after {
+                    parts.push(MathIr::RawLiteral(" ".to_string()));
+                }
+            }
+            SyntaxKind::Linebreak => parts.push(MathIr::RawLiteral(" ".to_string())),
+            SyntaxKind::Space => {
+                if child.text().contains(['\n', '\r']) {
+                    parts.push(MathIr::RawLiteral(" ".to_string()));
+                } else {
+                    parts.push(MathIr::RawLiteral(child.text().to_string()));
+                }
+            }
+            SyntaxKind::LineComment | SyntaxKind::BlockComment => {}
+            SyntaxKind::Escape => {
+                if let Some(ch) = Escape::from_untyped(child).map(|escape| escape.get()) {
+                    parts.push(MathIr::RawLiteral(escape_latex_text(&ch.to_string())));
+                }
+            }
+            SyntaxKind::Raw => parts.push(build_raw_math_text(child)),
+            _ => parts.push(MathIr::RawLiteral(escape_latex_math_text(
+                &SyntaxNode::clone(child).into_text(),
+            ))),
+        }
+    }
+}
+
+/// A content block in math, such as the body of `#box[$x$]`: the equations
+/// in it become math and any other markup becomes `\text{…}`.
+fn build_content_block(node: &SyntaxNode, options: &T2LOptions, env: &MathBuildEnv) -> MathIr {
+    let Some(markup) = child_of_kind(node, SyntaxKind::Markup) else {
+        return MathIr::empty();
+    };
+    // Text runs keep their spaces inside `\text{…}`, where LaTeX sets them.
+    fn flush(text: &mut String, items: &mut Vec<MathIr>) {
+        if text.trim().is_empty() {
+            if !text.is_empty() {
+                items.push(MathIr::Spacing(MathSpacing::Soft));
+            }
+        } else {
+            items.push(MathIr::command(
+                "\\text",
+                vec![MathIr::RawLiteral(escape_latex_math_text(text))],
+            ));
+        }
+        text.clear();
+    }
+    let mut items = Vec::new();
+    let mut text = String::new();
+    for child in markup.children() {
+        match child.kind() {
+            SyntaxKind::Equation => {
+                flush(&mut text, &mut items);
+                if let Some(math) = child_of_kind(child, SyntaxKind::Math) {
+                    items.push(build_math_ir_with_env(math, options, env));
+                }
+            }
+            SyntaxKind::Parbreak | SyntaxKind::Linebreak => text.push(' '),
+            SyntaxKind::Space => {
+                if child.text().contains(['\n', '\r']) {
+                    text.push(' ');
+                } else {
+                    text.push_str(child.text().as_str());
+                }
+            }
+            SyntaxKind::LineComment | SyntaxKind::BlockComment => {}
+            SyntaxKind::Escape => {
+                if let Some(ch) = Escape::from_untyped(child).map(|escape| escape.get()) {
+                    text.push(ch);
+                }
+            }
+            SyntaxKind::Raw => {
+                flush(&mut text, &mut items);
+                items.push(build_raw_math_text(child));
+            }
+            _ => text.push_str(&SyntaxNode::clone(child).into_text()),
+        }
+    }
+    flush(&mut text, &mut items);
+    seq_or_single(items)
+}
+
+/// The positional arguments of a call, for a LaTeX command whose arguments are
+/// all positional. A named argument (`stroke: 0.5pt`) would otherwise become
+/// one more brace group.
+fn build_positional_args(
+    args_node: &SyntaxNode,
+    options: &T2LOptions,
+    env: &MathBuildEnv,
+) -> Vec<MathIr> {
+    args_node
+        .children()
+        .filter(|child| is_content_node(child) && child.kind() != SyntaxKind::Named)
+        .map(|child| build_math_ir_with_env(child, options, env))
+        .collect()
+}
+
+/// `box` in math. L → T writes `\boxed` and `\fbox` as a box with a stroke and
+/// `\rule{w}{h}` as an empty box with a fill. A box with neither draws only
+/// its body, and an empty one is a space of its width.
+fn build_box_ir(
+    args_node: &SyntaxNode,
+    options: &T2LOptions,
+    math_args: bool,
+    env: &MathBuildEnv,
+) -> MathIr {
+    let mut named = Vec::new();
+    let mut body_nodes = Vec::new();
+    for child in args_node.children() {
+        if child.kind() == SyntaxKind::Named {
+            if let Some((name, value)) = get_simple_text(child).split_once(':') {
+                named.push((name.trim().to_string(), value.trim().to_string()));
+            }
+        } else if is_content_node(child) {
+            body_nodes.push(child);
+        }
+    }
+    let get = |key: &str| {
+        named
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    };
+    // A positive baseline lowers the box; `\raisebox` and `\rule` raise it.
+    let raise = get("baseline")
+        .and_then(extract_length_value)
+        .map(|baseline| match baseline.strip_prefix('-') {
+            Some(up) => up.to_string(),
+            None => format!("-{baseline}"),
+        });
+    // A framed box of text, `#box(stroke: …)[6]`, is `\fbox{6}`; one that
+    // holds only an equation is `\boxed`.
+    let text_body = args_node.children().any(|child| {
+        child.kind() == SyntaxKind::ContentBlock
+            && child_of_kind(child, SyntaxKind::Markup).is_some_and(|markup| {
+                let parts: Vec<_> = markup
+                    .children()
+                    .filter(|c| !matches!(c.kind(), SyntaxKind::Space))
+                    .collect();
+                !matches!(parts.as_slice(), [only] if only.kind() == SyntaxKind::Equation)
+            })
+    });
+    if text_body && get("stroke").is_some_and(|stroke| stroke != "none") {
+        return build_text_markup_ir(r"\fbox", args_node, options, false, env);
+    }
+    // L → T writes `\raisebox{h}{…}` as a box with baseline `-h`.
+    if let (Some(raise), None, None) = (&raise, get("stroke"), get("width")) {
+        if args_node
+            .children()
+            .any(|c| c.kind() == SyntaxKind::ContentBlock)
+        {
+            let text = text_markup_arg(args_node, options, false, env);
+            return MathIr::required_command(
+                r"\raisebox",
+                vec![MathIr::RawLiteral(raise.clone()), text],
+            );
+        }
+    }
+    if !body_nodes.is_empty() {
+        let build_body = || {
+            seq_or_single(
+                body_nodes
+                    .iter()
+                    .map(|child| build_math_ir_with_env(child, options, env))
+                    .collect(),
+            )
+        };
+        return match (get("stroke"), get("width")) {
+            (Some(stroke), _) if stroke != "none" => MathIr::command(r"\boxed", vec![build_body()]),
+            // L → T writes `\rlap{x}` as a box of zero width.
+            (_, Some("0pt")) => MathIr::required_command(
+                r"\rlap",
+                vec![text_markup_arg(args_node, options, math_args, env)],
+            ),
+            _ => build_body(),
+        };
+    }
+    let width = get("width").and_then(extract_length_value);
+    let height = get("height").and_then(extract_length_value);
+    match (width, height, get("fill")) {
+        (Some(width), Some(height), Some(fill)) if fill != "none" => MathIr::Command(MathCommand {
+            latex: r"\rule".to_string(),
+            args: vec![MathIr::RawLiteral(width), MathIr::RawLiteral(height)],
+            optional_arg: raise.map(|raise| Box::new(MathIr::RawLiteral(raise))),
+            preserve_empty_args: false,
+        }),
+        (Some(width), _, _) => MathIr::command(r"\hspace", vec![MathIr::RawLiteral(width)]),
+        _ => MathIr::empty(),
+    }
+}
+
+/// Collect diagnostics before nested fragments are rendered.
+pub fn collect_math_warnings(ir: &MathIr, warnings: &mut Vec<String>) {
+    let mut visit = |item: &MathIr| collect_math_warnings(item, warnings);
+    match ir {
+        MathIr::Ident(name) => {
+            if name.len() > 1 && name.chars().all(|ch| ch.is_ascii_alphabetic() || ch == '.') {
+                warnings.push(format!(
+                    "unknown math symbol or variable `{name}` was copied as letters"
+                ));
+            }
+        }
+        MathIr::Seq(items) => items.iter().for_each(visit),
+        MathIr::Delimited { content, .. }
+        | MathIr::Limits(content)
+        | MathIr::Style { content, .. } => visit(content),
+        MathIr::Apply { callee, args } => {
+            visit(callee);
+            args.iter().for_each(visit);
+        }
+        MathIr::Attachment {
+            base,
+            top,
+            bottom,
+            top_left,
+            top_right,
+            bottom_left,
+            bottom_right,
+        } => {
+            visit(base);
+            [top, bottom, top_left, top_right, bottom_left, bottom_right]
+                .into_iter()
+                .flatten()
+                .for_each(|item| visit(item));
+        }
+        MathIr::Script { base, sub, sup, .. } => {
+            visit(base);
+            [sub, sup]
+                .into_iter()
+                .flatten()
+                .for_each(|item| visit(item));
+        }
+        MathIr::Command(command) => {
+            command.args.iter().for_each(&mut visit);
+            if let Some(arg) = &command.optional_arg {
+                visit(arg);
+            }
+        }
+        MathIr::Environment(MathEnvironment::Matrix { rows, .. }) => {
+            rows.iter().flatten().for_each(visit)
+        }
+        MathIr::Environment(MathEnvironment::Cases { rows }) => rows.iter().for_each(visit),
+        MathIr::PreservedSource { reason, .. } => warnings.push((*reason).to_string()),
+        MathIr::Linebreak
+        | MathIr::Symbol(_)
+        | MathIr::Number(_)
+        | MathIr::Operator(_)
+        | MathIr::Punctuation(_)
+        | MathIr::Spacing(_)
+        | MathIr::RawLiteral(_) => {}
+    }
+}
+
+fn ungroup_expr(mut expr: ast::Expr<'_>) -> ast::Expr<'_> {
+    while let ast::Expr::Parenthesized(group) = expr {
+        expr = group.expr();
+    }
+    expr
+}
+
+/// The first child of `node` of the given kind: the `Math` of an `Equation`, or
+/// the `Markup` of a `ContentBlock`.
+fn child_of_kind(node: &SyntaxNode, kind: SyntaxKind) -> Option<&SyntaxNode> {
+    node.children().find(|child| child.kind() == kind)
+}
+
+/// The value of a string literal, with its escapes (`\"`) resolved.
+fn str_value(node: &SyntaxNode) -> String {
+    typst_syntax::ast::Str::from_untyped(node)
+        .map(|string| string.get().to_string())
+        .unwrap_or_default()
 }
 
 fn seq_or_single(items: Vec<MathIr>) -> MathIr {
@@ -1130,96 +2349,6 @@ fn collect_field_access_text(node: &SyntaxNode) -> String {
     let mut parts = Vec::new();
     collect_recursive(node, &mut parts);
     parts.join(".")
-}
-
-fn is_cases_condition(ir: &MathIr) -> bool {
-    match ir {
-        MathIr::Operator(op) => op == "&",
-        MathIr::RawLiteral(text) => text.trim_start().starts_with('&'),
-        MathIr::Ident(text) => text.trim_start().starts_with('&'),
-        MathIr::Seq(items) => items
-            .iter()
-            .find(|item| !matches!(item, MathIr::Spacing(MathSpacing::Soft)))
-            .is_some_and(is_cases_condition),
-        _ => false,
-    }
-}
-
-fn strip_cases_condition_prefix(ir: MathIr) -> MathIr {
-    match ir {
-        MathIr::Seq(items) => {
-            let mut stripped = Vec::new();
-            let mut removed = false;
-            for item in items {
-                if !removed {
-                    match item {
-                        MathIr::Spacing(MathSpacing::Soft) => continue,
-                        MathIr::Operator(op) if op == "&" => {
-                            removed = true;
-                            continue;
-                        }
-                        MathIr::RawLiteral(text) if text.trim_start().starts_with('&') => {
-                            let rest = text
-                                .trim_start()
-                                .trim_start_matches('&')
-                                .trim_start()
-                                .to_string();
-                            if !rest.is_empty() {
-                                stripped.push(MathIr::RawLiteral(rest));
-                            }
-                            removed = true;
-                            continue;
-                        }
-                        MathIr::Ident(text) if text.trim_start().starts_with('&') => {
-                            let rest = text
-                                .trim_start()
-                                .trim_start_matches('&')
-                                .trim_start()
-                                .to_string();
-                            if !rest.is_empty() {
-                                stripped.push(MathIr::Ident(rest));
-                            }
-                            removed = true;
-                            continue;
-                        }
-                        other => {
-                            removed = true;
-                            stripped.push(other);
-                            continue;
-                        }
-                    }
-                }
-                stripped.push(item);
-            }
-            seq_or_single(stripped)
-        }
-        MathIr::Operator(op) if op == "&" => MathIr::empty(),
-        MathIr::RawLiteral(text) => {
-            let rest = text
-                .trim_start()
-                .trim_start_matches('&')
-                .trim_start()
-                .to_string();
-            if rest.is_empty() {
-                MathIr::empty()
-            } else {
-                MathIr::RawLiteral(rest)
-            }
-        }
-        MathIr::Ident(text) => {
-            let rest = text
-                .trim_start()
-                .trim_start_matches('&')
-                .trim_start()
-                .to_string();
-            if rest.is_empty() {
-                MathIr::empty()
-            } else {
-                MathIr::Ident(rest)
-            }
-        }
-        other => other,
-    }
 }
 
 fn convert_unicode_in_text(text: &str) -> String {

@@ -119,6 +119,8 @@ impl<'a> MacroExpander<'a> {
         }
 
         match node.kind() {
+            // Context-dependent expressions retain their local scope and source.
+            SyntaxKind::Contextual => get_node_full_text(node),
             // Skip let bindings and set/show rules in output
             SyntaxKind::LetBinding | SyntaxKind::SetRule | SyntaxKind::ShowRule => String::new(),
 
@@ -364,6 +366,13 @@ impl<'a> MacroExpander<'a> {
                     continue;
                 }
 
+                if next.kind() == SyntaxKind::Contextual {
+                    result.push('#');
+                    result.push_str(&get_node_full_text(next));
+                    i += 2;
+                    continue;
+                }
+
                 // Check for Hash followed by FuncCall - handle specially
                 if next.kind() == SyntaxKind::FuncCall {
                     let func_name = self.get_func_name(next);
@@ -467,6 +476,9 @@ pub fn extract_let_from_ast(input: &str) -> (TypstDefDb, String) {
 
 /// Recursively extract let bindings from AST
 fn extract_lets_recursive(node: &SyntaxNode, db: &mut TypstDefDb, patterns: &mut Vec<String>) {
+    if node.kind() == SyntaxKind::Contextual {
+        return;
+    }
     // In the Typst AST, LetBinding is a sibling of Hash, not a child
     // We need to look at consecutive siblings: Hash followed by LetBinding
     let children: Vec<_> = node.children().collect();

@@ -6539,17 +6539,17 @@ mod t2l_lr_delimiters {
     }
 
     #[test]
-    fn test_lr_no_delimiter_uses_default_parentheses() {
-        // When lr() has no recognizable delimiters, should use default ()
+    fn test_lr_no_delimiter_uses_null_delimiters() {
+        // Typst draws no delimiter when lr() has none at its edges
         let result = typst_to_latex("$lr(x + y)$");
         assert!(
-            result.contains("\\left("),
-            "Fallback should use \\left(, got: {}",
+            result.contains("\\left."),
+            "Fallback should use \\left., got: {}",
             result
         );
         assert!(
-            result.contains("\\right)"),
-            "Fallback should use \\right), got: {}",
+            result.contains("\\right."),
+            "Fallback should use \\right., got: {}",
             result
         );
     }
@@ -7684,28 +7684,14 @@ mod t2l_escaped_punctuation {
     }
 
     #[test]
-    fn test_cases_condition_rows_stay_paired() {
+    fn test_cases_rows_follow_arguments() {
+        // Typst sets each argument of cases() as its own row, even one that
+        // starts with `&`, so `& y` is a row with an empty first column.
         let result = typst_to_latex_with_options("$cases(x, & y, z, & w)$", &T2LOptions::default());
 
         assert!(
-            result.contains("x & y"),
-            "cases row should keep value/condition pairing, got: {}",
-            result
-        );
-        assert!(
-            result.contains("z & w"),
-            "cases second row should keep value/condition pairing, got: {}",
-            result
-        );
-        assert!(
-            !result.contains(
-                "x \\
- & y"
-            ) && !result.contains(
-                "z \\
- & w"
-            ),
-            "cases condition should not be emitted as a separate row, got: {}",
+            result.contains("x \\\\\n & y \\\\\n z \\\\\n & w"),
+            "each cases argument should be a row, got: {}",
             result
         );
     }
@@ -7776,7 +7762,7 @@ mod t2l_escaped_punctuation {
         );
 
         assert!(
-            result.contains(r#"\operatorname{argmax}_{\substack{x \\ y}}"#),
+            result.contains(r#"\operatorname*{argmax}_{\substack{x \\ y}}"#),
             "multiline limits() subscript should use substack, got: {}",
             result
         );
@@ -7935,7 +7921,7 @@ mod t2l_math_ir_tranche2 {
             typst_to_latex_with_options(r#"$limits(op("argmax"))_(x)$"#, &T2LOptions::default());
 
         assert!(
-            result.contains(r#"\operatorname{argmax}"#),
+            result.contains(r#"\operatorname*{argmax}"#),
             "limits() should preserve operator content, got: {}",
             result
         );
@@ -10015,5 +10001,199 @@ mod fuzz_regressions {
             r#"= A
 #label("s~1")"#
         );
+    }
+}
+
+/// Round-trip instabilities found by `tests/roundtrip_fixpoint.rs`.
+mod roundtrip_regressions {
+    use super::*;
+
+    fn t2l(math: &str) -> String {
+        typst_to_latex_with_options(math, &T2LOptions::math_only())
+            .trim()
+            .to_string()
+    }
+
+    /// A name that no table maps is still copied, but now with a warning.
+    #[test]
+    fn unknown_math_symbol_warns() {
+        let result = typst_to_latex_with_diagnostics("a foo.bar", &T2LOptions::math_only());
+        assert_eq!(result.output.trim(), "a foo.bar");
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.message.contains("`foo.bar`")),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    /// Typst's `bold` keeps letters italic, like `\boldsymbol`, not `\mathbf`.
+    #[test]
+    fn bold_is_boldsymbol() {
+        assert_eq!(t2l("bold(A)"), r"\boldsymbol{A}");
+    }
+
+    /// `upright(bold(x))` is L → T's `\mathbf{x}`. Converting each wrapper gave
+    /// `\mathrm{\mathbf{x}}`, one `upright` deeper every round. `bold(upright(x))`
+    /// is L → T's `\boldsymbol{\mathrm{x}}`, so it keeps both wrappers.
+    #[test]
+    fn upright_bold_is_mathbf() {
+        assert_eq!(t2l("upright(bold(a))"), r"\mathbf{a}");
+        assert_eq!(t2l("bold(upright(a))"), r"\boldsymbol{\mathrm{a}}");
+        assert_eq!(latex_to_typst(r"\mathbf{a}"), "upright(bold(a))");
+    }
+
+    /// `zws` stands for an empty group, so dropping it moved the next token.
+    #[test]
+    fn zws_is_an_empty_group() {
+        assert_eq!(t2l("zws_(a)"), "{}_a");
+        assert_eq!(
+            t2l("mat(delim: #none, a, zws)"),
+            "\\begin{matrix}\n a & {}\n\\end{matrix}"
+        );
+    }
+
+    /// `{ x }` inside `lr` is a pair of literal braces, not a LaTeX group.
+    #[test]
+    fn braces_inside_lr() {
+        assert_eq!(
+            t2l("lr(chevron.l { x } chevron.r)"),
+            r"\left\langle\left\{x\right\}\right\rangle"
+        );
+    }
+
+    /// `limits` was dropped. LaTeX allows `\limits` only after an operator, so
+    /// any other base takes `\overset` and `\underset`.
+    #[test]
+    fn limits_on_any_base() {
+        assert_eq!(t2l("limits(F)^(zws)"), r"\overset{{}}{F}");
+        assert_eq!(latex_to_typst(r"\overset{{}}{F}"), "limits(F)^(zws)");
+        assert_eq!(
+            t2l("limits(limits(F)^(a))_(b)"),
+            r"\underset{b}{\overset{a}{F}}"
+        );
+        assert_eq!(t2l(r#"limits(op("x"))_(a)"#), r"\operatorname*{x}_a");
+        assert_eq!(t2l("limits(sum)_(x)"), r"\sum\limits_x");
+    }
+
+    /// T → L wrote the subscript first, so `x^(2)_(3)` came back as `x_(3)^(2)`.
+    #[test]
+    fn script_order_is_kept() {
+        assert_eq!(t2l("x^(2)_(3)"), "x^2_3");
+        assert_eq!(t2l("x_(3)^(2)"), "x_3^2");
+        assert_eq!(latex_to_typst("x^2_3"), "x^(2)_(3)");
+    }
+
+    /// `mat(delim: "‖")` lost its delimiter.
+    #[test]
+    fn double_bar_matrix_is_vmatrix() {
+        assert!(t2l("mat(delim: \"‖\", a)").starts_with(r"\begin{Vmatrix}"));
+        assert!(t2l("mat(delim: bar.v.double, a)").starts_with(r"\begin{Vmatrix}"));
+    }
+
+    /// `op("a_b")` gave `\operatorname{a_b}`, a subscript.
+    #[test]
+    fn operator_name_escapes_specials() {
+        assert_eq!(t2l(r#"op("a_b")"#), r"\operatorname{a\_b}");
+    }
+
+    /// `nbsp`, `wj` and `shy` were dropped.
+    #[test]
+    fn invisible_characters_are_kept() {
+        assert_eq!(t2l("a nbsp b"), "a ~ b");
+        assert_eq!(t2l("a wj b"), r"a \nobreak b");
+        assert_eq!(t2l("a shy b"), r"a \- b");
+    }
+
+    /// A brace group split at the edge of `lr` left a LaTeX group open.
+    #[test]
+    fn lr_edge_brace_is_literal() {
+        assert_eq!(t2l("lr(a { b })"), r"\left.a\{b\right\}");
+        assert_eq!(t2l("lr({ b } a)"), r"\left\{b\} a\right.");
+    }
+}
+
+mod typst_spacing_regressions {
+    use super::*;
+
+    fn t2l(input: &str) -> String {
+        typst_to_latex(input)
+    }
+
+    /// `1em + 2pt` was concatenated as text: `#h([1em2pt])`.
+    #[test]
+    fn length_arithmetic_is_kept() {
+        assert_eq!(
+            t2l("$a #h(1em + 2pt) b$"),
+            r"$a \hspace{1em}\hspace{2pt} b$"
+        );
+    }
+
+    /// A call MiniEval cannot evaluate keeps its source; it was a bare `#`.
+    #[test]
+    fn unevaluated_call_keeps_its_source() {
+        assert!(t2l("$a #rect(width: 1cm) b$").contains("rect"));
+    }
+
+    /// `box` with named arguments: each named argument became one more brace
+    /// group (`\boxed{x}{stroke: 0.5pt}…`), and `#box[$a/b$]` was re-emitted
+    /// as `#box(a/b)`, a division in code.
+    #[test]
+    fn box_round_trips() {
+        assert_eq!(
+            t2l("$#box(stroke: 0.5pt, inset: 2pt)[$x$]$"),
+            r"$\boxed{x}$"
+        );
+        assert_eq!(
+            t2l("$#box(stroke: 0.5pt)[$a/b$] + c$"),
+            r"$\boxed{\frac{a}{b}} + c$"
+        );
+        assert_eq!(t2l("$x + #box[$y$]$"), "$x + y$");
+        assert_eq!(
+            t2l("$a #box(width: 5cm, height: 0.4pt, fill: black) b$"),
+            r"$a \rule{5cm}{0.4pt} b$"
+        );
+        assert_eq!(t2l("$a #box(width: 1cm) b$"), r"$a \hspace{1cm} b$");
+    }
+
+    /// A content block in math was copied with its brackets and dollars.
+    #[test]
+    fn content_block_in_math() {
+        assert_eq!(t2l("$x + #box[$y$ and $z$]$"), r"$x + y\text{ and } z$");
+    }
+}
+
+mod structural_regressions {
+    use super::*;
+
+    fn t2l(input: &str) -> String {
+        typst_to_latex(input)
+    }
+
+    #[test]
+    fn augmented_matrix_back_to_array() {
+        let latex = t2l(r#"$mat(delim: "(", augment: #(hline: 1, vline: 1), a, b ; c, d)$"#);
+        assert!(latex.contains(r"\left(\begin{array}{c|c}"), "{latex}");
+        assert!(latex.contains(r"\hline c & d"), "{latex}");
+        let latex = t2l("$mat(delim: #none, align: #right, 1, 2 ; 3, 4)$");
+        assert!(latex.contains(r"\begin{array}{rr}"), "{latex}");
+    }
+}
+
+mod delimiter_pairing_regressions {
+    use super::*;
+
+    /// The script strip read an escaped `\)` as closing the group.
+    #[test]
+    fn escaped_delimiter_in_script() {
+        assert_eq!(
+            typst_to_latex("$e^(- i theta^(0)\\))$"),
+            r"$e^{- i \theta^0)}$"
+        );
+        assert_eq!(typst_to_latex("$x^(\\))$"), r"$x^{)}$");
+        assert_eq!(typst_to_latex("$x^(\\(a\\))$"), r"$x^{{(a)}}$");
+        assert_eq!(typst_to_latex("$a \\} b$"), r"$a \} b$");
     }
 }

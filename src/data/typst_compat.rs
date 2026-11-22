@@ -162,9 +162,12 @@ lazy_static! {
         m.insert("underbrace", MathHandler::Command { latex_cmd: "\\underbrace" });
         m.insert("cancel", MathHandler::Command { latex_cmd: "\\cancel" });
         m.insert("hide", MathHandler::Command { latex_cmd: "\\phantom" });
-        m.insert("box", MathHandler::Command { latex_cmd: "\\boxed" });
+        m.insert("box", MathHandler::Special);
         m.insert("dot", MathHandler::Command { latex_cmd: "\\dot" });
         m.insert("ddot", MathHandler::Command { latex_cmd: "\\ddot" });
+        m.insert("dot.double", MathHandler::Command { latex_cmd: "\\ddot" });
+        m.insert("dot.triple", MathHandler::Command { latex_cmd: "\\dddot" });
+        m.insert("dot.quad", MathHandler::Command { latex_cmd: "\\ddddot" });
         m.insert("acute", MathHandler::Command { latex_cmd: "\\acute" });
         m.insert("grave", MathHandler::Command { latex_cmd: "\\grave" });
         m.insert("macron", MathHandler::Command { latex_cmd: "\\bar" });
@@ -195,9 +198,12 @@ lazy_static! {
         m.insert("inf", MathHandler::BigOperator { latex_cmd: "\\inf" });
 
         // Font styles
-        m.insert("text", MathHandler::Command { latex_cmd: "\\text" });
+        m.insert("text", MathHandler::Special);
+        m.insert("emph", MathHandler::Special);
+        m.insert("strong", MathHandler::Special);
         m.insert("upright", MathHandler::Command { latex_cmd: "\\mathrm" });
-        m.insert("bold", MathHandler::Command { latex_cmd: "\\mathbf" });
+        // Typst's `bold` keeps letters italic, as `\boldsymbol` does; `\mathbf` is upright.
+        m.insert("bold", MathHandler::Command { latex_cmd: "\\boldsymbol" });
         m.insert("bf", MathHandler::Command { latex_cmd: "\\mathbf" });
         m.insert("italic", MathHandler::Command { latex_cmd: "\\mathit" });
         m.insert("it", MathHandler::Command { latex_cmd: "\\mathit" });
@@ -236,6 +242,8 @@ lazy_static! {
         m.insert("op", MathHandler::Special);
         m.insert("display", MathHandler::Special);
         m.insert("inline", MathHandler::Special);
+        m.insert("script", MathHandler::Special);
+        m.insert("sscript", MathHandler::Special);
         m.insert("h", MathHandler::Special);
         m.insert("set", MathHandler::Special);
         m.insert("Set", MathHandler::Special);

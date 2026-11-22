@@ -2,10 +2,11 @@
 //!
 //! Helper functions for text escaping, content extraction, etc.
 
+use super::context::ConvertContext;
 use crate::data::colors::TYPST_TO_LATEX_COLORS;
 use lazy_static::lazy_static;
 use std::collections::HashMap;
-use typst_syntax::{SyntaxKind, SyntaxNode};
+use typst_syntax::{ast, SyntaxKind, SyntaxNode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpacingSpec {
@@ -202,17 +203,31 @@ lazy_static! {
 }
 
 /// Escape special LaTeX characters in text
+///
+/// One pass, so the braces of `\textbackslash{}` are not escaped in turn.
 pub fn escape_latex_text(text: &str) -> String {
-    text.replace('\\', "\\textbackslash{}")
-        .replace('&', "\\&")
-        .replace('%', "\\%")
-        .replace('$', "\\$")
-        .replace('#', "\\#")
-        .replace('_', "\\_")
-        .replace('{', "\\{")
-        .replace('}', "\\}")
-        .replace('~', "\\textasciitilde{}")
-        .replace('^', "\\textasciicircum{}")
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\textbackslash{}"),
+            '~' => escaped.push_str("\\textasciitilde{}"),
+            '^' => escaped.push_str("\\textasciicircum{}"),
+            '&' | '%' | '$' | '#' | '_' | '{' | '}' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+pub(crate) fn preserve_typst_source(source: &str, ctx: &mut ConvertContext) {
+    for line in source.split(['\n', '\r']) {
+        ctx.push_line(&format!("% {line}"));
+    }
+    // Keep following braces and math delimiters outside the last comment.
+    ctx.push_line("\\relax{}");
 }
 
 /// Check if a string is a known color name
@@ -358,41 +373,10 @@ pub fn count_heading_markers(node: &SyntaxNode) -> usize {
     1
 }
 
-/// Check if an equation is display math (block math)
-/// Display math in Typst starts with `$ ` (space after $) or `$\n` (newline after $)
+/// Check the equation's layout without interpreting newlines in code or text.
 pub fn is_display_math(node: &SyntaxNode) -> bool {
-    // Get full text recursively for newline detection
-    let text = get_simple_text(node);
-
-    // Check if there are newlines in the content (multi-line = display math)
-    if text.contains('\n') {
-        return true;
-    }
-
-    // Check the structure of the Equation node
-    // Display math: $ followed by Space, then Math, then Space (optional), then $
-    // Inline math: $ followed directly by Math content, then $
-    let children: Vec<_> = node.children().collect();
-
-    // Look for: [Dollar] [Space] [Math] ...
-    // or: [Dollar] [Math] (no space = inline)
-    if children.len() >= 2 && children[0].kind() == SyntaxKind::Dollar {
-        // Check if the second child is a Space (display math)
-        if children[1].kind() == SyntaxKind::Space {
-            return true;
-        }
-    }
-
-    // Fallback: check raw text
-    let raw_text = node.text().to_string();
-    if raw_text.len() >= 2 {
-        let after_dollar = raw_text.chars().nth(1);
-        if matches!(after_dollar, Some(' ') | Some('\n') | Some('\r')) {
-            return true;
-        }
-    }
-
-    false
+    node.cast::<ast::Equation>()
+        .is_some_and(|equation| equation.block())
 }
 
 /// Get raw text content and language from a raw node
@@ -1032,7 +1016,12 @@ impl<'a> FuncArgs<'a> {
 
     /// Get a named argument value node by key.
     pub fn named_node(&self, key: &str) -> Option<&'a SyntaxNode> {
-        self.named_arg(key).and_then(|arg| arg.value_node)
+        // A hash starts the code expression; it is not its value.
+        self.named_arg(key)?
+            .value_nodes
+            .iter()
+            .copied()
+            .find(|node| node.kind() != SyntaxKind::Hash && !node.kind().is_trivia())
     }
 
     /// Get all named argument value nodes by key.
@@ -1191,6 +1180,7 @@ mod tests {
         assert_eq!(escape_latex_text("50%"), "50\\%");
         assert_eq!(escape_latex_text("$100"), "\\$100");
         assert_eq!(escape_latex_text("a_b"), "a\\_b");
+        assert_eq!(escape_latex_text(r"a\b"), r"a\textbackslash{}b");
     }
 
     #[test]
