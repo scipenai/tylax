@@ -265,55 +265,158 @@ pub fn extract_curly_inner_content(node: &SyntaxNode) -> String {
     content
 }
 
-pub fn contains_top_level_separator(text: &str, separator: char) -> bool {
-    let mut paren_depth = 0usize;
-    let mut bracket_depth = 0usize;
-    let mut brace_depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    for ch in text.chars() {
-        if in_string {
-            match ch {
-                _ if escaped => escaped = false,
-                '\\' => escaped = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-
-        match ch {
-            '"' => in_string = true,
-            '(' => paren_depth += 1,
-            ')' if paren_depth > 0 => paren_depth -= 1,
-            '[' => bracket_depth += 1,
-            ']' if bracket_depth > 0 => bracket_depth -= 1,
-            '{' => brace_depth += 1,
-            '}' if brace_depth > 0 => brace_depth -= 1,
-            _ => {}
-        }
-
-        if ch == separator && paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
-            return true;
-        }
-    }
-
-    false
+/// Whether `s` ends with an odd number of consecutive `\` characters (a Typst line break).
+pub(crate) fn ends_with_unescaped_backslash(s: &str) -> bool {
+    s.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1
 }
 
-/// Protect content that contains a top-level comma by wrapping it in `{}`.
+/// Incremental Typst math bracket and string-literal state tracker.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct BracketScanner {
+    depth: usize,
+    in_string: bool,
+    after_line_break: bool,
+}
+
+impl BracketScanner {
+    /// Current nesting depth of `(`, `[`, and `{`.
+    pub(crate) fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Reset bracket and string state across paragraph or `$` math boundaries.
+    pub(crate) fn reset(&mut self) {
+        self.depth = 0;
+        self.in_string = false;
+        self.after_line_break = false;
+    }
+
+    /// Advance tracked state across `text` in $O(|text|)$ time.
+    pub(crate) fn advance_math_stream(&mut self, text: &str) {
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\n' {
+                if self.after_line_break {
+                    self.reset();
+                    continue;
+                }
+                self.after_line_break = true;
+            } else if self.after_line_break && !ch.is_whitespace() {
+                self.after_line_break = false;
+            }
+
+            match ch {
+                '\\' if matches!(chars.peek(), Some('\n' | '\r')) => {}
+                '\\' => {
+                    chars.next();
+                }
+                '"' => {
+                    self.in_string = !self.in_string;
+                }
+                '$' if !self.in_string => {
+                    self.reset();
+                }
+                _ if self.in_string => {}
+                '(' | '[' | '{' => self.depth += 1,
+                ')' | ']' | '}' => self.depth = self.depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Whether `text` contains more unquoted, unescaped `{` than `}`.
+pub(crate) fn has_more_open_braces(text: &str) -> bool {
+    let mut opens = 0usize;
+    let mut closes = 0usize;
+    scan_brackets(text, |_, ch, _| {
+        match ch {
+            '{' => opens += 1,
+            '}' => closes += 1,
+            _ => {}
+        }
+        true
+    });
+    opens > closes
+}
+
+/// Walk the brackets of Typst math `text`, skipping strings and escapes.
+///
+/// `visit` is given every other character, with its byte offset and the
+/// bracket depth before it, and stops the walk by returning `false`. Any of
+/// `)`, `]` and `}` closes any of `(`, `[` and `{`, as in Typst, and a closing
+/// bracket with nothing open leaves the depth at zero. Returns the depth at the
+/// end, or `None` if `visit` stopped the walk.
+pub fn scan_brackets(
+    text: &str,
+    mut visit: impl FnMut(usize, char, usize) -> bool,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut chars = text.char_indices();
+    while let Some((offset, ch)) = chars.next() {
+        match ch {
+            '\\' => {
+                chars.next();
+                continue;
+            }
+            '"' => {
+                in_string = !in_string;
+                continue;
+            }
+            _ if in_string => continue,
+            _ => {}
+        }
+        if !visit(offset, ch, depth) {
+            return None;
+        }
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    Some(depth)
+}
+
+/// Escape each top-level comma and semicolon in Typst math content as `\,`
+/// and `\;`.
 ///
 /// Typst function calls treat top-level commas as argument separators, so
-/// `sqrt(a, b)` is parsed as two arguments while `sqrt({a, b})` is a single
-/// content argument.
+/// `sqrt(a, b)` is parsed as two arguments while `sqrt(a\, b)` is one, and a
+/// semicolon makes the arguments an array. Wrapping the content in `{}` also
+/// groups it, but Typst math draws those braces. Commas inside strings, escapes
+/// and bracket pairs are left alone.
 pub fn protect_top_level_comma(content: &str) -> String {
     let trimmed = content.trim();
-    if contains_top_level_separator(trimmed, ',') {
-        format!("{{{}}}", trimmed)
-    } else {
-        trimmed.to_string()
-    }
+    let mut out = String::with_capacity(trimmed.len());
+    let mut copied = 0;
+    scan_brackets(trimmed, |offset, ch, depth| {
+        if depth == 0 && matches!(ch, ',' | ';') {
+            let prefix = &trimmed[copied..offset];
+            let kept = prefix.trim_end();
+            out.push_str(kept);
+            if kept.len() < prefix.len() && ends_with_unescaped_backslash(kept) {
+                // Keep the space separating a Typst forced line break `\` from `\,`.
+                out.push(' ');
+            }
+            out.push('\\');
+            out.push(ch);
+            copied = offset + 1;
+        }
+        true
+    });
+    out.push_str(&trimmed[copied..]);
+    out
+}
+
+/// Whether every bracket in Typst math `content` closes, and none of
+/// `separators` appears outside every bracket. Strings and escapes are skipped.
+pub fn brackets_balanced(content: &str, separators: &[char]) -> bool {
+    let balanced = scan_brackets(content, |_, ch, depth| {
+        depth > 0 || !(matches!(ch, ')' | ']' | '}') || separators.contains(&ch))
+    });
+    balanced == Some(0)
 }
 
 // =============================================================================

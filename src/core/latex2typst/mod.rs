@@ -5,6 +5,7 @@
 //! the AST to generate Typst code.
 
 pub mod context;
+mod delimiters;
 pub mod engine;
 mod environment;
 mod markup;

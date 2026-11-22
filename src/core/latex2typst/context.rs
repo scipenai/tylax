@@ -25,9 +25,10 @@ use super::engine::{ArgumentErrorType, EngineWarning};
 use super::{parse_latex, ConversionResult, ConversionWarning, WarningKind};
 
 use super::utils::{
-    clean_whitespace, convert_caption_text, extract_arg_content, extract_arg_content_with_braces,
-    extract_curly_inner_content, protect_top_level_comma, protect_zero_arg_commands,
-    restore_protected_commands, sanitize_label,
+    brackets_balanced, clean_whitespace, convert_caption_text, ends_with_unescaped_backslash,
+    extract_arg_content, extract_arg_content_with_braces, extract_curly_inner_content,
+    has_more_open_braces, protect_top_level_comma, protect_zero_arg_commands,
+    restore_protected_commands, sanitize_label, scan_brackets, BracketScanner,
 };
 
 /// Marker for a `\big`-style vertical delimiter, paired during math cleanup.
@@ -531,6 +532,9 @@ pub struct LatexConverter {
 
     /// Repairs the math cleanup applied to `_`/`^` attachments.
     pub(crate) attachment_repairs: AttachmentRepairs,
+    /// Start offsets of the delimiters that do not pair within their sequence
+    /// of siblings in the tree being visited (see [`unpaired_delimiters`]).
+    pub(crate) unpaired_delimiters: HashSet<u32>,
 }
 
 /// A `ClauseArgument` is a *required* argument iff it does not carry an
@@ -645,72 +649,79 @@ fn glue_lone_identifier_calls(input: &str) -> String {
 }
 
 /// Split `s` on top-level occurrences of `sep`, respecting nesting of `()`,
-/// `[]`, and `{}` so a separator inside e.g. `frac(a, b)` is left alone.
+/// `[]`, `{}`, strings, and escapes so a separator inside e.g. `frac(a, b)`
+/// or `"["` is left alone.
 fn split_top_level(s: &str, sep: char) -> Vec<String> {
     let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut cur = String::new();
-    for c in s.chars() {
-        match c {
-            '(' | '[' | '{' => {
-                depth += 1;
-                cur.push(c);
-            }
-            ')' | ']' | '}' => {
-                depth -= 1;
-                cur.push(c);
-            }
-            _ if c == sep && depth == 0 => {
-                parts.push(cur.trim().to_string());
-                cur.clear();
-            }
-            _ => cur.push(c),
+    let mut start = 0usize;
+    scan_brackets(s, |offset, ch, depth| {
+        if ch == sep && depth == 0 {
+            parts.push(s[start..offset].trim().to_string());
+            start = offset + ch.len_utf8();
         }
-    }
-    parts.push(cur.trim().to_string());
+        true
+    });
+    parts.push(s[start..].trim().to_string());
     parts
+}
+
+/// Split `s` at the first top-level comma outside brackets, strings, and escapes.
+fn split_first_top_level_comma(s: &str) -> Option<(&str, &str)> {
+    let mut split_at = None;
+    scan_brackets(s, |offset, ch, depth| {
+        if ch == ',' && depth == 0 {
+            split_at = Some(offset);
+            false
+        } else {
+            true
+        }
+    });
+    split_at.map(|idx| (s[..idx].trim(), s[idx + 1..].trim_start()))
 }
 
 /// Escape commas at the top level of a `cases` row. Inside a row that already
 /// has explicit `&` columns, a comma is literal content, not another column or
-/// row separator. Nested function/group commas remain untouched.
+/// row separator. Nested function/group/string commas remain untouched.
 fn escape_top_level_case_commas(s: &str) -> String {
-    let mut depth = 0i32;
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '(' | '[' | '{' => {
-                depth += 1;
-                out.push(c);
+    let mut copied = 0usize;
+    scan_brackets(s, |offset, ch, depth| {
+        if ch == ',' && depth == 0 {
+            let prefix = &s[copied..offset];
+            out.push_str(prefix);
+            if ends_with_unescaped_backslash(prefix) {
+                out.push(' ');
             }
-            ')' | ']' | '}' => {
-                depth -= 1;
-                out.push(c);
-            }
-            ',' if depth == 0 => out.push_str("\\,"),
-            _ => out.push(c),
+            out.push_str("\\,");
+            copied = offset + 1;
         }
-    }
+        true
+    });
+    out.push_str(&s[copied..]);
     out
 }
 
 /// If `s` is exactly a single call `name(...)` — the paren matching the opening
 /// one is the final character — return the inner argument text; else `None`.
 fn strip_call<'a>(s: &'a str, name: &str) -> Option<&'a str> {
-    let inner = s.strip_prefix(name)?.strip_prefix('(')?.strip_suffix(')')?;
-    // Reject `name(a)(b)`: the first '(' must stay open until the end.
-    let mut depth = 1i32;
-    for c in inner.chars() {
-        match c {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            _ => {}
-        }
-        if depth == 0 {
-            return None;
-        }
+    let tail = s.strip_prefix(name)?;
+    if !tail.starts_with('(') {
+        return None;
     }
-    Some(inner)
+    // Reject `name(a)(b)`: the first '(' must stay open until the final ')'.
+    let mut close = None;
+    scan_brackets(tail, |offset, ch, depth| {
+        let closes_call = depth == 1 && matches!(ch, ')' | ']' | '}');
+        if closes_call {
+            close = Some(offset);
+        }
+        !closes_call
+    });
+    if close == Some(tail.len() - 1) && tail.ends_with(')') {
+        Some(&tail[1..tail.len() - 1])
+    } else {
+        None
+    }
 }
 
 /// Render the operand between a matched pair of sized vertical delimiters.
@@ -750,35 +761,52 @@ fn resolve_sized_delimiter_pair(
         return input.replace(marker, fallback);
     }
 
+    let mut scanner = BracketScanner::default();
     let mut output = String::with_capacity(input.len());
     let mut remaining = input;
 
     while let Some(open) = remaining.find(marker) {
-        output.push_str(&remaining[..open]);
+        let prefix = &remaining[..open];
+        scanner.advance_math_stream(prefix);
+        output.push_str(prefix);
         let after_open = &remaining[open + marker.len()..];
 
         // A blank line cannot occur inside one math expression, so these are not a pair.
-        let close = after_open
-            .find(marker)
-            .filter(|&offset| !contains_paragraph_break(&after_open[..offset]));
+        let inside_call = scanner.depth() > 0;
+        let close = after_open.find(marker).filter(|&offset| {
+            !contains_paragraph_break(&after_open[..offset])
+                && is_one_operand(&after_open[..offset], inside_call)
+        });
 
         let Some(close) = close else {
+            scanner.advance_math_stream(fallback);
             output.push_str(fallback);
             // Keep scanning: a later pair in a following paragraph still resolves.
             remaining = after_open;
             continue;
         };
 
-        output.push_str(&render_sized_delimiter_operand(
-            &after_open[..close],
-            function,
-            matrix_delim,
-        ));
+        let rendered = render_sized_delimiter_operand(&after_open[..close], function, matrix_delim);
+        scanner.advance_math_stream(&rendered);
+        output.push_str(&rendered);
         remaining = &after_open[close + marker.len()..];
     }
 
     output.push_str(remaining);
     output
+}
+
+/// Whether two bars around `text` can enclose it: it is balanced, and does not
+/// cross a cell or row (`&`, `;`). Inside a call a bare `,` separates
+/// arguments too. Otherwise the bars belong to different cells or arguments,
+/// as in `\frac{a\big|_b}{c\big|_d}`.
+fn is_one_operand(text: &str, inside_call: bool) -> bool {
+    let separators: &[char] = if inside_call {
+        &['&', ';', ',']
+    } else {
+        &['&', ';']
+    };
+    brackets_balanced(text, separators)
 }
 
 /// Repairs the math cleanup applied to `_`/`^` attachments, so the converter
@@ -1108,28 +1136,69 @@ fn is_latex_comment_position(input: &str, position: usize) -> bool {
     false
 }
 
+/// Split converted math at its Typst line breaks: a `\` before a space or the
+/// end. Before anything else it is an escape, as in `\(`.
+fn split_line_breaks(body: &str) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            row.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some(next) if !next.is_whitespace() => {
+                row.push(c);
+                row.push(*next);
+                chars.next();
+            }
+            _ => rows.push(std::mem::take(&mut row).trim().to_string()),
+        }
+    }
+    rows.push(row.trim().to_string());
+    rows
+}
+
 /// String fallback that turns an already-converted `\left\{ ... \right.` body
 /// into `cases(...)` arguments, for shapes the AST path (see math.rs
 /// `classify_lr_cases_environment`) doesn't catch: `atop(a, b)`, a bare
-/// expression, or a leftover `mat(...)`. A row without an explicit `&` treats a
-/// top-level comma as a column hint; a row with `&` keeps commas as content.
+/// expression, or a leftover `mat(...)`. In a `mat` or `atop` row without an
+/// explicit `&`, a top-level comma separated columns, so it becomes `&`;
+/// anywhere else a comma is content, and is escaped.
 fn body_to_cases(body: &str) -> String {
     let body = body.trim();
 
-    let rows: Vec<String> = if let Some(inner) = strip_call(body, "mat") {
-        let inner = inner.trim();
-        // Drop a leading `delim: #none` keyword argument, if present.
-        let inner = inner
-            .strip_prefix("delim: #none,")
-            .or_else(|| inner.strip_prefix("delim: #none ,"))
-            .map(str::trim)
-            .unwrap_or(inner);
-        split_top_level(inner, ';')
+    let (rows, commas_are_columns) = if let Some(inner) = strip_call(body, "mat") {
+        // Drop known delimiterless leading named arguments (`delim: #none`, `align`,
+        // `augment`, `gap`) which `cases` does not take. If `mat` carries a visible
+        // intrinsic delimiter (e.g. `bmatrix`/`pmatrix`/`Bmatrix`), keep `mat(...)`
+        // whole inside `cases(...)` instead of stripping its delimiters or body.
+        let mut inner = inner.trim();
+        let mut has_visible_delim = false;
+        while let Some((raw_name, rest)) = inner.split_once(':') {
+            let name = raw_name.trim();
+            if !matches!(name, "delim" | "align" | "augment" | "gap") {
+                break;
+            }
+            let Some((value, tail)) = split_first_top_level_comma(rest.trim_start()) else {
+                break;
+            };
+            if name == "delim" && value != "#none" {
+                has_visible_delim = true;
+                break;
+            }
+            inner = tail;
+        }
+        if has_visible_delim {
+            return format!("cases({})", body);
+        }
+        (split_top_level(inner, ';'), true)
     } else if let Some(inner) = strip_call(body, "atop") {
-        split_top_level(inner, ',')
+        (split_top_level(inner, ','), true)
     } else {
         // aligned / plain body: rows are separated by Typst line breaks `\`.
-        body.split('\\').map(|r| r.trim().to_string()).collect()
+        (split_line_breaks(body), false)
     };
 
     let cells: Vec<String> = rows
@@ -1139,6 +1208,9 @@ fn body_to_cases(body: &str) -> String {
         .map(|r| {
             if r.contains('&') {
                 escape_top_level_case_commas(r)
+            } else if !commas_are_columns {
+                // `\left\{ a, b \right.`: a comma column dropped the comma.
+                protect_top_level_comma(r)
             } else {
                 split_top_level(r, ',')
                     .into_iter()
@@ -1161,7 +1233,7 @@ fn element_source_text(el: &SyntaxElement) -> String {
 }
 
 /// Whether `el` is a command with exactly `name` (without its leading slash).
-fn is_command_named(el: &SyntaxElement, name: &str) -> bool {
+pub(super) fn is_command_named(el: &SyntaxElement, name: &str) -> bool {
     let Some(node) = el.as_node() else {
         return false;
     };
@@ -1321,6 +1393,7 @@ impl LatexConverter {
             siunitx_arg_collector: None,
             pending_section: None,
             attachment_repairs: AttachmentRepairs::default(),
+            unpaired_delimiters: HashSet::new(),
         }
     }
 
@@ -1335,7 +1408,27 @@ impl LatexConverter {
             siunitx_arg_collector: None,
             pending_section: None,
             attachment_repairs: AttachmentRepairs::default(),
+            unpaired_delimiters: HashSet::new(),
         }
+    }
+
+    /// Visit a freshly parsed tree, with its unpaired delimiters marked.
+    pub(crate) fn visit_tree(&mut self, tree: &SyntaxNode, output: &mut String) {
+        let previous = std::mem::replace(
+            &mut self.unpaired_delimiters,
+            super::delimiters::unpaired_delimiters(tree),
+        );
+        self.visit_node(tree, output);
+        self.unpaired_delimiters = previous;
+    }
+
+    /// Whether `elem` is a delimiter in math that must be escaped because it
+    /// does not pair within its sequence.
+    pub(crate) fn is_unpaired_delimiter(&self, elem: &SyntaxElement) -> bool {
+        matches!(self.state.mode, ConversionMode::Math)
+            && self
+                .unpaired_delimiters
+                .contains(&u32::from(elem.text_range().start()))
     }
 
     /// Get a reference to the current options
@@ -1514,7 +1607,7 @@ impl LatexConverter {
         let mut output = String::with_capacity(estimated_size.max(1024));
 
         // Walk the tree
-        self.visit_node(&parsed.tree, &mut output);
+        self.visit_tree(&parsed.tree, &mut output);
 
         // Pair the sized-delimiter sentinels only; full `postprocess_math` would corrupt prose.
         let output = self.resolve_sized_delimiter_pairs(&output);
@@ -1555,7 +1648,7 @@ impl LatexConverter {
 
         // Convert with pre-allocated buffer
         let mut output = String::with_capacity(expanded_input.len().max(256));
-        self.visit_node(&parsed.tree, &mut output);
+        self.visit_tree(&parsed.tree, &mut output);
 
         // Resolve citation markers BEFORE math cleanup, so `#cite(...)` is post-processed.
         let output = self.resolve_citations(&output);
@@ -1729,7 +1822,7 @@ impl LatexConverter {
             if let Some(style) = style {
                 let mut styled_content = String::new();
                 self.visit_elements(&children[index + 1..], &mut styled_content);
-                let styled_content = styled_content.trim();
+                let styled_content = protect_top_level_comma(&styled_content);
                 if !styled_content.is_empty() {
                     let _ = write!(output, "{}({})", style, styled_content);
                 }
@@ -2116,15 +2209,24 @@ impl LatexConverter {
                 }
             }
             TokenApostrophe => output.push('\''),
-            TokenComma => {
-                if matches!(self.state.current_env(), EnvironmentContext::Cases) {
+            // A comma in a `cases` row or a matrix cell would separate cells, and
+            // a semicolon would end the row.
+            TokenComma | TokenSemicolon => {
+                if matches!(
+                    self.state.current_env(),
+                    EnvironmentContext::Cases | EnvironmentContext::Matrix
+                ) {
+                    let had_ws = output.ends_with(char::is_whitespace);
                     while output.ends_with(char::is_whitespace) {
                         output.pop();
                     }
-                    output.push_str("\\,");
-                } else {
-                    output.push(',');
+                    if had_ws && ends_with_unescaped_backslash(output) {
+                        // Preserve the space after a Typst forced line break `\`.
+                        output.push(' ');
+                    }
+                    output.push('\\');
                 }
+                output.push_str(&elem.to_string());
             }
             TokenSlash => {
                 if matches!(self.state.mode, ConversionMode::Math) || slash_is_between_mathy(elem) {
@@ -2149,20 +2251,18 @@ impl LatexConverter {
                 }
             }
             TokenAtSign => output.push('@'),
-            TokenSemicolon => output.push(';'),
-            TokenDitto => output.push('"'),
-            TokenLParen => output.push('('),
-            TokenRParen => output.push(')'),
-            // Brackets here are literal text: a real optional argument is consumed by the grammar.
-            TokenLBracket => {
-                if !self.state.in_preamble {
-                    output.push('[');
-                }
+            // A bare `"` would open a Typst string in math.
+            TokenDitto if matches!(self.state.mode, ConversionMode::Math) => {
+                output.push_str("\\\"")
             }
-            TokenRBracket => {
-                if !self.state.in_preamble {
-                    output.push(']');
+            TokenDitto => output.push('"'),
+            // Brackets here are literal text: a real optional argument is consumed by the grammar.
+            TokenLBracket | TokenRBracket if self.state.in_preamble => {}
+            TokenLParen | TokenRParen | TokenLBracket | TokenRBracket => {
+                if self.is_unpaired_delimiter(&elem) {
+                    output.push('\\');
                 }
+                output.push_str(&elem.to_string());
             }
 
             // Ignore these
@@ -2307,7 +2407,15 @@ impl LatexConverter {
     /// mode: accents and roots always take a math expression. On the document
     /// path `\overrightarrow{PC}` would otherwise emit `arrow(PC)`, a single
     /// Typst variable that fails to compile, not `arrow(P C)` (issue #35).
+    /// The result is a function argument, so a top-level comma is escaped:
+    /// `\frac{a , b}{c}` gave `frac(a, b, c)`.
     pub fn convert_required_math_arg(&mut self, cmd: &CmdItem, index: usize) -> Option<String> {
+        self.convert_required_math_content(cmd, index)
+            .map(|arg| protect_top_level_comma(&arg))
+    }
+
+    /// [`Self::convert_required_math_arg`] for content emitted outside a call.
+    pub fn convert_required_math_content(&mut self, cmd: &CmdItem, index: usize) -> Option<String> {
         let previous_mode = self.state.mode;
         self.state.mode = ConversionMode::Math;
         let converted = self.convert_required_arg(cmd, index);
@@ -2736,7 +2844,7 @@ impl LatexConverter {
             let inner_trim = inner.trim_start();
             // Null right delimiter <=> the leading '{' has no matching '}'.
             if let Some(body) = inner_trim.strip_prefix('{') {
-                if inner.matches('{').count() > inner.matches('}').count() {
+                if has_more_open_braces(inner) {
                     let cases = body_to_cases(body.trim());
                     result = format!(
                         "{}{}{}",
@@ -2806,9 +2914,18 @@ impl LatexConverter {
 
     /// Find matching closing parenthesis
     pub fn find_matching_paren(&self, s: &str) -> Option<usize> {
-        let mut depth = 1;
+        let mut depth = 1usize;
+        let mut escaped = false;
+        let mut in_string = false;
         for (i, c) in s.char_indices() {
+            if std::mem::take(&mut escaped) {
+                continue;
+            }
             match c {
+                // `\(` and `\)` are content, and strings like `delim: "("` are literal.
+                '\\' => escaped = true,
+                '"' => in_string = !in_string,
+                _ if in_string => {}
                 '(' => depth += 1,
                 ')' => {
                     depth -= 1;
@@ -3055,6 +3172,8 @@ impl LatexConverter {
                 }
             }
         }
+        // A bracket that does not pair within its matrix cell or `cases` row
+        // is escaped by `unpaired_delimiters`: `{ ( } & { ) }` gave `mat((, ))`.
         self.visit_elements(&content, output);
     }
 
