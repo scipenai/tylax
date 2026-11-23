@@ -437,6 +437,27 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
                         ctx.indent_level -= 1;
                         ctx.push_line("\\end{enumerate}");
                     }
+                    SyntaxKind::TermItem => {
+                        // Start a description environment for consecutive term items
+                        ctx.ensure_paragraph_break();
+                        ctx.push_line("\\begin{description}");
+                        ctx.indent_level += 1;
+
+                        // Collect all consecutive TermItems
+                        while i < children.len()
+                            && (children[i].kind() == SyntaxKind::TermItem
+                                || children[i].kind() == SyntaxKind::Space
+                                || children[i].kind() == SyntaxKind::Parbreak)
+                        {
+                            if children[i].kind() == SyntaxKind::TermItem {
+                                convert_term_item(children[i], ctx);
+                            }
+                            i += 1;
+                        }
+
+                        ctx.indent_level -= 1;
+                        ctx.push_line("\\end{description}");
+                    }
                     SyntaxKind::FuncCall => {
                         // Check if this is a figure/table that has a label following it
                         let func_name = child
@@ -676,6 +697,13 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
                 convert_enum_item(node, ctx);
                 ctx.push_line("\\end{enumerate}");
             }
+        }
+
+        SyntaxKind::TermItem => {
+            // Standalone term item - wrap it in an environment
+            ctx.push_line("\\begin{description}");
+            convert_term_item(node, ctx);
+            ctx.push_line("\\end{description}");
         }
 
         // Math (inline or display)
@@ -2326,6 +2354,35 @@ fn convert_list_item(node: &SyntaxNode, ctx: &mut ConvertContext) {
             convert_markup_node(child, ctx);
         }
     }
+    ctx.newline();
+}
+
+/// Convert a single term item (`/ Term: Details`) to `\item[Term] Details`
+fn convert_term_item(node: &SyntaxNode, ctx: &mut ConvertContext) {
+    let mut markups = node
+        .children()
+        .filter(|child| child.kind() == SyntaxKind::Markup);
+    let (Some(term), Some(description)) = (markups.next(), markups.next()) else {
+        return;
+    };
+
+    let mut inner = ConvertContext::new();
+    inner.options = ctx.options.clone();
+    convert_markup_node(term, &mut inner);
+    let term = inner.finish_into(ctx);
+    let term = term.trim();
+
+    ctx.push_indent();
+    if term.is_empty() {
+        // `/ : Details` has no term; a bare `\item` is its LaTeX form.
+        ctx.push("\\item ");
+    } else if term.contains(']') {
+        // Brace the label so a `]` in it does not end the optional argument.
+        ctx.push(&format!("\\item[{{{}}}] ", term));
+    } else {
+        ctx.push(&format!("\\item[{}] ", term));
+    }
+    convert_markup_node(description, ctx);
     ctx.newline();
 }
 

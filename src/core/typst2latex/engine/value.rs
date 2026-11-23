@@ -432,6 +432,7 @@ impl Selector {
                     ("math", ContentNode::Math { .. }) => true,
                     ("list", ContentNode::ListItem(_)) => true,
                     ("enum", ContentNode::EnumItem { .. }) => true,
+                    ("terms", ContentNode::TermItem { .. }) => true,
                     ("text", ContentNode::Text(_)) => true,
                     ("cite", ContentNode::Citation { .. }) => true,
                     ("ref", ContentNode::Reference { .. }) => true,
@@ -1257,6 +1258,11 @@ pub enum ContentNode {
         number: Option<i64>,
         content: Vec<ContentNode>,
     },
+    /// A term list item: `/ term: description`
+    TermItem {
+        term: Vec<ContentNode>,
+        description: Vec<ContentNode>,
+    },
     /// A unified element representation for introspection.
     ///
     /// All built-in elements (heading, strong, emph, list items, etc.) can be
@@ -1593,6 +1599,11 @@ impl ContentNode {
                 } else {
                     format!("+ {}\n", inner)
                 }
+            }
+            ContentNode::TermItem { term, description } => {
+                let term: String = term.iter().map(|c| c.to_typst()).collect();
+                let description: String = description.iter().map(|c| c.to_typst()).collect();
+                format!("/ {}: {}\n", term, description)
             }
             ContentNode::Element { name, fields } => {
                 let args: Vec<String> = fields

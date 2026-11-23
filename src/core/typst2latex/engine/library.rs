@@ -1519,6 +1519,7 @@ fn call_content_method(c: &[ContentNode], method: &str, args: Vec<Value>) -> Eva
                     ContentNode::Math { .. } => "math".to_string(),
                     ContentNode::ListItem(_) => "list.item".to_string(),
                     ContentNode::EnumItem { .. } => "enum.item".to_string(),
+                    ContentNode::TermItem { .. } => "terms.item".to_string(),
                     ContentNode::Text(_) => "text".to_string(),
                     ContentNode::Space => "space".to_string(),
                     ContentNode::Linebreak => "linebreak".to_string(),
@@ -1655,6 +1656,15 @@ fn content_node_to_fields(node: &ContentNode) -> IndexMap<String, Value> {
             fields.insert("body".to_string(), Value::Content(content.clone()));
             fields
         }
+        ContentNode::TermItem { term, description } => {
+            let mut fields = IndexMap::new();
+            fields.insert("term".to_string(), Value::Content(term.clone()));
+            fields.insert(
+                "description".to_string(),
+                Value::Content(description.clone()),
+            );
+            fields
+        }
         ContentNode::Text(t) => {
             let mut fields = IndexMap::new();
             fields.insert("text".to_string(), Value::Str(t.clone()));
@@ -1736,6 +1746,11 @@ fn content_node_to_text(node: &ContentNode) -> String {
             c.iter().map(content_node_to_text).collect()
         }
         ContentNode::EnumItem { content, .. } => content.iter().map(content_node_to_text).collect(),
+        ContentNode::TermItem { term, description } => term
+            .iter()
+            .chain(description)
+            .map(content_node_to_text)
+            .collect(),
         ContentNode::Heading { content, .. } => content.iter().map(content_node_to_text).collect(),
         ContentNode::Raw { text, .. } => text.clone(),
         ContentNode::Math { segments, .. } => render_math_segments_to_typst_source(segments),
