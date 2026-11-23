@@ -27,6 +27,7 @@ use std::fmt;
 use crate::core::latex2typst::lexical::{find_env_tag, inline_verb, literal_env};
 use crate::core::latex2typst::{parse_latex, SourceMap};
 use crate::data::maps::TEX_COMMAND_SPEC;
+use crate::data::symbols::convert_delimiter;
 use fxhash::FxHashMap;
 use lazy_static::lazy_static;
 
@@ -433,13 +434,12 @@ fn check_node(
 
             kind @ (SyntaxKind::ItemAttachComponent | SyntaxKind::ItemLR) => {
                 if let SyntaxElement::Node(n) = &child {
-                    let check = if kind == SyntaxKind::ItemLR {
-                        check_left_right
+                    if kind == SyntaxKind::ItemLR {
+                        check_left_right(n, line_offsets, source_map, result);
                     } else {
-                        check_attachment
-                    };
-                    check(n, line_offsets, result);
-                    check_node(n, source, line_offsets, declared, result);
+                        check_attachment(n, line_offsets, source_map, result);
+                    }
+                    check_node(n, source, line_offsets, source_map, declared, result);
                 }
             }
 
@@ -453,6 +453,152 @@ fn check_node(
     }
 }
 
+/// Count required term (`t`) tokens outside optional groups in a MiTeX glob pattern.
+fn glob_required_terms(pattern: &str) -> usize {
+    let mut depth = 0usize;
+    let mut required = 0usize;
+    for ch in pattern.chars() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            't' if depth == 0 => required += 1,
+            _ => {}
+        }
+    }
+    required
+}
+
+/// Minimum required argument count for a command, and whether leading optional
+/// `[...]` bracket groups should be excluded when counting bound arguments.
+fn required_term_count(cmd_name: &str, pattern: &ArgPattern) -> Option<(usize, bool, bool)> {
+    // Variadic physics commands declare their maximum arity in `TEX_COMMAND_SPEC`.
+    match cmd_name {
+        "dd" | "differential" => return None,
+        "dv"
+        | "dv*"
+        | "derivative"
+        | "fdv"
+        | "fdv*"
+        | "fderivative"
+        | "functionalderivative"
+        | "pdv"
+        | "pdv*"
+        | "partialderivative"
+        | "pderivative" => return Some((1, true, true)),
+        "braket" | "braket*" | "ev" | "ev*" | "expval" | "expval*" | "expectationvalue" => {
+            return Some((1, false, true));
+        }
+        _ => {}
+    }
+
+    match pattern {
+        ArgPattern::FixedLenTerm { len } if *len > 0 => Some((usize::from(*len), false, false)),
+        ArgPattern::RangeLenTerm { min, .. } if *min > 0 => Some((usize::from(*min), false, true)),
+        ArgPattern::Glob { pattern } => {
+            let required = glob_required_terms(&pattern.0);
+            (required > 0).then_some((required, true, false))
+        }
+        _ => None,
+    }
+}
+
+/// Whether all arguments of `cmd_name` are opaque identifiers/keys/URLs/paths
+/// (where underscores or caret-like text are literal rather than math scripts).
+fn is_opaque_arg_command(cmd_name: &str) -> bool {
+    matches!(
+        cmd_name,
+        "label"
+            | "ref"
+            | "eqref"
+            | "pageref"
+            | "cref"
+            | "Cref"
+            | "autoref"
+            | "cite"
+            | "citep"
+            | "citet"
+            | "autocite"
+            | "parencite"
+            | "textcite"
+            | "footcite"
+            | "bibitem"
+            | "url"
+            | "includegraphics"
+            | "input"
+            | "include"
+            | "bibliography"
+            | "bibliographystyle"
+            | "documentclass"
+            | "usepackage"
+            | "RequirePackage"
+            | "gls"
+            | "Gls"
+            | "acrshort"
+            | "acrlong"
+            | "acrfull"
+            | "ac"
+            | "Acs"
+            | "Acl"
+            | "Acf"
+    )
+}
+
+/// Extract `(command, delimiter)` tokens from a `ClauseLR` node.
+fn lr_clause_parts(clause: &SyntaxNode) -> Option<(String, Option<String>)> {
+    let mut tokens = clause
+        .children_with_tokens()
+        .filter_map(|elem| elem.into_token())
+        .filter(|tok| {
+            !matches!(
+                tok.kind(),
+                SyntaxKind::TokenWhiteSpace | SyntaxKind::TokenLineBreak | SyntaxKind::TokenComment
+            )
+        });
+    let cmd = tokens.next()?.text().to_string();
+    let delim = tokens.next().map(|tok| tok.text().to_string());
+    Some((cmd, delim))
+}
+
+/// Whether `delim` is a valid delimiter token after `\left` or `\right`.
+fn is_valid_lr_delimiter(delim: &str) -> bool {
+    convert_delimiter(delim).is_some()
+        || matches!(
+            delim,
+            "\\uparrow"
+                | "\\downarrow"
+                | "\\updownarrow"
+                | "\\Uparrow"
+                | "\\Downarrow"
+                | "\\Updownarrow"
+                | "\\lgroup"
+                | "\\rgroup"
+                | "\\lmoustache"
+                | "\\rmoustache"
+                | "\\arrowvert"
+                | "\\Arrowvert"
+                | "\\bracevert"
+                | "\\ulcorner"
+                | "\\urcorner"
+                | "\\llcorner"
+                | "\\lrcorner"
+                | "\\llbracket"
+                | "\\rrbracket"
+                | "\\lAngle"
+                | "\\rAngle"
+                | "\\llangle"
+                | "\\rrangle"
+                | "\\lBrack"
+                | "\\rBrack"
+                | "\\lParen"
+                | "\\rParen"
+                | "\\Vvert"
+                | "\\lbag"
+                | "\\rbag"
+                | "\\lang"
+                | "\\rang"
+        )
+}
+
 /// Check a command node for issues
 fn check_command(
     node: &SyntaxNode,
@@ -462,16 +608,41 @@ fn check_command(
     declared: &HashSet<String>,
     result: &mut CheckResult,
 ) {
-    // Extract command name
-    let text = node.text().to_string();
-    let cmd_name = text
-        .split(|c: char| !c.is_alphanumeric() && c != '\\')
-        .next()
-        .unwrap_or("")
-        .trim_start_matches('\\');
+    // Extract the command's own token rather than the whole node text: Left1/Infix
+    // commands such as `\limits` or `\over` wrap their left operand as the first
+    // child of `ItemCmd`.
+    let cmd_token = node
+        .children_with_tokens()
+        .filter_map(|elem| elem.into_token())
+        .find(|tok| tok.kind() == SyntaxKind::ClauseCommandName);
+    let cmd_name_owned = cmd_token
+        .as_ref()
+        .map(|tok| tok.text().trim_start_matches('\\').to_string())
+        .unwrap_or_else(|| {
+            let text = node.text().to_string();
+            text.split(|c: char| !c.is_alphanumeric() && c != '\\')
+                .next()
+                .unwrap_or("")
+                .trim_start_matches('\\')
+                .to_string()
+        });
+    let cmd_name = cmd_name_owned.as_str();
 
-    let offset: usize = node.text_range().start().into();
+    let offset: usize = cmd_token
+        .as_ref()
+        .map(|tok| tok.text_range().start().into())
+        .unwrap_or_else(|| node.text_range().start().into());
     let (line, col) = offset_to_location(source_map.original_offset(offset), line_offsets);
+
+    // Every paired `\right` lives inside `ItemLR`/`ClauseLR`, so an `ItemCmd`
+    // named `right` has no matching `\left`.
+    if cmd_name == "right" {
+        result.add(
+            Diagnostic::new(DiagnosticLevel::Error, "\\right has no matching \\left")
+                .with_location(line, col)
+                .with_source("\\right"),
+        );
+    }
 
     // Check if unsupported
     if UNSUPPORTED_COMMANDS.contains(cmd_name) {
@@ -503,29 +674,59 @@ fn check_command(
         }
     }
 
-    // A command that takes required arguments but finds none to bind, as in
-    // `\frac{a}` or `\text_a`, is a LaTeX error.
-    if let Some(ArgShape::Right {
-        pattern: ArgPattern::FixedLenTerm { len },
-    }) = MERGED_SPEC.get_cmd(cmd_name).map(|shape| &shape.args)
+    // Check for missing required arguments (`\frac{a}`, `\text_a`, `\sqrt`, `\sqrt[3]`, `\rule{1cm}`).
+    if let Some(ArgShape::Right { pattern }) =
+        MERGED_SPEC.get_cmd(cmd_name).map(|shape| &shape.args)
     {
-        let bound = node
-            .children()
-            .filter(|child| child.kind() == SyntaxKind::ClauseArgument)
-            .count();
-        if bound < usize::from(*len) {
-            result.add(
-                Diagnostic::new(
-                    DiagnosticLevel::Error,
-                    format!(
-                        "command '\\{}' takes {} argument(s) but has {}",
-                        cmd_name, len, bound
-                    ),
-                )
-                .with_location(line, col)
-                .with_source(format!("\\{}", cmd_name)),
-            );
+        if let Some((required, skip_optional, at_least)) = required_term_count(cmd_name, pattern) {
+            let bound = node
+                .children()
+                .filter(|child| child.kind() == SyntaxKind::ClauseArgument)
+                .filter(|child| {
+                    !skip_optional
+                        || child
+                            .first_child()
+                            .is_none_or(|inner| inner.kind() != SyntaxKind::ItemBracket)
+                })
+                .count();
+            if bound < required {
+                let requirement = if at_least { "at least " } else { "" };
+                result.add(
+                    Diagnostic::new(
+                        DiagnosticLevel::Error,
+                        format!(
+                            "command '\\{}' takes {}{} argument(s) but has {}",
+                            cmd_name, requirement, required, bound
+                        ),
+                    )
+                    .with_location(line, col)
+                    .with_source(format!("\\{}", cmd_name)),
+                );
+            }
         }
+    }
+
+    // Identifiers, keys, paths and URLs contain literal `_` characters rather than subscripts.
+    if is_opaque_arg_command(cmd_name) {
+        return;
+    }
+
+    if cmd_name == "href" || cmd_name == "hyperref" {
+        let mut skipped = false;
+        for child in node.children() {
+            if !skipped && child.kind() == SyntaxKind::ClauseArgument {
+                let is_target = cmd_name == "href"
+                    || child
+                        .first_child()
+                        .is_some_and(|inner| inner.kind() == SyntaxKind::ItemBracket);
+                if is_target {
+                    skipped = true;
+                    continue;
+                }
+            }
+            check_node(&child, source, line_offsets, source_map, declared, result);
+        }
+        return;
     }
 
     // Recurse into children
@@ -533,28 +734,45 @@ fn check_command(
 }
 
 /// Check a `_` or `^` script for a missing argument, and for a second script of
-/// the same kind on one base (`x_a_b`, `x_a^b_c`), which LaTeX rejects.
-fn check_attachment(node: &SyntaxNode, line_offsets: &[usize], result: &mut CheckResult) {
+/// the same kind on one base (`x_a_b`, `x^a^b`, `x_a^b_c`), which LaTeX rejects.
+fn check_attachment(
+    node: &SyntaxNode,
+    line_offsets: &[usize],
+    source_map: &SourceMap,
+    result: &mut CheckResult,
+) {
     let is_trivia = |kind: SyntaxKind| {
         matches!(
             kind,
             SyntaxKind::TokenWhiteSpace | SyntaxKind::TokenLineBreak
         )
     };
-    let marker_of = |node: &SyntaxNode| {
+    let marker_token_of = |node: &SyntaxNode| {
         node.children_with_tokens()
-            .map(|child| child.kind())
-            .find(|kind| matches!(kind, SyntaxKind::TokenUnderscore | SyntaxKind::TokenCaret))
+            .filter_map(|child| child.into_token())
+            .find(|tok| {
+                matches!(
+                    tok.kind(),
+                    SyntaxKind::TokenUnderscore | SyntaxKind::TokenCaret
+                )
+            })
     };
-    let Some(marker) = marker_of(node) else {
+    let Some(marker_tok) = marker_token_of(node) else {
         return;
     };
-    let offset: usize = node.text_range().start().into();
-    let (line, col) = offset_to_location(offset, line_offsets);
-    let name = if marker == SyntaxKind::TokenUnderscore {
-        "subscript"
+    let marker = marker_tok.kind();
+    let offset: usize = marker_tok.text_range().start().into();
+    let (line, col) = offset_to_location(source_map.original_offset(offset), line_offsets);
+    let (name, suggestion) = if marker == SyntaxKind::TokenUnderscore {
+        (
+            "subscript",
+            "Brace the first script's base and script: {x_a}_b",
+        )
     } else {
-        "superscript"
+        (
+            "superscript",
+            "Brace the first script's base and script: {x^a}^b",
+        )
     };
 
     let script_missing = node
@@ -579,11 +797,11 @@ fn check_attachment(node: &SyntaxNode, line_offsets: &[usize], result: &mut Chec
         else {
             break;
         };
-        if marker_of(&inner) == Some(marker) {
+        if marker_token_of(&inner).map(|tok| tok.kind()) == Some(marker) {
             result.add(
                 Diagnostic::new(DiagnosticLevel::Error, format!("double {name}"))
                     .with_location(line, col)
-                    .with_suggestion("Brace the first script's base and script: {x_a}_b"),
+                    .with_suggestion(suggestion),
             );
             break;
         }
@@ -591,15 +809,48 @@ fn check_attachment(node: &SyntaxNode, line_offsets: &[usize], result: &mut Chec
     }
 }
 
-/// Check that a `\left` has its `\right`.
-fn check_left_right(node: &SyntaxNode, line_offsets: &[usize], result: &mut CheckResult) {
-    let has_right = node
+/// Check that a `\left` has its `\right`, and that both carry valid delimiters.
+fn check_left_right(
+    node: &SyntaxNode,
+    line_offsets: &[usize],
+    source_map: &SourceMap,
+    result: &mut CheckResult,
+) {
+    let mut has_right = false;
+    for clause in node
         .children()
         .filter(|child| child.kind() == SyntaxKind::ClauseLR)
-        .any(|clause| clause.text().to_string().starts_with("\\right"));
+    {
+        let Some((cmd, delim)) = lr_clause_parts(&clause) else {
+            continue;
+        };
+        if cmd == "\\right" {
+            has_right = true;
+        }
+        let clause_offset: usize = clause.text_range().start().into();
+        let (line, col) =
+            offset_to_location(source_map.original_offset(clause_offset), line_offsets);
+        match delim {
+            None => result.add(
+                Diagnostic::new(
+                    DiagnosticLevel::Error,
+                    format!("{cmd} is missing a delimiter"),
+                )
+                .with_location(line, col),
+            ),
+            Some(d) if !is_valid_lr_delimiter(&d) => result.add(
+                Diagnostic::new(
+                    DiagnosticLevel::Error,
+                    format!("invalid delimiter '{}' after {}", d, cmd),
+                )
+                .with_location(line, col),
+            ),
+            _ => {}
+        }
+    }
     if !has_right {
         let offset: usize = node.text_range().start().into();
-        let (line, col) = offset_to_location(offset, line_offsets);
+        let (line, col) = offset_to_location(source_map.original_offset(offset), line_offsets);
         result.add(
             Diagnostic::new(DiagnosticLevel::Error, "\\left has no matching \\right")
                 .with_location(line, col),
@@ -919,6 +1170,19 @@ mod tests {
             r"x^a^b",
             r"x_a^b_c",
             r"\left( a",
+            r"a \right)",
+            r"\left( a \right) \right)",
+            r"\left( x \right$",
+            r"\left( x \right",
+            r"\left( x \right a",
+            r"\left( x \right{",
+            r"\left$ x \right)",
+            r"\left a x \right)",
+            r"\sqrt",
+            r"\sqrt[3]",
+            r"\rule{1cm}",
+            r"\section",
+            r"\section[short]",
         ] {
             assert!(check_latex(invalid).has_errors(), "{invalid}");
         }
@@ -928,11 +1192,96 @@ mod tests {
             r"{x_a}_b",
             r"\frac12",
             r"\left( a \right.",
+            r"\left\uparrow x \right\Downarrow",
+            r"\left\llbracket x \right\rrbracket",
+            r"\sqrt{x}",
             r"\sqrt[3]{x}",
+            r"\rule[0.5ex]{1cm}{1pt}",
+            r"\section[short]{title}",
+            r"\dd",
+            r"\dv{x}",
+            r"\pdv{f}{x}",
             r"\sum\limits_{i}^{n}",
             r"x'^2",
+            r"\frac{1}{2}\limits",
+            r"\overset{a}{b}\limits",
+            r"\frac{1}{2}\over x",
         ] {
-            assert!(!check_latex(valid).has_errors(), "{valid}");
+            let report = check_latex(valid);
+            assert!(
+                !report.has_errors(),
+                "{valid}: {:?}",
+                error_messages(&report)
+            );
+        }
+    }
+
+    #[test]
+    fn test_double_script_suggestions_match_kind() {
+        let sub = check_latex(r"x_a_b");
+        assert!(
+            sub.diagnostics.iter().any(|d| d.suggestion.as_deref()
+                == Some("Brace the first script's base and script: {x_a}_b")),
+            "{sub:?}"
+        );
+
+        let sup = check_latex(r"x^a^b");
+        assert!(
+            sup.diagnostics.iter().any(|d| d.suggestion.as_deref()
+                == Some("Brace the first script's base and script: {x^a}^b")),
+            "{sup:?}"
+        );
+    }
+
+    #[test]
+    fn test_opaque_document_command_arguments() {
+        for valid in [
+            r"\label{eq:my_first_eq}",
+            r"\ref{fig:plot_a_b}",
+            r"\cite{smith_2020_a}",
+            r"\url{https://example.com/a_b_c}",
+            r"\includegraphics{plot_a_b.png}",
+            r"\href{https://example.com/a_b_c}{ok}",
+            r"\hyperref[sec:a_b_c]{ok}",
+        ] {
+            let report = check_latex(valid);
+            assert!(
+                !report.has_errors(),
+                "{valid}: {:?}",
+                error_messages(&report)
+            );
+        }
+
+        for invalid in [
+            r"\href{https://example.com/a_b_c}{$x_a_b$}",
+            r"\hyperref[sec:a_b_c]{$x_a_b$}",
+        ] {
+            assert!(check_latex(invalid).has_errors(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn test_structural_errors_preserve_recovered_source_locations() {
+        for (source, needle) in [
+            (r"\hskip 2pt + \left( x", r"\left"),
+            (r"__\limits + x_a_b", "_b"),
+            (r"\sqrt(2) + a \right)", r"\right"),
+        ] {
+            let report = check_latex(source);
+            let expected_col = source.find(needle).unwrap() + 1;
+            let err = report
+                .diagnostics
+                .iter()
+                .find(|d| d.level == DiagnosticLevel::Error && d.column == Some(expected_col));
+            assert!(
+                err.is_some(),
+                "expected error at col {expected_col} for {source:?}, got: {:?}",
+                report
+                    .diagnostics
+                    .iter()
+                    .map(|d| (d.level, d.line, d.column, &d.message))
+                    .collect::<Vec<_>>()
+            );
         }
     }
 
