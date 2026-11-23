@@ -65,6 +65,8 @@ TYPST_PPI = PX_PER_EM * 72 / TYPST_PT
 
 def driver_path():
     target_dir = os.environ.get("CARGO_TARGET_DIR") or os.path.join(REPO, "target")
+    if not os.path.isabs(target_dir):
+        target_dir = os.path.join(REPO, target_dir)
     name = "l2t_batch.exe" if os.name == "nt" else "l2t_batch"
     return os.path.join(target_dir, "release", "examples", name)
 
@@ -142,12 +144,15 @@ def render_mathjax(out):
 
 
 def typst_source(formulas):
-    """One page per formula. A display equation that already starts with `$` or
-    `#math.equation` is emitted as-is; otherwise the closing `$` sits on its own
-    line, so a `//` in the output cannot comment it out. Returns the source and,
-    per formula, its 1-based line range."""
+    """One page per formula, with top-level equations rendered in display style.
+    Returns the source and, per formula, its 1-based line range."""
     lines = ["#set page(width: auto, height: auto, margin: 2pt, fill: white)",
-             f"#set text(size: {TYPST_PT}pt)"]
+             f"#set text(size: {TYPST_PT}pt)",
+             "#let tylax-display(eq) = if eq.func() == math.equation {",
+             "  math.equation(eq.body, block: true)",
+             "} else {",
+             "  eq",
+             "}"]
     ranges = []
     for n, typst in enumerate(formulas):
         if n:
@@ -155,7 +160,13 @@ def typst_source(formulas):
         stripped = typst.strip()
         body = stripped.split("\n")
         start = len(lines) + 1
-        if stripped.startswith("$") or stripped.startswith("#math.equation"):
+        if stripped.startswith("$"):
+            end = next_unescaped_dollar(stripped)
+            if end is None:
+                lines.extend(body)
+            else:
+                lines.extend(("#tylax-display[" + stripped[:end] + "]" + stripped[end:]).split("\n"))
+        elif stripped.startswith("#math.equation"):
             lines.extend(body)
         else:
             lines.append("$ " + body[0])
@@ -163,6 +174,19 @@ def typst_source(formulas):
             lines.append("$")
         ranges.append((start, len(lines)))
     return "\n".join(lines) + "\n", ranges
+
+
+def next_unescaped_dollar(text):
+    escaped = False
+    for index in range(1, len(text)):
+        char = text[index]
+        if char == "$" and not escaped:
+            return index + 1
+        if char == "\\" and not escaped:
+            escaped = True
+        else:
+            escaped = False
+    return None
 
 
 ERROR_LINE = re.compile(r"^(.*?):(\d+):\d+: error: (.*)$")
@@ -364,13 +388,14 @@ def quantiles(values, qs=(0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)):
 def cmd_run(args):
     required = ([] if args.no_build else ["cargo"]) + ["node", "typst", "rsvg-convert", "magick"]
     require_tools(required)
+    entries = load_entries(args.input)
+    if args.sample and args.sample < len(entries):
+        entries = random.Random(args.seed).sample(entries, args.sample)
+
     out = os.path.abspath(args.out)
     for sub in ("mathjax", "typst", "norm"):
         shutil.rmtree(os.path.join(out, sub), ignore_errors=True)
         os.makedirs(os.path.join(out, sub), exist_ok=True)
-    entries = load_entries(args.input)
-    if args.sample and args.sample < len(entries):
-        entries = random.Random(args.seed).sample(entries, args.sample)
     print(f"{len(entries)} formulas", file=sys.stderr)
 
     records = convert(entries, out, not args.no_build)
