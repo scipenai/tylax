@@ -4,15 +4,18 @@
 //! typst_to_latex(T1)` in math-only mode, then `T2 = latex_to_typst(L2)`. Once
 //! the first round has normalised the input, the second round must change
 //! nothing: `T1 == T2`. A difference means one direction loses or invents
-//! information, without a human reading either output. A second check runs
-//! `check_latex` on `L2`: an error there means T → L wrote invalid LaTeX, even
-//! when `T2` still matches.
+//! information, without a human reading either output. Second and third checks
+//! run `check_latex` on `L2` and `typst_syntax::parse_math` on `T1`/`T2`: an
+//! error there means T → L wrote invalid LaTeX or L → T wrote invalid Typst,
+//! even when the round trip repeats identically.
 //!
 //! The corpus test pins which entries of `corpus_merged.json` are unstable
-//! today and why, so it fails both on a new instability and when a known one
-//! is fixed. The generator test compares tokens, since Typst ignores
-//! differences in spacing.
+//! today along with their diagnosed `Cause`, so it fails on a new instability,
+//! when a known one is fixed, or when a known entry changes cause. The
+//! generator test verifies clean LaTeX/Typst parses and compares the parsed
+//! Typst math AST modulo `SyntaxKind::Space`.
 
+use std::collections::HashSet;
 use tylax::diagnostics::{check_latex, DiagnosticLevel};
 use tylax::{latex_to_typst, typst_to_latex_with_options, T2LOptions};
 use typst_syntax::{SyntaxKind, SyntaxNode};
@@ -33,8 +36,10 @@ fn round_trip(latex: &str) -> RoundTrip {
 }
 
 /// The error messages `check_latex` reports for `latex`: unbalanced braces or
-/// environments, and parser syntax errors. Its warnings and notes are about
-/// support for a command or package, not validity, so they are left out.
+/// environments, parser syntax errors, and structural math errors (bad scripts,
+/// unpaired `\left`/`\right`, invalid delimiters, missing command arguments).
+/// Its warnings and notes are about support for a command or package, not
+/// validity, so they are left out.
 fn latex_errors(latex: &str) -> Vec<String> {
     check_latex(latex)
         .diagnostics
@@ -44,47 +49,40 @@ fn latex_errors(latex: &str) -> Vec<String> {
         .collect()
 }
 
-/// The leaf tokens of `typst` parsed as math, without whitespace. Two outputs
-/// with the same tokens differ only in spacing, which Typst ignores between
-/// tokens (`f (x)= x` and `f (x) = x`), while `ab` and `a b` stay distinct.
-fn tokens(typst: &str) -> Vec<String> {
-    fn walk(node: &SyntaxNode, out: &mut Vec<String>) {
-        if node.children().len() == 0 && node.kind() != SyntaxKind::Space {
-            out.push(node.text().to_string());
-        }
-        for child in node.children() {
-            walk(child, out);
-        }
-    }
-    let mut out = Vec::new();
-    walk(&typst_syntax::parse_math(typst), &mut out);
-    out
+fn typst_errors(node: &SyntaxNode) -> Vec<String> {
+    node.errors()
+        .into_iter()
+        .map(|err| err.message.to_string())
+        .collect()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Outcome {
-    Stable,
-    /// `T1` and `T2` have the same tokens but different whitespace.
-    Spacing,
-    Unstable,
-    /// `check_latex` reports an error in `L2`, whatever `T2` is.
-    InvalidLatex,
+/// Structured Typst math syntax tree with `SyntaxKind::Space` trivia stripped.
+///
+/// Preserving node kinds keeps semantically distinct whitespace changes apart
+/// (e.g., `sqrt(x)` is a `FuncCall` while `sqrt (x)` is `MathIdent` followed by
+/// `MathDelimited`), while harmless inter-token spacing (`F (x)= x` vs
+/// `F (x) = x`) produces identical trees.
+#[derive(Debug, PartialEq, Eq)]
+enum MathTree {
+    Leaf(SyntaxKind, String),
+    Branch(SyntaxKind, Vec<MathTree>),
 }
 
-fn outcome(round: &RoundTrip) -> Outcome {
-    if !latex_errors(&round.l2).is_empty() {
-        Outcome::InvalidLatex
-    } else if round.t1 == round.t2 {
-        Outcome::Stable
-    } else if tokens(&round.t1) == tokens(&round.t2) {
-        Outcome::Spacing
+fn math_tree(node: &SyntaxNode) -> MathTree {
+    if node.children().len() == 0 {
+        MathTree::Leaf(node.kind(), node.text().to_string())
     } else {
-        Outcome::Unstable
+        let children = node
+            .children()
+            .filter(|child| child.kind() != SyntaxKind::Space)
+            .map(math_tree)
+            .collect();
+        MathTree::Branch(node.kind(), children)
     }
 }
 
 /// Why a corpus entry is not a fixpoint, with a minimal input for each.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cause {
     /// L → T copies source whitespace: `F(x)=x` → `F (x)= x`, then `F (x) = x`.
     Spacing,
@@ -95,6 +93,129 @@ enum Cause {
     /// group is gone on the way back: `\left\{ x { \right\} }` → `{ x \}`
     /// → `\{x \}` → `{x }`.
     CrossGroupDelimiter,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    Stable,
+    /// Not a strict string fixpoint, tagged with the verified cause (`None`
+    /// when the diff does not match any known cause).
+    Unstable(Option<Cause>),
+    /// `check_latex` reports an error in `L2`, whatever `T2` is.
+    InvalidLatex,
+    /// `typst_syntax::parse_math` reports syntax errors in `T1` or `T2`.
+    InvalidTypst,
+}
+
+fn parenthesize_stacked_scripts(tree: &MathTree) -> (MathTree, bool) {
+    match tree {
+        MathTree::Leaf(kind, text) => (MathTree::Leaf(*kind, text.clone()), false),
+        MathTree::Branch(kind, children) => {
+            let mut changed = false;
+            let mut transformed = Vec::with_capacity(children.len());
+            for child in children {
+                let (next, child_changed) = parenthesize_stacked_scripts(child);
+                changed |= child_changed;
+                transformed.push(next);
+            }
+            if *kind == SyntaxKind::MathAttach {
+                for i in 1..transformed.len() {
+                    let op = match &transformed[i - 1] {
+                        MathTree::Leaf(op @ (SyntaxKind::Underscore | SyntaxKind::Hat), _) => *op,
+                        _ => continue,
+                    };
+                    let has_same_nested_op = matches!(
+                        &transformed[i],
+                        MathTree::Branch(SyntaxKind::MathAttach, inner_children)
+                            if inner_children
+                                .iter()
+                                .any(|child| matches!(child, MathTree::Leaf(inner_op, _) if *inner_op == op))
+                    );
+                    if has_same_nested_op {
+                        let inner = std::mem::replace(
+                            &mut transformed[i],
+                            MathTree::Branch(SyntaxKind::Math, Vec::new()),
+                        );
+                        transformed[i] = MathTree::Branch(
+                            SyntaxKind::Math,
+                            vec![
+                                MathTree::Leaf(SyntaxKind::LeftParen, "(".to_string()),
+                                MathTree::Branch(SyntaxKind::Math, vec![inner]),
+                                MathTree::Leaf(SyntaxKind::RightParen, ")".to_string()),
+                            ],
+                        );
+                        changed = true;
+                    }
+                }
+            }
+            (MathTree::Branch(*kind, transformed), changed)
+        }
+    }
+}
+
+fn is_stacked_scripts_cause(t1_tree: &MathTree, t2_tree: &MathTree) -> bool {
+    let (normalized, changed) = parenthesize_stacked_scripts(t1_tree);
+    changed && normalized == *t2_tree
+}
+
+fn unescape_delimiters(node: &SyntaxNode, out: &mut String, changed: &mut bool) {
+    if node.children().len() == 0 {
+        let text = node.text().as_str();
+        if node.kind() == SyntaxKind::Escape
+            && matches!(text, r"\{" | r"\}" | r"\(" | r"\)" | r"\[" | r"\]")
+        {
+            out.push_str(&text[1..]);
+            *changed = true;
+        } else {
+            out.push_str(text);
+        }
+        return;
+    }
+    for child in node.children() {
+        unescape_delimiters(child, out, changed);
+    }
+}
+
+fn is_cross_group_delimiter_cause(latex: &str, p1: &SyntaxNode, t2_tree: &MathTree) -> bool {
+    let has_lr_error = latex_errors(latex)
+        .iter()
+        .any(|msg| msg.contains(r"\left") || msg.contains(r"\right"));
+    if !has_lr_error {
+        return false;
+    }
+    let mut unescaped = String::new();
+    let mut changed = false;
+    unescape_delimiters(p1, &mut unescaped, &mut changed);
+    if !changed {
+        return false;
+    }
+    let p1_unescaped = typst_syntax::parse_math(&unescaped);
+    !p1_unescaped.erroneous() && math_tree(&p1_unescaped) == *t2_tree
+}
+
+fn outcome(latex: &str, round: &RoundTrip) -> Outcome {
+    if !latex_errors(&round.l2).is_empty() {
+        return Outcome::InvalidLatex;
+    }
+    let p1 = typst_syntax::parse_math(&round.t1);
+    let p2 = typst_syntax::parse_math(&round.t2);
+    if p1.erroneous() || p2.erroneous() {
+        return Outcome::InvalidTypst;
+    }
+    if round.t1 == round.t2 {
+        return Outcome::Stable;
+    }
+    let t1_tree = math_tree(&p1);
+    let t2_tree = math_tree(&p2);
+    if t1_tree == t2_tree {
+        Outcome::Unstable(Some(Cause::Spacing))
+    } else if is_stacked_scripts_cause(&t1_tree, &t2_tree) {
+        Outcome::Unstable(Some(Cause::StackedScripts))
+    } else if is_cross_group_delimiter_cause(latex, &p1, &t2_tree) {
+        Outcome::Unstable(Some(Cause::CrossGroupDelimiter))
+    } else {
+        Outcome::Unstable(None)
+    }
 }
 
 /// Corpus entries that are not a fixpoint today, by cause. Where an entry has
@@ -115,17 +236,13 @@ const KNOWN_UNSTABLE: &[(Cause, &[&str])] = &[
     (Cause::CrossGroupDelimiter, &["m310"]),
 ];
 
-fn expected_outcome(id: &str) -> (Outcome, Option<Cause>) {
+fn expected_outcome(id: &str) -> Outcome {
     for (cause, ids) in KNOWN_UNSTABLE {
         if ids.contains(&id) {
-            let outcome = match cause {
-                Cause::Spacing => Outcome::Spacing,
-                _ => Outcome::Unstable,
-            };
-            return (outcome, Some(*cause));
+            return Outcome::Unstable(Some(*cause));
         }
     }
-    (Outcome::Stable, None)
+    Outcome::Stable
 }
 
 #[test]
@@ -136,11 +253,16 @@ fn merged_corpus_round_trip_is_a_fixpoint() {
         .iter()
         .map(|case| case["id"].as_str().unwrap())
         .collect();
+    let mut seen = HashSet::new();
     for (_, known) in KNOWN_UNSTABLE {
         for id in *known {
             assert!(
                 ids.contains(id),
                 "KNOWN_UNSTABLE lists `{id}`, which is not in the corpus"
+            );
+            assert!(
+                seen.insert(*id),
+                "KNOWN_UNSTABLE lists `{id}` more than once"
             );
         }
     }
@@ -150,11 +272,25 @@ fn merged_corpus_round_trip_is_a_fixpoint() {
         let id = case["id"].as_str().unwrap();
         let latex = case["latex"].as_str().unwrap();
         let round = round_trip(latex);
-        let got = outcome(&round);
-        let (expected, cause) = expected_outcome(id);
+        let got = outcome(latex, &round);
+        let expected = expected_outcome(id);
         if got != expected {
+            let mut extra = String::new();
+            match got {
+                Outcome::InvalidLatex => {
+                    extra.push_str(&format!("\n    L2 errors: {:?}", latex_errors(&round.l2)));
+                }
+                Outcome::InvalidTypst => {
+                    let t1_errs = typst_errors(&typst_syntax::parse_math(&round.t1));
+                    let t2_errs = typst_errors(&typst_syntax::parse_math(&round.t2));
+                    extra.push_str(&format!(
+                        "\n    T1 errors: {t1_errs:?}\n    T2 errors: {t2_errs:?}"
+                    ));
+                }
+                _ => {}
+            }
             mismatches.push(format!(
-                "  {id}: expected {expected:?} (cause {cause:?}), got {got:?}\n    L1: {latex}\n    T1: {}\n    L2: {}\n    T2: {}",
+                "  {id}: expected {expected:?}, got {got:?}{extra}\n    L1: {latex}\n    T1: {}\n    L2: {}\n    T2: {}",
                 round.t1, round.l2, round.t2
             ));
         }
@@ -469,15 +605,20 @@ fn latex_math(rng: &mut Rng, depth: u32) -> String {
     }
 }
 
-/// Ignores whitespace, so that spacing does not hide the other causes. Runs
-/// `ROUNDTRIP_CASES` cases, else 1,000. A failure prints its input; its fix
-/// adds a test to integration_tests.rs.
+/// Ignores `SyntaxKind::Space` trivia via `math_tree`, so that harmless
+/// spacing differences do not hide structural changes while parse-changing
+/// spacing (like `sqrt(x)` vs `sqrt (x)`) and Typst syntax errors still fail.
+/// Runs `ROUNDTRIP_CASES` cases, else 1,000. A failure prints its input; its
+/// fix adds a test to integration_tests.rs.
 #[test]
 fn generated_math_round_trip_is_a_fixpoint_up_to_spacing() {
-    let cases = std::env::var("ROUNDTRIP_CASES")
-        .ok()
-        .and_then(|cases| cases.parse().ok())
-        .unwrap_or(1000);
+    let cases: u64 = match std::env::var("ROUNDTRIP_CASES") {
+        Ok(val) => val
+            .parse()
+            .unwrap_or_else(|err| panic!("invalid ROUNDTRIP_CASES={val:?}: {err}")),
+        Err(std::env::VarError::NotPresent) => 1000,
+        Err(err) => panic!("failed to read ROUNDTRIP_CASES: {err}"),
+    };
     for seed in 0..cases {
         let latex = latex_math(&mut Rng(seed), 4);
         let round = round_trip(&latex);
@@ -488,13 +629,87 @@ fn generated_math_round_trip_is_a_fixpoint_up_to_spacing() {
             round.t1,
             round.l2
         );
+        let p1 = typst_syntax::parse_math(&round.t1);
+        let p2 = typst_syntax::parse_math(&round.t2);
         assert_eq!(
-            tokens(&round.t1),
-            tokens(&round.t2),
+            typst_errors(&p1),
+            Vec::<String>::new(),
+            "T1 Typst syntax error\nL1: {latex}\nT1: {}\nL2: {}\nT2: {}",
+            round.t1,
+            round.l2,
+            round.t2
+        );
+        assert_eq!(
+            typst_errors(&p2),
+            Vec::<String>::new(),
+            "T2 Typst syntax error\nL1: {latex}\nT1: {}\nL2: {}\nT2: {}",
+            round.t1,
+            round.l2,
+            round.t2
+        );
+        assert_eq!(
+            math_tree(&p1),
+            math_tree(&p2),
             "L1: {latex}\nT1: {}\nL2: {}\nT2: {}",
             round.t1,
             round.l2,
             round.t2
         );
     }
+}
+
+#[test]
+fn math_tree_distinguishes_func_call_from_spaced_delimiters() {
+    assert_ne!(
+        math_tree(&typst_syntax::parse_math("sqrt(x)")),
+        math_tree(&typst_syntax::parse_math("sqrt (x)"))
+    );
+    assert_ne!(
+        math_tree(&typst_syntax::parse_math("frac(a, b)")),
+        math_tree(&typst_syntax::parse_math("frac (a, b)"))
+    );
+    assert_eq!(
+        math_tree(&typst_syntax::parse_math("F (x)= x")),
+        math_tree(&typst_syntax::parse_math("F (x) = x"))
+    );
+}
+
+#[test]
+fn cause_classifiers_verify_specific_instability_only() {
+    let stacked_latex = r"{x^{a}}^{b}";
+    let stacked_round = round_trip(stacked_latex);
+    assert_eq!(
+        outcome(stacked_latex, &stacked_round),
+        Outcome::Unstable(Some(Cause::StackedScripts))
+    );
+    let stacked_unrelated = RoundTrip {
+        t2: "y^((a)^(b))".to_string(),
+        ..stacked_round
+    };
+    assert_eq!(
+        outcome(stacked_latex, &stacked_unrelated),
+        Outcome::Unstable(None)
+    );
+
+    let cross_latex = r"\left\{ x { \right\} }";
+    let cross_round = round_trip(cross_latex);
+    assert_eq!(
+        outcome(cross_latex, &cross_round),
+        Outcome::Unstable(Some(Cause::CrossGroupDelimiter))
+    );
+    let cross_unrelated = RoundTrip {
+        t2: "{y }".to_string(),
+        ..cross_round
+    };
+    assert_eq!(
+        outcome(cross_latex, &cross_unrelated),
+        Outcome::Unstable(None)
+    );
+
+    let invalid_typst = RoundTrip {
+        t1: "frac(a,".to_string(),
+        l2: "x".to_string(),
+        t2: "x".to_string(),
+    };
+    assert_eq!(outcome("x", &invalid_typst), Outcome::InvalidTypst);
 }
