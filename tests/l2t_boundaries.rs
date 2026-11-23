@@ -209,3 +209,71 @@ fn text_quotes_and_at_signs_stay_text() {
     assert!(out.contains("The \u{2018}best' option."), "{out}");
     assert!(out.contains("jane\\@example.com"), "{out}");
 }
+
+#[test]
+fn text_quotes_and_at_signs_respect_boundaries() {
+    let out = latex_document_to_typst(concat!(
+        r"\begin{document}",
+        r"Nested: ``He said `hi'{}'' ",
+        r"Styled: ``\emph{hello}'' ",
+        r"Triple: ```hi''' ",
+        r"Note\footnote{Email: jane@example.com}",
+        r"\end{document}",
+    ));
+    assert!(
+        out.contains("Nested: \u{201C}He said \u{2018}hi'\u{201D}"),
+        "{out}"
+    );
+    assert!(out.contains("Styled: \u{201C}_hello_\u{201D}"), "{out}");
+    assert!(out.contains("Triple: \u{201C}\u{2018}hi\u{201D}'"), "{out}");
+    assert!(
+        out.contains("#footnote[Email: jane\\@example.com]"),
+        "{out}"
+    );
+
+    // Braces, commands, and spaces break the `''` ligature rather than merging.
+    for broken in [
+        r"\begin{document}\text{a'}'\end{document}",
+        r"\begin{document}\mbox{a'}'\end{document}",
+        r"\begin{document}{a'}'\end{document}",
+        r"\begin{document}a'\relax'b\end{document}",
+        r"\begin{document}a' 'b\end{document}",
+    ] {
+        let converted = latex_document_to_typst(broken);
+        assert!(!converted.contains('\u{201D}'), "{broken} -> {converted}");
+    }
+
+    // Math mode keeps primes and `@` untouched.
+    let math_doc = latex_document_to_typst(r"\begin{document}$f''(x) + a@b$\end{document}");
+    assert!(math_doc.contains("f''(x)"), "{math_doc}");
+    assert!(!math_doc.contains('\u{201D}'), "{math_doc}");
+    assert!(!math_doc.contains("\\@"), "{math_doc}");
+
+    // Embedded math text blocks keep symmetric backslash escaping instead of smart quotes.
+    assert_eq!(
+        latex_to_typst(r"\text{``hello'' $x$}"),
+        r"#text[\`\`hello'' $x$]"
+    );
+    assert_eq!(latex_to_typst(r"\textbf{a `b $x$}"), r"#strong[a \`b $x$]");
+    assert_eq!(latex_to_typst(r"\textbf{a @b $x$}"), r"#strong[a \@b $x$]");
+
+    // Verbatim, inline code, and URLs keep literal content; preamble `@` does not leak.
+    let literal_doc = latex_document_to_typst(concat!(
+        r"\documentclass{article} stray@preamble",
+        "\n",
+        r"\begin{document}",
+        r"\verb|``a'' @b| \texttt{`a' @b} \url{https://example.com/@user}",
+        r"\end{document}",
+    ));
+    assert!(literal_doc.contains("``a'' @b"), "{literal_doc}");
+    assert!(literal_doc.contains("``a' @b`"), "{literal_doc}");
+    assert!(
+        literal_doc.contains("#link(\"https://example.com/@user\")"),
+        "{literal_doc}"
+    );
+    let body_start = literal_doc.find("```").unwrap();
+    assert!(!literal_doc[..body_start].contains('@'), "{literal_doc}");
+    assert!(!literal_doc.contains("stray"), "{literal_doc}");
+    assert!(!literal_doc.contains("preamble"), "{literal_doc}");
+    assert!(!literal_doc.contains("\\@"), "{literal_doc}");
+}
