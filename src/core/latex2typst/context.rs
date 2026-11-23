@@ -577,6 +577,10 @@ pub struct LatexConverter {
     pub(crate) unpaired_delimiters: HashSet<u32>,
     /// Byte range of trailing `_(...)`/`^(...)` scripts at the end of `output`.
     pub(crate) trailing_script: Option<TrailingScript>,
+    /// `(output_len, source_end)` of the immediately preceding text-mode
+    /// `TokenApostrophe`, so only genuinely adjacent `''` tokens merge into `”`
+    /// (and ligature breakers like `'{}'`, `\text{a'}'`, or `\mbox{a'}'` do not).
+    pub(crate) last_text_apostrophe: Option<(usize, u32)>,
     /// Whether we are converting an embedded math content block (`#text[...]`,
     /// `#strong[...]`, `#emph[...]`), where Typst markup syntax chars must be escaped.
     pub(crate) in_math_text_block: bool,
@@ -778,6 +782,28 @@ fn split_first_top_level_comma(s: &str) -> Option<(&str, &str)> {
         }
     });
     split_at.map(|idx| (s[..idx].trim(), s[idx + 1..].trim_start()))
+}
+
+/// Write a plain text-mode word. LaTeX's opening quote ligatures become quote
+/// characters, since a backtick opens raw text in Typst.
+fn push_text_word(text: &str, output: &mut String) {
+    if !text.contains('`') {
+        output.push_str(text);
+        return;
+    }
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '`' {
+            if chars.peek() == Some(&'`') {
+                chars.next();
+                output.push('\u{201C}');
+            } else {
+                output.push('\u{2018}');
+            }
+        } else {
+            output.push(ch);
+        }
+    }
 }
 
 /// Escape commas at the top level of a `cases` row. Inside a row that already
@@ -1518,6 +1544,7 @@ impl LatexConverter {
             attachment_repairs: AttachmentRepairs::default(),
             unpaired_delimiters: HashSet::new(),
             trailing_script: None,
+            last_text_apostrophe: None,
             in_math_text_block: false,
         }
     }
@@ -1535,6 +1562,7 @@ impl LatexConverter {
             attachment_repairs: AttachmentRepairs::default(),
             unpaired_delimiters: HashSet::new(),
             trailing_script: None,
+            last_text_apostrophe: None,
             in_math_text_block: false,
         }
     }
@@ -1546,9 +1574,11 @@ impl LatexConverter {
             super::delimiters::unpaired_delimiters(tree),
         );
         let previous_trailing_script = self.trailing_script.take();
+        let previous_text_apostrophe = self.last_text_apostrophe.take();
         self.visit_node(tree, output);
         self.unpaired_delimiters = previous;
         self.trailing_script = previous_trailing_script;
+        self.last_text_apostrophe = previous_text_apostrophe;
     }
 
     /// Whether `elem` is a delimiter in math that must be escaped because it
@@ -1705,6 +1735,7 @@ impl LatexConverter {
         self.pending_section = None;
         self.attachment_repairs.take();
         self.trailing_script = None;
+        self.last_text_apostrophe = None;
         self.in_math_text_block = false;
     }
 
@@ -1964,8 +1995,10 @@ impl LatexConverter {
                     .map_or(children.len(), |offset| index + 1 + offset);
                 let mut styled_content = String::new();
                 self.trailing_script = None;
+                self.last_text_apostrophe = None;
                 self.visit_elements(&children[index + 1..end], &mut styled_content);
                 self.trailing_script = None;
+                self.last_text_apostrophe = None;
                 // The content is a call argument, so a top-level `,` or `;`
                 // must not split it: `\displaystyle m=0,u\ne0;`.
                 let styled_content = protect_top_level_comma(styled_content.trim());
@@ -2082,8 +2115,10 @@ impl LatexConverter {
                         .collect();
                     let mut title = String::new();
                     self.trailing_script = None;
+                    self.last_text_apostrophe = None;
                     self.visit_elements(&body, &mut title);
                     self.trailing_script = None;
+                    self.last_text_apostrophe = None;
                     super::markup::emit_starred_section(pending, title.trim(), output);
                     return true;
                 }
@@ -2250,8 +2285,10 @@ impl LatexConverter {
                     if let SyntaxElement::Node(n) = elem {
                         let mut dummy = String::new();
                         self.trailing_script = None;
+                        self.last_text_apostrophe = None;
                         self.visit_node(&n, &mut dummy);
                         self.trailing_script = None;
+                        self.last_text_apostrophe = None;
                     }
                 } else if let SyntaxElement::Node(n) = elem {
                     self.visit_node(&n, output);
@@ -2318,7 +2355,7 @@ impl LatexConverter {
                     } else if self.in_math_text_block {
                         push_escaped_typst_text(text, output);
                     } else {
-                        output.push_str(text);
+                        push_text_word(text, output);
                     }
                 }
             }
@@ -2387,6 +2424,7 @@ impl LatexConverter {
                 // Typst attaches primes only to the token right before them:
                 // `x '^(2)` is `x` followed by primes on an empty base.
                 if matches!(self.state.mode, ConversionMode::Math) {
+                    self.last_text_apostrophe = None;
                     let base = output.trim_end();
                     // Keep the space of a `\ ` line break, or `\'` becomes an escape.
                     if !ends_with_unescaped_backslash(base) {
@@ -2410,9 +2448,26 @@ impl LatexConverter {
                             }
                         }
                     }
+                    self.trailing_script = None;
+                    output.push('\'');
+                } else if !self.in_math_text_block {
+                    self.trailing_script = None;
+                    let range = elem.text_range();
+                    if self.last_text_apostrophe == Some((output.len(), u32::from(range.start())))
+                        && output.ends_with('\'')
+                    {
+                        output.pop();
+                        output.push('\u{201D}');
+                        self.last_text_apostrophe = None;
+                    } else {
+                        output.push('\'');
+                        self.last_text_apostrophe = Some((output.len(), u32::from(range.end())));
+                    }
+                } else {
+                    self.trailing_script = None;
+                    self.last_text_apostrophe = None;
+                    output.push('\'');
                 }
-                self.trailing_script = None;
-                output.push('\'');
             }
             // A comma in a `cases` row or a matrix cell would separate cells, and
             // a semicolon would end the row.
@@ -2460,10 +2515,14 @@ impl LatexConverter {
                 }
             }
             TokenAtSign => {
-                if self.in_math_text_block && matches!(self.state.mode, ConversionMode::Text) {
-                    output.push_str("\\@");
-                } else {
+                if self.state.in_preamble {
+                    return;
+                }
+                // `@` starts a reference in Typst markup, as in jane@example.com
+                if matches!(self.state.mode, ConversionMode::Math) {
                     output.push('@');
+                } else {
+                    output.push_str("\\@");
                 }
             }
             // A bare `"` would open a Typst string in math.
@@ -2597,8 +2656,10 @@ impl LatexConverter {
                     })
                     .collect();
                 self.trailing_script = None;
+                self.last_text_apostrophe = None;
                 self.visit_elements(&content, &mut output);
                 self.trailing_script = None;
+                self.last_text_apostrophe = None;
                 return Some(trim_converted_arg(&output));
             }
             optional_count += 1;
@@ -2631,8 +2692,10 @@ impl LatexConverter {
                         })
                         .collect();
                     self.trailing_script = None;
+                    self.last_text_apostrophe = None;
                     self.visit_elements(&content, &mut output);
                     self.trailing_script = None;
+                    self.last_text_apostrophe = None;
                     return Some(trim_converted_arg(&output));
                 }
                 required_count += 1;
