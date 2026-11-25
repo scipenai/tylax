@@ -211,6 +211,25 @@ fn text_quotes_and_at_signs_stay_text() {
 }
 
 #[test]
+fn at_signs_in_title_caption_and_link_text_stay_text() {
+    let out = latex_document_to_typst(concat!(
+        r"\title{P}\author{Jane Doe \\ jane@example.com}",
+        r"\begin{document}\maketitle ",
+        r"\begin{figure}\caption{Contact me@x.org}\end{figure}",
+        r"\href{mailto:a@b.com}{a@b.com}",
+        r"\end{document}",
+    ));
+    assert!(out.contains("jane\\@example.com]"), "{out}");
+    // `#set document` takes a string, where `\@` is not a valid escape.
+    assert!(out.contains("jane@example.com\","), "{out}");
+    assert!(out.contains("Contact me\\@x.org"), "{out}");
+    assert!(
+        out.contains("#link(\"mailto:a@b.com\")[a\\@b.com]"),
+        "{out}"
+    );
+}
+
+#[test]
 fn text_quotes_and_at_signs_respect_boundaries() {
     let out = latex_document_to_typst(concat!(
         r"\begin{document}",

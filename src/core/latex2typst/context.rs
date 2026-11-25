@@ -532,6 +532,12 @@ impl ConversionState {
     }
 }
 
+/// Text of a `#set document(...)` string: the `\@` markup escape is not a valid
+/// string escape.
+fn metadata_string(text: &str) -> String {
+    text.replace("\\@", "@").replace('"', "\\\"")
+}
+
 /// Escape Typst markup syntax characters in literal text emitted inside an
 /// embedded math content block (`#text[...]`, `#strong[...]`, `#emph[...]`).
 pub(crate) fn push_escaped_typst_text(text: &str, output: &mut String) {
@@ -2727,11 +2733,7 @@ impl LatexConverter {
     /// Get a required argument from a command and convert it to Typst
     pub fn get_converted_required_arg(&mut self, cmd: &CmdItem, index: usize) -> Option<String> {
         let raw_text = self.get_required_arg_with_braces(cmd, index)?;
-        if raw_text.contains('$') || raw_text.contains('\\') {
-            Some(convert_caption_text(&raw_text))
-        } else {
-            Some(raw_text)
-        }
+        Some(convert_caption_text(&raw_text))
     }
 
     /// Get optional argument from an environment
@@ -3372,10 +3374,10 @@ impl LatexConverter {
         if self.state.title.is_some() || self.state.author.is_some() {
             doc.push_str("#set document(\n");
             if let Some(ref title) = self.state.title {
-                let _ = writeln!(doc, "  title: \"{}\",", title.replace('"', "\\\""));
+                let _ = writeln!(doc, "  title: \"{}\",", metadata_string(title));
             }
             if let Some(ref author) = self.state.author {
-                let _ = writeln!(doc, "  author: \"{}\",", author.replace('"', "\\\""));
+                let _ = writeln!(doc, "  author: \"{}\",", metadata_string(author));
             }
             doc.push_str(")\n\n");
         }

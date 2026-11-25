@@ -581,6 +581,9 @@ pub fn convert_caption_text(text: &str) -> String {
                     // Otherwise, just skip the unknown command
                 }
             }
+        } else if ch == '@' {
+            // `@` starts a reference in Typst markup, as in jane@example.com
+            result.push_str("\\@");
         } else {
             result.push(ch);
         }

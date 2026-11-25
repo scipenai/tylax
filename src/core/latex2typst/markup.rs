@@ -1104,7 +1104,10 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "href" => {
             let url = conv.get_required_arg(&cmd, 0).unwrap_or_default();
-            let text = conv.get_required_arg(&cmd, 1).unwrap_or_else(|| url.clone());
+            let previous_mode = conv.state.mode;
+            conv.state.mode = ConversionMode::Text;
+            let text = conv.convert_required_arg(&cmd, 1).unwrap_or_else(|| url.clone());
+            conv.state.mode = previous_mode;
             let _ = write!(output, "#link(\"{}\")[{}]", url, text);
         }
         "hyperref" => {
