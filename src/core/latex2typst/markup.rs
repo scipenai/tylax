@@ -2483,32 +2483,32 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         // Accents in text mode
         "`" => {
             // grave accent
-            let content = conv.get_required_arg(&cmd, 0).unwrap_or_default();
+            let content = text_accent_base(conv, &cmd);
             output.push_str(&apply_text_accent(&content, '`'));
         }
         "'" => {
             // acute accent
-            let content = conv.get_required_arg(&cmd, 0).unwrap_or_default();
+            let content = text_accent_base(conv, &cmd);
             output.push_str(&apply_text_accent(&content, '\''));
         }
         "^" => {
             // circumflex
-            let content = conv.get_required_arg(&cmd, 0).unwrap_or_default();
+            let content = text_accent_base(conv, &cmd);
             output.push_str(&apply_text_accent(&content, '^'));
         }
         "~" => {
             // tilde
-            let content = conv.get_required_arg(&cmd, 0).unwrap_or_default();
+            let content = text_accent_base(conv, &cmd);
             output.push_str(&apply_text_accent(&content, '~'));
         }
         "\"" => {
             // umlaut
-            let content = conv.get_required_arg(&cmd, 0).unwrap_or_default();
+            let content = text_accent_base(conv, &cmd);
             output.push_str(&apply_text_accent(&content, '"'));
         }
         "c" => {
             // cedilla
-            let content = conv.get_required_arg(&cmd, 0).unwrap_or_default();
+            let content = text_accent_base(conv, &cmd);
             output.push_str(&apply_cedilla(&content));
         }
 
@@ -3633,6 +3633,18 @@ fn typst_length(dim: &str) -> Option<String> {
     }
     let rounded = if rounded == 0.0 { 0.0 } else { rounded };
     Some(format!("{rounded}{unit}"))
+}
+
+/// The letter under a text accent: dotless \i and \j take the accent as i and j,
+/// any other command is converted first (\"{\o} is ø, not raw LaTeX).
+fn text_accent_base(conv: &mut LatexConverter, cmd: &CmdItem) -> String {
+    let raw = conv.get_required_arg(cmd, 0).unwrap_or_default();
+    match raw.trim() {
+        "\\i" => "i".to_string(),
+        "\\j" => "j".to_string(),
+        r if r.starts_with('\\') => conv.convert_required_arg(cmd, 0).unwrap_or_default(),
+        _ => raw,
+    }
 }
 
 /// Apply a text accent to a character

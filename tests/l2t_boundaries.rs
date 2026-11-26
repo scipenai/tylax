@@ -277,3 +277,23 @@ fn text_quotes_and_at_signs_respect_boundaries() {
     assert!(!literal_doc.contains("preamble"), "{literal_doc}");
     assert!(!literal_doc.contains("\\@"), "{literal_doc}");
 }
+
+#[test]
+fn text_accents_keep_their_letter() {
+    let out = latex_document_to_typst(
+        "\\begin{document}Caf\\'e, \\'{e}t\\'{e}, \\`a la, h\\^otel, Schr\\\"odinger, fa\\c{c}ade.\\end{document}",
+    );
+    assert!(
+        out.contains("Café, été, à la, hôtel, Schrödinger, façade."),
+        "{out}"
+    );
+    // Math accents are separate commands and stay accent calls.
+    assert!(latex_to_typst("\\hat{x} + \\acute{e}").contains("hat(x)"));
+}
+
+#[test]
+fn text_accents_on_dotless_letters_and_commands() {
+    let out =
+        latex_document_to_typst("\\begin{document}ma\\^{\\i}tre, na\\\"{\\i}ve.\\end{document}");
+    assert!(out.contains("maître, naïve."), "{out}");
+}

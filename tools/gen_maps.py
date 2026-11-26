@@ -306,6 +306,9 @@ COMMANDS_WITH_ARGS = {
     "overleftrightarrow": 1, "overrightarrow": 1, "dot": 1, "ddot": 1,
     "overbrace": 1, "underbrace": 1, "check": 1, "acute": 1, "grave": 1,
     "breve": 1, "dddot": 1, "ddddot": 1, "mathring": 1,
+
+    # Text accents (1 arg): \'e, \'{e}, \"o, \c{c}
+    "`": 1, "'": 1, "^": 1, '"': 1, "c": 1,
     
     # Limits and stacking (2 args)
     "overset": 2, "underset": 2, "stackrel": 2,
