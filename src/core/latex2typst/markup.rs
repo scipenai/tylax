@@ -22,7 +22,7 @@ use super::context::{
     PendingReference, PendingSection, PendingSiunitx, SiunitxKind, SIZED_BAR_SENTINEL,
     SIZED_DOUBLE_BAR_SENTINEL,
 };
-use super::utils::{protect_top_level_comma, sanitize_label, to_roman_numeral};
+use super::utils::{protect_top_level_comma, sanitize_label, to_roman_numeral, unescape_texttt};
 use super::{ConversionWarning, WarningKind};
 use crate::features::images::ImageAttributes;
 use crate::features::refs::{
@@ -980,7 +980,7 @@ pub fn convert_command(conv: &mut LatexConverter, elem: SyntaxElement, output: &
         }
         "texttt" | "tt" => {
             let content = conv.get_required_arg(&cmd, 0).unwrap_or_default();
-            let _ = write!(output, "`{}`", content);
+            let _ = write!(output, "`{}`", unescape_texttt(&content));
         }
         "underline" => {
             // In math, `#underline[…]` takes its argument as markup; T -> L then

@@ -277,3 +277,22 @@ fn text_quotes_and_at_signs_respect_boundaries() {
     assert!(!literal_doc.contains("preamble"), "{literal_doc}");
     assert!(!literal_doc.contains("\\@"), "{literal_doc}");
 }
+
+#[test]
+fn texttt_resolves_latex_escapes() {
+    let out = latex_document_to_typst(
+        "\\begin{document}Run \\texttt{my\\_script.py} at \\texttt{50\\%} from \\texttt{C:\\textbackslash{}tmp\\textbackslash{}\\_x}.\\end{document}",
+    );
+    assert!(
+        out.contains("Run `my_script.py` at `50%` from `C:\\tmp\\_x`."),
+        "{out}"
+    );
+}
+
+#[test]
+fn texttt_drops_space_after_command_words() {
+    let out = latex_document_to_typst(
+        "\\begin{document}\\texttt{\\textbackslash n} and \\texttt{\\~{}/.bashrc}.\\end{document}",
+    );
+    assert!(out.contains("`\\n` and `~/.bashrc`."), "{out}");
+}
