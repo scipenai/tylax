@@ -1279,6 +1279,7 @@ dependencies = [
  "serde_yaml",
  "toml",
  "typst-syntax",
+ "unicode-segmentation",
  "wasm-bindgen",
 ]
 

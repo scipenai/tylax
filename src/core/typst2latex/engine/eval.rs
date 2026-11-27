@@ -11,6 +11,7 @@ use indexmap::IndexMap;
 
 use typst_syntax::ast::{self, AstNode};
 use typst_syntax::{parse, parse_code, SyntaxKind, SyntaxNode};
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::library::{call_builtin, call_calc, call_method, BuiltinResult};
 use super::ops;
@@ -1174,7 +1175,10 @@ impl MiniEval {
                 .into_iter()
                 .map(|(k, v)| Value::Array(vec![Value::Str(k), v]))
                 .collect(),
-            Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
+            Value::Str(s) => s
+                .graphemes(true)
+                .map(|g| Value::Str(g.to_string()))
+                .collect(),
             _ => {
                 return Err(EvalError::invalid_op(format!(
                     "cannot iterate over {}",
