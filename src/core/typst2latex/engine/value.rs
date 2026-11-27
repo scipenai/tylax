@@ -432,6 +432,7 @@ impl Selector {
                     ("math", ContentNode::Math { .. }) => true,
                     ("list", ContentNode::ListItem(_)) => true,
                     ("enum", ContentNode::EnumItem { .. }) => true,
+                    ("terms", node) if node.term_item_parts().is_some() => true,
                     ("text", ContentNode::Text(_)) => true,
                     ("cite", ContentNode::Citation { .. }) => true,
                     ("ref", ContentNode::Reference { .. }) => true,
@@ -1592,7 +1593,9 @@ fn escape_typst_markup_text(text: &str) -> String {
     escaped
 }
 
-fn render_content_block_body(nodes: &[ContentNode]) -> String {
+pub(crate) const TERM_ITEM_NAME: &str = "terms.item";
+
+fn render_term_field_nodes(nodes: &[ContentNode]) -> String {
     let mut rendered = render_content_nodes(nodes);
     if nodes
         .last()
@@ -1605,7 +1608,7 @@ fn render_content_block_body(nodes: &[ContentNode]) -> String {
 }
 
 fn render_content_block_arg(nodes: &[ContentNode]) -> String {
-    let rendered = render_content_block_body(nodes);
+    let rendered = render_term_field_nodes(nodes);
     let starts_with_list = nodes
         .iter()
         .find(|node| {
@@ -1654,7 +1657,7 @@ pub(crate) fn render_content_nodes(nodes: &[ContentNode]) -> String {
             continue;
         }
         flush_text_run(&mut output, &mut text_run);
-        if node.is_ordinary_list_item() {
+        if node.is_ordinary_list_item() || node.term_item_parts().is_some() {
             output.truncate(output.trim_end_matches([' ', '\t']).len());
             if !output.is_empty() && !output.ends_with('\n') {
                 output.push('\n');
@@ -1671,8 +1674,42 @@ impl ContentNode {
         matches!(self, Self::ListItem(_) | Self::EnumItem { .. })
     }
 
+    pub(crate) fn term_item(term: Vec<ContentNode>, description: Vec<ContentNode>) -> Self {
+        Self::Element {
+            name: TERM_ITEM_NAME.to_string(),
+            fields: IndexMap::from([
+                ("term".to_string(), Value::Content(term)),
+                ("description".to_string(), Value::Content(description)),
+            ]),
+        }
+    }
+
+    pub(crate) fn term_item_parts(&self) -> Option<(&[ContentNode], &[ContentNode])> {
+        let Self::Element { name, fields } = self else {
+            return None;
+        };
+        if name != TERM_ITEM_NAME {
+            return None;
+        }
+        let Value::Content(term) = fields.get("term")? else {
+            return None;
+        };
+        let Value::Content(description) = fields.get("description")? else {
+            return None;
+        };
+        Some((term, description))
+    }
+
     /// Convert this content node back to Typst source code.
     pub fn to_typst(&self) -> String {
+        if let Some((term, description)) = self.term_item_parts() {
+            // Content blocks preserve colons and paragraphs and can appear inside a list item.
+            return format!(
+                "#{TERM_ITEM_NAME}({}, {})",
+                render_content_block_arg(term),
+                render_content_block_arg(description),
+            );
+        }
         match self {
             ContentNode::Text(s) => escape_typst_markup_text(s),
             ContentNode::Space => " ".to_string(),
@@ -2203,6 +2240,35 @@ mod tests {
     }
 
     #[test]
+    fn test_terms_selector_matches_terms_and_terms_item() {
+        let term = vec![ContentNode::Text("Key".to_string())];
+        let desc = vec![ContentNode::Text("Value".to_string())];
+        let node = ContentNode::term_item(term.clone(), desc);
+        let text_node = ContentNode::Text("Other".to_string());
+
+        let terms_sel = Selector::Element("terms".to_string(), vec![]);
+        let item_sel = Selector::Element("terms.item".to_string(), vec![]);
+        let filtered_sel = Selector::Element(
+            "terms".to_string(),
+            vec![("term".to_string(), Value::Content(term))],
+        );
+        let wrong_filter_sel = Selector::Element(
+            "terms".to_string(),
+            vec![(
+                "term".to_string(),
+                Value::Content(vec![ContentNode::Text("Missing".to_string())]),
+            )],
+        );
+
+        assert!(terms_sel.matches(&node));
+        assert!(item_sel.matches(&node));
+        assert!(!terms_sel.matches(&text_node));
+        assert!(!item_sel.matches(&text_node));
+        assert!(filtered_sel.matches(&node));
+        assert!(!wrong_filter_sel.matches(&node));
+    }
+
+    #[test]
     fn test_escape_typst_markup_text_escapes_comment_slashes() {
         assert_eq!(escape_typst_markup_text("A // B"), r"A \/\/ B");
         assert_eq!(escape_typst_markup_text("A /* B */ C"), r"A \/\* B \*\/ C");
@@ -2219,5 +2285,11 @@ mod tests {
         assert_eq!(escape_typst_markup_text("a = b"), "a = b");
         assert_eq!(escape_typst_markup_text("Hello."), "Hello.");
         assert_eq!(escape_typst_markup_text("3.14"), "3.14");
+
+        let item = ContentNode::term_item(
+            vec![ContentNode::Text("Key".to_string())],
+            vec![ContentNode::Text("A // B".to_string())],
+        );
+        assert_eq!(item.to_typst(), r"#terms.item([Key], [A \/\/ B])");
     }
 }

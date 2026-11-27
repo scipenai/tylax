@@ -188,6 +188,40 @@ pub fn convert_content_nodes_to_latex(nodes: &[ContentNode], ctx: &mut ConvertCo
         }
         after_list_item = node.is_ordinary_list_item();
 
+        if let Some((term, description)) = node.term_item_parts() {
+            flush_typst_chunk(&mut buffer, ctx);
+            if ctx.is_in_env(&EnvironmentContext::Table) {
+                let mut items = vec![render_table_term_entry(
+                    ctx,
+                    |c| convert_content_nodes_to_latex(term, c),
+                    |c| convert_content_nodes_to_latex(description, c),
+                )];
+                collect_following_evaluated_term_items(nodes, &mut i, |t, d| {
+                    items.push(render_table_term_entry(
+                        ctx,
+                        |c| convert_content_nodes_to_latex(t, c),
+                        |c| convert_content_nodes_to_latex(d, c),
+                    ));
+                });
+                emit_table_cell_lines(items, ctx);
+            } else {
+                begin_description(ctx);
+                emit_description_item(
+                    ctx,
+                    |c| convert_content_nodes_to_latex(term, c),
+                    |c| convert_content_nodes_to_latex(description, c),
+                );
+                collect_following_evaluated_term_items(nodes, &mut i, |t, d| {
+                    emit_description_item(
+                        ctx,
+                        |c| convert_content_nodes_to_latex(t, c),
+                        |c| convert_content_nodes_to_latex(d, c),
+                    );
+                });
+                end_description(ctx);
+            }
+            continue;
+        }
         match node {
             ContentNode::Space => {
                 flush_typst_chunk(&mut buffer, ctx);
@@ -661,6 +695,12 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
             }
         }
 
+        SyntaxKind::TermItem => {
+            if let Some((term, description)) = term_item_parts(node) {
+                emit_single_ast_term_item(term, description, ctx);
+            }
+        }
+
         // Math (inline or display)
         SyntaxKind::Equation => {
             let in_table = ctx.is_in_env(&EnvironmentContext::Table);
@@ -865,6 +905,11 @@ fn module_include_path(node: &SyntaxNode) -> Option<String> {
 pub fn convert_func_call_markup(node: &SyntaxNode, ctx: &mut ConvertContext) {
     let children: Vec<_> = node.children().collect();
     if children.is_empty() {
+        return;
+    }
+
+    if let Some((term, description)) = term_item_parts(node) {
+        emit_single_ast_term_item(term, description, ctx);
         return;
     }
 
@@ -2434,6 +2479,18 @@ fn convert_list_item(node: &SyntaxNode, ctx: &mut ConvertContext) {
     ctx.newline();
 }
 
+enum TermPart<'a> {
+    Markup(&'a SyntaxNode),
+    Expr(ast::Expr<'a>),
+}
+
+fn term_item_arg(arg: Option<ast::Arg<'_>>) -> Option<TermPart<'_>> {
+    match arg? {
+        ast::Arg::Pos(expr) => Some(TermPart::Expr(expr)),
+        _ => None,
+    }
+}
+
 fn is_list_group_trivia(node: &SyntaxNode) -> bool {
     matches!(
         node.kind(),
@@ -2442,6 +2499,92 @@ fn is_list_group_trivia(node: &SyntaxNode) -> bool {
             | SyntaxKind::LineComment
             | SyntaxKind::BlockComment
     )
+}
+
+fn term_item_parts(node: &SyntaxNode) -> Option<(TermPart<'_>, TermPart<'_>)> {
+    if let Some(item) = node.cast::<ast::TermItem>() {
+        return Some((
+            TermPart::Markup(item.term().to_untyped()),
+            TermPart::Markup(item.description().to_untyped()),
+        ));
+    }
+
+    // MiniEval emits this explicit form when expanding content to Typst source.
+    let call = node.cast::<ast::FuncCall>()?;
+    let ast::Expr::FieldAccess(access) = call.callee() else {
+        return None;
+    };
+    if super::scope_analysis::is_shadowed_node(access.to_untyped()) {
+        return None;
+    }
+    let ast::Expr::Ident(target) = access.target() else {
+        return None;
+    };
+    if target.get().as_str() != "terms" || access.field().get().as_str() != "item" {
+        return None;
+    }
+    let mut args = call.args().items();
+    match (
+        term_item_arg(args.next()),
+        term_item_arg(args.next()),
+        args.next(),
+    ) {
+        (Some(term), Some(description), None) => Some((term, description)),
+        _ => None,
+    }
+}
+
+fn collect_following_evaluated_term_items<'a>(
+    nodes: &'a [ContentNode],
+    i: &mut usize,
+    mut on_item: impl FnMut(&'a [ContentNode], &'a [ContentNode]),
+) {
+    while *i < nodes.len() {
+        let mut next_idx = *i;
+        while matches!(
+            nodes.get(next_idx),
+            Some(ContentNode::Space | ContentNode::Parbreak)
+        ) {
+            next_idx += 1;
+        }
+        if let Some((term, description)) =
+            nodes.get(next_idx).and_then(ContentNode::term_item_parts)
+        {
+            on_item(term, description);
+            *i = next_idx + 1;
+        } else {
+            break;
+        }
+    }
+}
+
+fn collect_following_ast_term_items<'a>(
+    children: &[&'a SyntaxNode],
+    i: &mut usize,
+    mut on_item: impl FnMut(TermPart<'a>, TermPart<'a>),
+) {
+    while *i < children.len() {
+        let mut next_idx = *i;
+        while let Some(next_child) = children.get(next_idx) {
+            let trivia = is_list_group_trivia(next_child);
+            let item_hash = next_child.kind() == SyntaxKind::Hash
+                && children
+                    .get(next_idx + 1)
+                    .is_some_and(|next| term_item_parts(next).is_some());
+            if trivia || item_hash {
+                next_idx += 1;
+            } else {
+                break;
+            }
+        }
+        if let Some((term, description)) = children.get(next_idx).copied().and_then(term_item_parts)
+        {
+            on_item(term, description);
+            *i = next_idx + 1;
+        } else {
+            break;
+        }
+    }
 }
 
 fn collect_following_kind<'a>(
@@ -2594,6 +2737,27 @@ fn collapse_table_text(s: &str) -> String {
     out
 }
 
+fn format_table_term_item(term: &str, description: &str) -> String {
+    let term = collapse_table_text(term);
+    let description = collapse_table_text(description);
+    match (term.is_empty(), description.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!("\\textbf{{{term}}}"),
+        (true, false) => description,
+        (false, false) => format!("\\textbf{{{term}}} {description}"),
+    }
+}
+
+fn render_table_term_entry(
+    ctx: &mut ConvertContext,
+    render_term: impl FnOnce(&mut ConvertContext),
+    render_description: impl FnOnce(&mut ConvertContext),
+) -> String {
+    let term = render_in_table_cell(ctx, render_term);
+    let description = render_in_table_cell(ctx, render_description);
+    format_table_term_item(&term, &description)
+}
+
 fn emit_table_cell_lines(lines: Vec<String>, ctx: &mut ConvertContext) {
     let lines: Vec<String> = lines.into_iter().filter(|line| !line.is_empty()).collect();
     if lines.is_empty() {
@@ -2611,6 +2775,40 @@ fn emit_table_cell_lines(lines: Vec<String>, ctx: &mut ConvertContext) {
         ctx.push("\\end{tabular}");
         ctx.last_token = TokenType::Command;
     }
+}
+
+fn emit_single_ast_term_item(
+    term: TermPart<'_>,
+    description: TermPart<'_>,
+    ctx: &mut ConvertContext,
+) {
+    if ctx.is_in_env(&EnvironmentContext::Table) {
+        let item = render_table_term_entry(
+            ctx,
+            |c| convert_term_part(term, c),
+            |c| convert_term_part(description, c),
+        );
+        emit_table_cell_lines(vec![item], ctx);
+    } else {
+        begin_description(ctx);
+        emit_description_item(
+            ctx,
+            |c| convert_term_part(term, c),
+            |c| convert_term_part(description, c),
+        );
+        end_description(ctx);
+    }
+}
+
+fn begin_description(ctx: &mut ConvertContext) {
+    ctx.ensure_paragraph_break();
+    ctx.push_line("\\begin{description}");
+    ctx.indent_level += 1;
+}
+
+fn end_description(ctx: &mut ConvertContext) {
+    ctx.indent_level -= 1;
+    ctx.push_line("\\end{description}");
 }
 
 fn push_escaped_latex_text(ctx: &mut ConvertContext, text: &str) {
@@ -2685,6 +2883,45 @@ fn convert_markup_children(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
                     ctx.push_line("\\end{enumerate}");
                 }
             }
+            _ if term_item_parts(child).is_some() => {
+                if ctx.is_in_env(&EnvironmentContext::Table) {
+                    let mut items = Vec::new();
+                    if let Some((term, description)) = term_item_parts(child) {
+                        items.push(render_table_term_entry(
+                            ctx,
+                            |c| convert_term_part(term, c),
+                            |c| convert_term_part(description, c),
+                        ));
+                    }
+                    i += 1;
+                    collect_following_ast_term_items(children, &mut i, |t, d| {
+                        items.push(render_table_term_entry(
+                            ctx,
+                            |c| convert_term_part(t, c),
+                            |c| convert_term_part(d, c),
+                        ));
+                    });
+                    emit_table_cell_lines(items, ctx);
+                } else {
+                    begin_description(ctx);
+                    if let Some((term, description)) = term_item_parts(child) {
+                        emit_description_item(
+                            ctx,
+                            |c| convert_term_part(term, c),
+                            |c| convert_term_part(description, c),
+                        );
+                    }
+                    i += 1;
+                    collect_following_ast_term_items(children, &mut i, |t, d| {
+                        emit_description_item(
+                            ctx,
+                            |c| convert_term_part(t, c),
+                            |c| convert_term_part(d, c),
+                        );
+                    });
+                    end_description(ctx);
+                }
+            }
             SyntaxKind::FuncCall => {
                 let func_name = child
                     .children()
@@ -2732,6 +2969,85 @@ fn convert_markup_children(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
                 i += 1;
             }
         }
+    }
+}
+
+fn collect_term_add_operands<'a>(mut expr: ast::Expr<'a>, out: &mut Vec<ast::Expr<'a>>) {
+    while let ast::Expr::Parenthesized(paren) = expr {
+        expr = paren.expr();
+    }
+    if let ast::Expr::Binary(bin) = expr {
+        if bin.op() == ast::BinOp::Add {
+            collect_term_add_operands(bin.lhs(), out);
+            collect_term_add_operands(bin.rhs(), out);
+            return;
+        }
+    }
+    out.push(expr);
+}
+
+fn convert_term_expr(expr: ast::Expr<'_>, ctx: &mut ConvertContext) {
+    let mut operands = Vec::new();
+    collect_term_add_operands(expr, &mut operands);
+
+    let mut pending_markup: Vec<&SyntaxNode> = Vec::new();
+    for operand in operands {
+        if let ast::Expr::ContentBlock(block) = operand {
+            pending_markup.extend(block.body().to_untyped().children());
+            continue;
+        }
+        if !pending_markup.is_empty() {
+            convert_markup_children(&pending_markup, ctx);
+            pending_markup.clear();
+        }
+        match operand {
+            ast::Expr::Str(text) => {
+                let decoded = text.get();
+                if !decoded.is_empty() {
+                    push_escaped_latex_text(ctx, &decoded);
+                    ctx.last_token = TokenType::Text;
+                }
+            }
+            other => convert_markup_node(other.to_untyped(), ctx),
+        }
+    }
+    if !pending_markup.is_empty() {
+        convert_markup_children(&pending_markup, ctx);
+    }
+}
+
+fn convert_term_part(part: TermPart<'_>, ctx: &mut ConvertContext) {
+    match part {
+        TermPart::Markup(node) => convert_markup_node(node, ctx),
+        TermPart::Expr(expr) => convert_term_expr(expr, ctx),
+    }
+}
+
+fn emit_description_item(
+    ctx: &mut ConvertContext,
+    render_term: impl FnOnce(&mut ConvertContext),
+    render_description: impl FnOnce(&mut ConvertContext),
+) {
+    let mut inner = ConvertContext::new();
+    inner.options = ctx.options.clone();
+    render_term(&mut inner);
+    let term = inner.finish_into(ctx);
+    push_term_label(&term, ctx);
+    render_description(ctx);
+    ctx.newline();
+}
+
+fn push_term_label(term: &str, ctx: &mut ConvertContext) {
+    let term = term.trim();
+    ctx.push_indent();
+    if term.is_empty() {
+        // `/ : Details` has no term; a bare `\item` is its LaTeX form.
+        ctx.push("\\item ");
+    } else if term.contains(']') {
+        // Brace the label so a `]` in it does not end the optional argument.
+        ctx.push(&format!("\\item[{{{}}}] ", term));
+    } else {
+        ctx.push(&format!("\\item[{}] ", term));
     }
 }
 

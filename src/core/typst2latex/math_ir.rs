@@ -61,6 +61,15 @@ pub(crate) fn current_math_build_env() -> MathBuildEnv {
     MATH_BUILD_ENV.with(|stack| stack.borrow().last().cloned().unwrap_or_default())
 }
 
+pub(crate) fn is_shadowed_node(node: &SyntaxNode) -> bool {
+    MATH_BUILD_ENV.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .is_some_and(|env| env.is_shadowed_context(node))
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MathSpacing {
     Soft,

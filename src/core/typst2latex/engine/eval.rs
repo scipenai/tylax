@@ -370,6 +370,14 @@ impl MiniEval {
                     content: processed,
                 })
             }
+            ContentNode::Element { name, mut fields } if name == super::value::TERM_ITEM_NAME => {
+                for field in ["term", "description"] {
+                    if let Some(Value::Content(nodes)) = fields.get_mut(field) {
+                        *nodes = self.apply_show_rules(std::mem::take(nodes))?;
+                    }
+                }
+                Ok(ContentNode::Element { name, fields })
+            }
             // Other nodes don't have children to process
             other => Ok(other),
         }
@@ -467,6 +475,7 @@ impl MiniEval {
             | ast::Expr::Heading(_)
             | ast::Expr::ListItem(_)
             | ast::Expr::EnumItem(_)
+            | ast::Expr::TermItem(_)
             | ast::Expr::Raw(_)
             | ast::Expr::Equation(_)
             | ast::Expr::Math(_)
@@ -585,6 +594,14 @@ impl MiniEval {
                     number,
                     content: body.into_content(),
                 }]))
+            }
+            ast::Expr::TermItem(item) => {
+                let term = self.eval_markup(item.term())?;
+                let description = self.eval_markup(item.description())?;
+                Ok(Value::Content(vec![ContentNode::term_item(
+                    term.into_content(),
+                    description.into_content(),
+                )]))
             }
             ast::Expr::Raw(raw) => {
                 let text: String = raw
@@ -1672,6 +1689,17 @@ impl MiniEval {
                     BuiltinResult::Ok(value) => Ok(value),
                     BuiltinResult::Err(error) => Err(error),
                     BuiltinResult::NotFound => unreachable!("registered table helper"),
+                };
+            }
+            if ident.get().as_str() == "terms"
+                && field == "item"
+                && self.scopes.get("terms").is_none()
+            {
+                let (pos_args, named_args) = self.eval_args(args)?;
+                return match call_builtin("terms.item", pos_args, named_args, &self.vfs) {
+                    BuiltinResult::Ok(value) => Ok(value),
+                    BuiltinResult::Err(error) => Err(error),
+                    BuiltinResult::NotFound => unreachable!("registered terms helper"),
                 };
             }
         }

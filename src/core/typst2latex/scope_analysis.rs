@@ -327,6 +327,10 @@ pub(crate) fn annotate_shadowed_builtins_in_node(
     .map(|annotated| format!("#{annotated}"))
 }
 
+pub(crate) fn is_shadowed_node(node: &SyntaxNode) -> bool {
+    super::math_ir::is_shadowed_node(node)
+}
+
 fn annotate_shadowed_builtins_in_linked(
     root: &LinkedNode<'_>,
     source: &str,

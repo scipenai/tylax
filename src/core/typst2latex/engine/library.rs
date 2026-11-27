@@ -122,6 +122,7 @@ pub fn call_builtin(
         "table.header" | "table.cell" | "table.hline" | "table.vline" => {
             builtin_layout_func(name, args, named).into()
         }
+        "terms.item" => builtin_terms_item(args, named).into(),
         "h" => builtin_layout_func("h", args, named).into(),
         "v" => builtin_layout_func("v", args, named).into(),
         "par" => builtin_layout_func("par", args, named).into(),
@@ -1728,6 +1729,15 @@ fn content_node_to_fields(node: &ContentNode) -> IndexMap<String, Value> {
 
 /// Extract plain text from a ContentNode for text() method.
 fn content_node_to_text(node: &ContentNode) -> String {
+    if let Some((term, description)) = node.term_item_parts() {
+        let mut text: String = term.iter().map(content_node_to_text).collect();
+        let description: String = description.iter().map(content_node_to_text).collect();
+        if !text.is_empty() && !description.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(&description);
+        return text;
+    }
     match node {
         ContentNode::Text(t) => t.clone(),
         ContentNode::Space => " ".to_string(),
@@ -1963,6 +1973,22 @@ fn builtin_layout_func(
         name: name.to_string(),
         args: func_args,
     }]))
+}
+
+/// Build an evaluated term-list item node for `#terms.item(term, description)`.
+fn builtin_terms_item(args: Vec<Value>, named: IndexMap<String, Value>) -> EvalResult<Value> {
+    if !named.is_empty() || args.len() != 2 {
+        return Err(EvalError::argument(
+            "terms.item expects 2 positional arguments".to_string(),
+        ));
+    }
+    let mut iter = args.into_iter();
+    let term = iter.next().unwrap().into_content();
+    let description = iter.next().unwrap().into_content();
+    Ok(Value::Content(vec![ContentNode::term_item(
+        term,
+        description,
+    )]))
 }
 
 /// Image function - loads and returns an image reference.
