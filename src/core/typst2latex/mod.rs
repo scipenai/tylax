@@ -10,6 +10,7 @@ mod math;
 mod math_emit;
 mod math_ir;
 mod preprocess;
+mod scope_analysis;
 mod supplement;
 mod table;
 mod utils;
@@ -17,7 +18,6 @@ mod utils;
 pub use context::{ConvertContext, DocumentWrapperMode, EnvironmentContext, T2LOptions, TokenType};
 use engine::ContentNode;
 use std::collections::HashSet;
-#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use typst_syntax::{parse, parse_math};
 
@@ -254,7 +254,7 @@ pub fn typst_to_latex(input: &str) -> String {
 
 /// Convert Typst code to LaTeX with options
 pub fn typst_to_latex_with_options(input: &str, options: &T2LOptions) -> String {
-    typst_to_latex_with_options_and_bibliography_keys(input, options, None)
+    typst_to_latex_with_options_and_bibliography_keys(input, options, None, None)
 }
 
 /// Convert a Typst source file to LaTeX, resolving bare `@key` citations from
@@ -269,22 +269,43 @@ pub fn typst_file_to_latex_with_options(
     options: &T2LOptions,
 ) -> String {
     let bibliography_keys = supplement::load_bibliography_keys(input, source_path);
-    typst_to_latex_with_options_and_bibliography_keys(input, options, Some(&bibliography_keys))
+    typst_to_latex_with_options_and_bibliography_keys(
+        input,
+        options,
+        Some(&bibliography_keys),
+        Some(source_path),
+    )
+}
+
+fn entry_source_dir(source_path: &Path) -> Option<std::path::PathBuf> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Ok(canon) = std::fs::canonicalize(source_path) {
+        if let Some(parent) = canon.parent() {
+            return Some(parent.to_path_buf());
+        }
+    }
+    source_path.parent().map(Path::to_path_buf)
 }
 
 fn typst_to_latex_with_options_and_bibliography_keys(
     input: &str,
     options: &T2LOptions,
     bibliography_keys: Option<&HashSet<String>>,
+    source_path: Option<&Path>,
 ) -> String {
     let mut ctx = ConvertContext::new();
     ctx.options = options.clone();
 
     // Preprocess: strip `//! tylax:` ignore directives, then handle imports, etc.
     let input = preprocess::strip_tylax_ignores(input);
-    let shadowed_marker = math_ir::unique_shadowed_context_marker(&input);
-    let annotated_input =
-        math_ir::annotate_shadowed_llap_contexts(&input, options.math_only, &shadowed_marker);
+    let shadowed_marker = scope_analysis::unique_shadowed_marker(&input);
+    let source_dir = source_path.and_then(entry_source_dir);
+    let annotated_input = scope_analysis::annotate_shadowed_builtins_in_dir(
+        &input,
+        options.math_only,
+        &shadowed_marker,
+        source_dir.as_deref(),
+    );
     let processed_input = preprocess::preprocess_typst(&annotated_input);
 
     // The AST is kept so the reference finalizer can look up what each label
@@ -355,7 +376,7 @@ pub fn typst_document_to_latex(input: &str) -> String {
 /// }
 /// ```
 pub fn typst_to_latex_with_diagnostics(input: &str, options: &T2LOptions) -> ConversionResult {
-    typst_to_latex_with_diagnostics_and_bibliography_keys(input, options, None)
+    typst_to_latex_with_diagnostics_and_bibliography_keys(input, options, None, None)
 }
 
 /// File-oriented variant of [`typst_to_latex_with_diagnostics`]: resolves bare
@@ -368,13 +389,19 @@ pub fn typst_file_to_latex_with_diagnostics(
     options: &T2LOptions,
 ) -> ConversionResult {
     let bibliography_keys = supplement::load_bibliography_keys(input, source_path);
-    typst_to_latex_with_diagnostics_and_bibliography_keys(input, options, Some(&bibliography_keys))
+    typst_to_latex_with_diagnostics_and_bibliography_keys(
+        input,
+        options,
+        Some(&bibliography_keys),
+        Some(source_path),
+    )
 }
 
 fn typst_to_latex_with_diagnostics_and_bibliography_keys(
     input: &str,
     options: &T2LOptions,
     bibliography_keys: Option<&HashSet<String>>,
+    source_path: Option<&Path>,
 ) -> ConversionResult {
     let mut warnings = Vec::new();
 
@@ -385,7 +412,7 @@ fn typst_to_latex_with_diagnostics_and_bibliography_keys(
     // MiniEval parses documents; keep bare math in its math context.
     let math_input = options.math_only.then(|| format!("${input}\n$"));
     let eval_input = math_input.as_deref().unwrap_or(input);
-    let shadowed_marker = math_ir::unique_shadowed_context_marker(input);
+    let shadowed_marker = scope_analysis::unique_shadowed_marker(input);
 
     // Step 1: Expand macros using MiniEval (with show rules applied)
     let (expanded_input, expanded_nodes): (String, Option<Vec<ContentNode>>) =
@@ -403,10 +430,12 @@ fn typst_to_latex_with_diagnostics_and_bibliography_keys(
             }
             Err(e) => {
                 warnings.push(ConversionWarning::from_eval_error(&e));
-                let annotated = math_ir::annotate_shadowed_llap_contexts(
+                let source_dir = source_path.and_then(entry_source_dir);
+                let annotated = scope_analysis::annotate_shadowed_builtins_in_dir(
                     input,
                     options.math_only,
                     &shadowed_marker,
+                    source_dir.as_deref(),
                 );
                 (preprocess::preprocess_typst(&annotated), None)
             }

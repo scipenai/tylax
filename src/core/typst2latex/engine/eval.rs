@@ -2268,17 +2268,17 @@ impl MiniEval {
                                 let marked = self.shadowed_context_marker.as_deref().and_then(|marker| {
                                     let h_shadowed = self.scopes.contains("h");
                                     let measure_shadowed = self.scopes.contains("measure");
-                                    if expr_node.kind() == Contextual
-                                        && (h_shadowed || measure_shadowed)
+                                    let terms_shadowed = self.scopes.contains("terms");
+                                    if matches!(
+                                        expr_node.kind(),
+                                        Contextual | ContentBlock | CodeBlock
+                                    ) && (h_shadowed || measure_shadowed || terms_shadowed)
                                     {
-                                        super::super::math_ir::mark_shadowed_context_source(
-                                            expr_node, marker,
-                                        )
-                                    } else if matches!(expr_node.kind(), ContentBlock | CodeBlock) {
-                                        super::super::math_ir::annotate_shadowed_llap_contexts_in_node(
+                                        super::super::scope_analysis::annotate_shadowed_builtins_in_node(
                                             expr_node,
                                             h_shadowed,
                                             measure_shadowed,
+                                            terms_shadowed,
                                             marker,
                                         )
                                     } else {
