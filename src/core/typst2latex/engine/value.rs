@@ -1532,20 +1532,145 @@ fn value_to_typst_math_arg(value: &Value) -> String {
 }
 
 fn escape_typst_markup_text(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
     let mut escaped = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if matches!(
+    let mut at_line_start = true;
+    let mut line_digits_only = false;
+
+    for (idx, &ch) in chars.iter().enumerate() {
+        let prev = idx.checked_sub(1).and_then(|p| chars.get(p).copied());
+        let prev2 = idx.checked_sub(2).and_then(|p| chars.get(p).copied());
+        let next = chars.get(idx + 1).copied();
+        let next2 = chars.get(idx + 2).copied();
+
+        let is_ellipsis_dot = ch == '.'
+            && ((prev == Some('.') && next == Some('.'))
+                || (prev2 == Some('.') && prev == Some('.'))
+                || (next == Some('.') && next2 == Some('.')));
+
+        let should_escape = matches!(
             ch,
-            '\\' | '$' | '#' | '[' | ']' | '*' | '_' | '`' | '<' | '>' | '@'
-        ) {
+            '\\' | '$'
+                | '#'
+                | '['
+                | ']'
+                | '*'
+                | '_'
+                | '`'
+                | '<'
+                | '>'
+                | '@'
+                | '/'
+                | '~'
+                | '"'
+                | '\''
+        ) || (at_line_start && matches!(ch, '=' | '+' | '-'))
+            || (ch == '-' && (prev == Some('-') || next == Some('-') || next == Some('?')))
+            || (ch == '.'
+                && ((line_digits_only && next.is_none_or(|c| c.is_whitespace()))
+                    || is_ellipsis_dot));
+
+        if should_escape {
             escaped.push('\\');
         }
         escaped.push(ch);
+
+        if matches!(ch, '\n' | '\r') {
+            at_line_start = true;
+            line_digits_only = false;
+        } else if matches!(ch, ' ' | '\t') && at_line_start {
+            // Leading indentation keeps line-start context.
+        } else if ch.is_ascii_digit() && (at_line_start || line_digits_only) {
+            at_line_start = false;
+            line_digits_only = true;
+        } else {
+            at_line_start = false;
+            line_digits_only = false;
+        }
     }
+
     escaped
 }
 
+fn render_content_block_body(nodes: &[ContentNode]) -> String {
+    let mut rendered = render_content_nodes(nodes);
+    if nodes
+        .last()
+        .is_some_and(|n| n.is_ordinary_list_item() || matches!(n, ContentNode::Heading { .. }))
+        && rendered.ends_with('\n')
+    {
+        rendered.pop();
+    }
+    rendered
+}
+
+fn render_content_block_arg(nodes: &[ContentNode]) -> String {
+    let rendered = render_content_block_body(nodes);
+    let starts_with_list = nodes
+        .iter()
+        .find(|node| {
+            !matches!(node, ContentNode::Space | ContentNode::Parbreak)
+                && !matches!(node, ContentNode::Text(text) if text.chars().all(|c| matches!(c, ' ' | '\t')))
+        })
+        .is_some_and(ContentNode::is_ordinary_list_item);
+    if starts_with_list {
+        format!("[\n{rendered}]")
+    } else {
+        format!("[{rendered}]")
+    }
+}
+
+fn format_list_item_typst(prefix: &str, children: &[ContentNode]) -> String {
+    let inner = render_content_nodes(children);
+    let inner = inner.strip_suffix('\n').unwrap_or(&inner);
+    let indent = " ".repeat(prefix.len());
+    let mut out = String::new();
+    for (idx, line) in inner.split('\n').enumerate() {
+        if idx == 0 {
+            out.push_str(prefix);
+            out.push_str(line);
+        } else if !line.is_empty() {
+            out.push_str(&indent);
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+pub(crate) fn render_content_nodes(nodes: &[ContentNode]) -> String {
+    let mut output = String::new();
+    let mut text_run = String::new();
+    let flush_text_run = |output: &mut String, text_run: &mut String| {
+        if !text_run.is_empty() {
+            output.push_str(&escape_typst_markup_text(text_run));
+            text_run.clear();
+        }
+    };
+
+    for node in nodes {
+        if let ContentNode::Text(s) = node {
+            text_run.push_str(s);
+            continue;
+        }
+        flush_text_run(&mut output, &mut text_run);
+        if node.is_ordinary_list_item() {
+            output.truncate(output.trim_end_matches([' ', '\t']).len());
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+        }
+        output.push_str(&node.to_typst());
+    }
+    flush_text_run(&mut output, &mut text_run);
+    output
+}
+
 impl ContentNode {
+    pub(crate) fn is_ordinary_list_item(&self) -> bool {
+        matches!(self, Self::ListItem(_) | Self::EnumItem { .. })
+    }
+
     /// Convert this content node back to Typst source code.
     pub fn to_typst(&self) -> String {
         match self {
@@ -1554,12 +1679,10 @@ impl ContentNode {
             ContentNode::Linebreak => "\\\n".to_string(),
             ContentNode::Parbreak => "\n\n".to_string(),
             ContentNode::Strong(children) => {
-                let inner: String = children.iter().map(|c| c.to_typst()).collect();
-                format!("*{}*", inner)
+                format!("*{}*", render_content_nodes(children))
             }
             ContentNode::Emph(children) => {
-                let inner: String = children.iter().map(|c| c.to_typst()).collect();
-                format!("_{}_", inner)
+                format!("_{}_", render_content_nodes(children))
             }
             ContentNode::Raw { text, lang, block } => {
                 if *block {
@@ -1579,19 +1702,14 @@ impl ContentNode {
             }
             ContentNode::Heading { level, content } => {
                 let prefix = "=".repeat(*level as usize);
-                let inner: String = content.iter().map(|c| c.to_typst()).collect();
-                format!("{} {}\n", prefix, inner)
+                format!("{} {}\n", prefix, render_content_nodes(content))
             }
-            ContentNode::ListItem(children) => {
-                let inner: String = children.iter().map(|c| c.to_typst()).collect();
-                format!("- {}\n", inner)
-            }
+            ContentNode::ListItem(children) => format_list_item_typst("- ", children),
             ContentNode::EnumItem { number, content } => {
-                let inner: String = content.iter().map(|c| c.to_typst()).collect();
                 if let Some(n) = number {
-                    format!("{}. {}\n", n, inner)
+                    format_list_item_typst(&format!("{n}. "), content)
                 } else {
-                    format!("+ {}\n", inner)
+                    format_list_item_typst("+ ", content)
                 }
             }
             ContentNode::Element { name, fields } => {
@@ -1712,8 +1830,7 @@ pub fn value_to_typst_arg(v: &Value) -> String {
                     return func_call_to_typst_code_source(name, args);
                 }
             }
-            let inner: String = nodes.iter().map(|n| n.to_typst()).collect();
-            format!("[{}]", inner)
+            render_content_block_arg(nodes)
         }
         Value::Regex(r) => format!("regex(\"{}\")", r.as_str()),
         Value::DateTime(dt) => dt.to_typst(),
@@ -2083,5 +2200,24 @@ mod tests {
         assert_eq!(flex, "#h(1fr)");
         // The arguments of a `#` call are code, where bare `foo` is a variable.
         assert_eq!(plain, "#h([foo])");
+    }
+
+    #[test]
+    fn test_escape_typst_markup_text_escapes_comment_slashes() {
+        assert_eq!(escape_typst_markup_text("A // B"), r"A \/\/ B");
+        assert_eq!(escape_typst_markup_text("A /* B */ C"), r"A \/\* B \*\/ C");
+        assert_eq!(escape_typst_markup_text("= literal"), r"\= literal");
+        assert_eq!(escape_typst_markup_text("- literal"), r"\- literal");
+        assert_eq!(escape_typst_markup_text("+ literal"), r"\+ literal");
+        assert_eq!(escape_typst_markup_text("1. literal"), r"1\. literal");
+        assert_eq!(escape_typst_markup_text("A -- B"), r"A \-\- B");
+        assert_eq!(escape_typst_markup_text("A --- B"), r"A \-\-\- B");
+        assert_eq!(escape_typst_markup_text("A ... B"), r"A \.\.\. B");
+        assert_eq!(escape_typst_markup_text("A ~ B"), r"A \~ B");
+        assert_eq!(escape_typst_markup_text("'a' \"b\""), r#"\'a\' \"b\""#);
+        assert_eq!(escape_typst_markup_text("1-2-3"), "1-2-3");
+        assert_eq!(escape_typst_markup_text("a = b"), "a = b");
+        assert_eq!(escape_typst_markup_text("Hello."), "Hello.");
+        assert_eq!(escape_typst_markup_text("3.14"), "3.14");
     }
 }

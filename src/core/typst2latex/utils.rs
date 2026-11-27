@@ -216,6 +216,15 @@ pub fn escape_latex_text(text: &str) -> String {
                 escaped.push('\\');
                 escaped.push(ch);
             }
+            // Typst en/em dashes in markup parse as `SyntaxKind::Shorthand`, so adjacent
+            // `-` characters reaching `escape_latex_text` come from literal text (such as
+            // strings or escaped characters) and must break TeX `--`/`---` ligatures.
+            '-' => {
+                if escaped.ends_with('-') {
+                    escaped.push_str("{}");
+                }
+                escaped.push('-');
+            }
             other => escaped.push(other),
         }
     }
@@ -1181,6 +1190,9 @@ mod tests {
         assert_eq!(escape_latex_text("$100"), "\\$100");
         assert_eq!(escape_latex_text("a_b"), "a\\_b");
         assert_eq!(escape_latex_text(r"a\b"), r"a\textbackslash{}b");
+        assert_eq!(escape_latex_text("A -- B"), "A -{}- B");
+        assert_eq!(escape_latex_text("A --- B"), "A -{}-{}- B");
+        assert_eq!(escape_latex_text("1-2-3"), "1-2-3");
     }
 
     #[test]

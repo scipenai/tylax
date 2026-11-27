@@ -175,6 +175,17 @@ pub fn convert_content_nodes_to_latex(nodes: &[ContentNode], ctx: &mut ConvertCo
                 ctx.ensure_paragraph_break();
                 ctx.last_token = TokenType::Newline;
             }
+            ContentNode::Text(s) => {
+                flush_typst_chunk(&mut buffer, ctx);
+                if !s.is_empty() {
+                    if !s.trim().is_empty() {
+                        push_escaped_latex_text(ctx, s);
+                        ctx.last_token = TokenType::Text;
+                    } else if ctx.last_token != TokenType::Newline && !ctx.output.ends_with(' ') {
+                        ctx.push(" ");
+                    }
+                }
+            }
             ContentNode::Linebreak => {
                 flush_typst_chunk(&mut buffer, ctx);
                 ctx.push("\\\n");
@@ -500,7 +511,7 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
                 &text
             };
             if !cleaned.trim().is_empty() {
-                ctx.push(&escape_latex_text(cleaned));
+                push_escaped_latex_text(ctx, cleaned);
                 ctx.last_token = TokenType::Text;
             } else if !cleaned.is_empty() && ctx.last_token != TokenType::Newline {
                 ctx.push(" ");
@@ -538,6 +549,9 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
                 "`" => "`",
                 _ => escaped_char,
             };
+            if ctx.output.ends_with('-') && latex.starts_with('-') {
+                ctx.push("{}");
+            }
             ctx.push(latex);
             ctx.last_token = TokenType::Text;
         }
@@ -802,7 +816,7 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
                 .trim_end_matches('"')
                 .trim_start_matches('\'')
                 .trim_end_matches('\'');
-            ctx.push(&escape_latex_text(content));
+            push_escaped_latex_text(ctx, content);
             ctx.last_token = TokenType::Text;
         }
 
@@ -2327,6 +2341,14 @@ fn convert_list_item(node: &SyntaxNode, ctx: &mut ConvertContext) {
         }
     }
     ctx.newline();
+}
+
+fn push_escaped_latex_text(ctx: &mut ConvertContext, text: &str) {
+    let escaped = escape_latex_text(text);
+    if ctx.output.ends_with('-') && escaped.starts_with('-') {
+        ctx.push("{}");
+    }
+    ctx.push(&escaped);
 }
 
 /// Convert a single enum item (ordered)

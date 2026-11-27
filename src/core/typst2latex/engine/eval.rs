@@ -2455,7 +2455,7 @@ pub(crate) fn expand_macros_with_shadowed_context_marker(
     let normalized_nodes = normalize_content_whitespace(transformed_nodes);
 
     // Convert transformed nodes to string
-    let output: String = normalized_nodes.iter().map(|n| n.to_typst()).collect();
+    let output = super::value::render_content_nodes(&normalized_nodes);
 
     // Collect warnings
     let warnings = eval.take_warnings();
