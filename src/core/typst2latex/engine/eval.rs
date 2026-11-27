@@ -570,10 +570,19 @@ impl MiniEval {
                 )]))
             }
             ast::Expr::EnumItem(item) => {
-                let number = item.number();
+                let number = item
+                    .number()
+                    .map(|n| {
+                        i64::try_from(n).map_err(|_| {
+                            EvalError::invalid_op(format!(
+                                "enum item number {n} exceeds supported integer range"
+                            ))
+                        })
+                    })
+                    .transpose()?;
                 let body = self.eval_markup(item.body())?;
                 Ok(Value::Content(vec![ContentNode::EnumItem {
-                    number: number.map(|n| n as i64),
+                    number,
                     content: body.into_content(),
                 }]))
             }

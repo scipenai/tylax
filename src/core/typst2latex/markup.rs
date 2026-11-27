@@ -24,7 +24,8 @@ use crate::features::refs::{
     CiteGroup, Reference,
 };
 use crate::tikz::{convert_cetz_to_tikz, is_cetz_code};
-use typst_syntax::{ast, SyntaxKind, SyntaxNode};
+use typst_syntax::ast::{self, AstNode};
+use typst_syntax::{SyntaxKind, SyntaxNode};
 
 /// Languages supported by the listings package (case-insensitive check)
 /// This is a subset of commonly used languages that listings supports by default
@@ -140,10 +141,21 @@ fn emit_rendered_math(ctx: &mut ConvertContext, math_content: &str, is_block: bo
 
     let has_alignment = has_unescaped_alignment(math_content);
 
-    if !in_table && has_alignment {
-        ctx.push("\\begin{align}\n");
-        ctx.push(math_content);
-        ctx.push("\n\\end{align}");
+    if has_alignment {
+        if in_table {
+            ctx.push("$\\begin{aligned}");
+            if math_content.trim_start().starts_with('[') {
+                ctx.push("[c] ");
+            } else {
+                ctx.push(" ");
+            }
+            ctx.push(math_content);
+            ctx.push(" \\end{aligned}$");
+        } else {
+            ctx.push("\\begin{align}\n");
+            ctx.push(math_content);
+            ctx.push("\n\\end{align}");
+        }
     } else if is_block && !in_table {
         ctx.push("\\[\n");
         ctx.push(math_content);
@@ -159,7 +171,23 @@ fn emit_rendered_math(ctx: &mut ConvertContext, math_content: &str, is_block: bo
 pub fn convert_content_nodes_to_latex(nodes: &[ContentNode], ctx: &mut ConvertContext) {
     let mut buffer = String::new();
 
-    for node in nodes {
+    let mut i = 0;
+    let mut after_list_item = false;
+    while i < nodes.len() {
+        let node = &nodes[i];
+        i += 1;
+        // Nested evaluated markup can retain the newline as a Space. Keep
+        // adjacent ordinary list items together until the chunk is parsed.
+        if after_list_item
+            && matches!(node, ContentNode::Space)
+            && nodes
+                .get(i)
+                .is_some_and(|next| next.is_ordinary_list_item())
+        {
+            continue;
+        }
+        after_list_item = node.is_ordinary_list_item();
+
         match node {
             ContentNode::Space => {
                 flush_typst_chunk(&mut buffer, ctx);
@@ -402,104 +430,7 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
         SyntaxKind::Markup => {
             // Process children, but group consecutive list items into list environments
             let children: Vec<_> = node.children().collect();
-            let mut i = 0;
-            while i < children.len() {
-                let child = children[i];
-                match child.kind() {
-                    SyntaxKind::ListItem => {
-                        // Start an itemize environment for consecutive list items
-                        ctx.ensure_paragraph_break();
-                        ctx.push_line("\\begin{itemize}");
-                        ctx.indent_level += 1;
-
-                        // Collect all consecutive ListItems
-                        while i < children.len()
-                            && (children[i].kind() == SyntaxKind::ListItem
-                                || children[i].kind() == SyntaxKind::Space
-                                || children[i].kind() == SyntaxKind::Parbreak)
-                        {
-                            if children[i].kind() == SyntaxKind::ListItem {
-                                convert_list_item(children[i], ctx);
-                            }
-                            i += 1;
-                        }
-
-                        ctx.indent_level -= 1;
-                        ctx.push_line("\\end{itemize}");
-                    }
-                    SyntaxKind::EnumItem => {
-                        // Start an enumerate environment for consecutive enum items
-                        ctx.ensure_paragraph_break();
-                        ctx.push_line("\\begin{enumerate}");
-                        ctx.indent_level += 1;
-
-                        // Collect all consecutive EnumItems
-                        while i < children.len()
-                            && (children[i].kind() == SyntaxKind::EnumItem
-                                || children[i].kind() == SyntaxKind::Space
-                                || children[i].kind() == SyntaxKind::Parbreak)
-                        {
-                            if children[i].kind() == SyntaxKind::EnumItem {
-                                convert_enum_item(children[i], ctx);
-                            }
-                            i += 1;
-                        }
-
-                        ctx.indent_level -= 1;
-                        ctx.push_line("\\end{enumerate}");
-                    }
-                    SyntaxKind::FuncCall => {
-                        // Check if this is a figure/table that has a label following it
-                        let func_name = child
-                            .children()
-                            .next()
-                            .map(|n| n.text().to_string())
-                            .unwrap_or_default();
-
-                        if func_name == "figure" {
-                            // Look ahead for a Label node (skip Space nodes)
-                            let mut label_text: Option<String> = None;
-                            let mut label_idx: Option<usize> = None;
-
-                            for (j, sibling) in children.iter().enumerate().skip(i + 1) {
-                                match sibling.kind() {
-                                    SyntaxKind::Space | SyntaxKind::Linebreak => continue,
-                                    SyntaxKind::Label => {
-                                        let text = sibling.text().to_string();
-                                        label_text = Some(
-                                            text.trim_start_matches('<')
-                                                .trim_end_matches('>')
-                                                .to_string(),
-                                        );
-                                        label_idx = Some(j);
-                                        break;
-                                    }
-                                    _ => break, // Not a label, stop looking
-                                }
-                            }
-
-                            // Set the pending label in context
-                            ctx.pending_label = label_text;
-                            convert_markup_node(child, ctx);
-                            ctx.pending_label = None;
-
-                            // Skip the label node if we found one
-                            if let Some(j) = label_idx {
-                                i = j + 1;
-                            } else {
-                                i += 1;
-                            }
-                        } else {
-                            convert_markup_node(child, ctx);
-                            i += 1;
-                        }
-                    }
-                    _ => {
-                        convert_markup_node(child, ctx);
-                        i += 1;
-                    }
-                }
-            }
+            convert_markup_children(&children, ctx);
         }
 
         SyntaxKind::Text => {
@@ -572,6 +503,20 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
 
         // Headings
         SyntaxKind::Heading => {
+            if ctx.is_in_env(&EnvironmentContext::Table) {
+                let rendered = render_in_table_cell(ctx, |inner| {
+                    for child in node.children() {
+                        if child.kind() != SyntaxKind::HeadingMarker {
+                            convert_markup_node(child, inner);
+                        }
+                    }
+                });
+                let title = collapse_table_text(&rendered);
+                if !title.is_empty() {
+                    emit_table_cell_lines(vec![format!("\\textbf{{{title}}}")], ctx);
+                }
+                return;
+            }
             let level = count_heading_markers(node);
             let section_cmd = get_heading_command(level);
 
@@ -627,6 +572,20 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
             let is_block = raw_text.starts_with("```") || text.contains('\n') || lang.is_some();
 
             if is_block {
+                if ctx.is_in_env(&EnvironmentContext::Table) {
+                    let table_text = node
+                        .cast::<ast::Raw>()
+                        .map(|raw| {
+                            raw.lines()
+                                .map(|l| l.get().to_string())
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_else(|| text.clone());
+                    emit_table_raw_code(&table_text, ctx);
+                    ctx.last_token = TokenType::Command;
+                    return;
+                }
                 ctx.ensure_paragraph_break();
                 // Only use lstlisting if the language is supported, otherwise use verbatim
                 if let Some(ref language) = lang {
@@ -669,8 +628,11 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
         // Lists - these are now handled by the Markup case above
         // If we encounter them directly, we're likely in a nested context
         SyntaxKind::ListItem => {
-            // Check if we're already in an itemize environment
-            if ctx.in_list() {
+            if ctx.is_in_env(&EnvironmentContext::Table) {
+                let item = render_table_list_item(node, "\\textbullet~", ctx);
+                emit_table_cell_lines(vec![item], ctx);
+            } else if ctx.in_list() {
+                // Check if we're already in an itemize environment
                 convert_list_item(node, ctx);
             } else {
                 // Standalone list item - wrap it in an environment
@@ -681,8 +643,15 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
         }
 
         SyntaxKind::EnumItem => {
-            // Check if we're already in an enumerate environment
-            if ctx.in_list() {
+            if ctx.is_in_env(&EnvironmentContext::Table) {
+                let num = node
+                    .cast::<ast::EnumItem>()
+                    .and_then(|e| e.number())
+                    .unwrap_or(1);
+                let item = render_table_list_item(node, &format!("{num}.~"), ctx);
+                emit_table_cell_lines(vec![item], ctx);
+            } else if ctx.in_list() {
+                // Check if we're already in an enumerate environment
                 convert_enum_item(node, ctx);
             } else {
                 // Standalone enum item - wrap it in an environment
@@ -916,17 +885,30 @@ pub fn convert_func_call_markup(node: &SyntaxNode, ctx: &mut ConvertContext) {
     if let Some(handler) = TYPST_MARKUP_HANDLERS.get(func_name.as_str()) {
         match handler {
             MarkupHandler::Wrap { prefix, suffix } => {
-                ctx.push(prefix);
-                convert_func_args_text(&children, ctx);
-                ctx.push(suffix);
+                if func_name == "heading" && ctx.is_in_env(&EnvironmentContext::Table) {
+                    let rendered =
+                        render_in_table_cell(ctx, |inner| convert_func_args_text(&children, inner));
+                    let title = collapse_table_text(&rendered);
+                    if !title.is_empty() {
+                        emit_table_cell_lines(vec![format!("\\textbf{{{title}}}")], ctx);
+                    }
+                } else {
+                    ctx.push(prefix);
+                    convert_func_args_text(&children, ctx);
+                    ctx.push(suffix);
+                }
             }
             MarkupHandler::Environment { name } => {
-                ctx.ensure_paragraph_break();
-                ctx.push_line(&format!("\\begin{{{}}}", name));
-                ctx.indent_level += 1;
-                convert_func_args_text(&children, ctx);
-                ctx.indent_level -= 1;
-                ctx.push_line(&format!("\\end{{{}}}", name));
+                if ctx.is_in_env(&EnvironmentContext::Table) {
+                    convert_func_args_text(&children, ctx);
+                } else {
+                    ctx.ensure_paragraph_break();
+                    ctx.push_line(&format!("\\begin{{{}}}", name));
+                    ctx.indent_level += 1;
+                    convert_func_args_text(&children, ctx);
+                    ctx.indent_level -= 1;
+                    ctx.push_line(&format!("\\end{{{}}}", name));
+                }
             }
             MarkupHandler::PassThrough => {
                 convert_func_args_text(&children, ctx);
@@ -1051,8 +1033,11 @@ fn handle_special_markup_func(func_name: &str, children: &[&SyntaxNode], ctx: &m
                 }
             }
 
-            ctx.ensure_paragraph_break();
-            ctx.push_line(&format!("\\begin{{{}}}", alignment));
+            let in_table = ctx.is_in_env(&EnvironmentContext::Table);
+            if !in_table {
+                ctx.ensure_paragraph_break();
+                ctx.push_line(&format!("\\begin{{{}}}", alignment));
+            }
 
             // Custom args processing to skip the alignment parameter
             if let Some(args) = children.get(1) {
@@ -1080,7 +1065,9 @@ fn handle_special_markup_func(func_name: &str, children: &[&SyntaxNode], ctx: &m
                 }
             }
 
-            ctx.push_line(&format!("\\end{{{}}}", alignment));
+            if !in_table {
+                ctx.push_line(&format!("\\end{{{}}}", alignment));
+            }
         }
 
         // Box/Frame
@@ -1831,6 +1818,9 @@ fn preserve_unconverted_layout(reason: &str, children: &[&SyntaxNode], ctx: &mut
         .map(|node| (**node).clone().into_text().to_string())
         .collect();
     preserve_typst_source(&format!("#{source}"), ctx);
+    if ctx.is_in_env(&EnvironmentContext::Table) {
+        ctx.push("{}");
+    }
 }
 
 // ============================================================================
@@ -2209,7 +2199,108 @@ fn convert_cetz_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
 // Enhanced List Conversion with Nesting Support
 // ============================================================================
 
+struct TableEnumCounter {
+    next: Option<u64>,
+}
+
+impl TableEnumCounter {
+    fn new(start: u64) -> Self {
+        Self { next: Some(start) }
+    }
+
+    fn next_marker(&mut self, explicit: Option<u64>) -> String {
+        if let Some(n) = explicit {
+            self.next = n.checked_add(1);
+            format!("{n}.~")
+        } else if let Some(n) = self.next {
+            self.next = n.checked_add(1);
+            format!("{n}.~")
+        } else {
+            // Explicit item hit u64::MAX; avoid wrapping a subsequent implicit item to 0.
+            "\\textbullet~".to_string()
+        }
+    }
+}
+
+fn expand_list_spread_expr<'a>(
+    mut expr: ast::Expr<'a>,
+    out: &mut Vec<&'a SyntaxNode>,
+    depth: usize,
+) -> bool {
+    if depth >= 8 {
+        return false;
+    }
+    while let ast::Expr::Parenthesized(paren) = expr {
+        expr = paren.expr();
+    }
+    let ast::Expr::Array(array) = expr else {
+        return false;
+    };
+    for item in array.items() {
+        match item {
+            ast::ArrayItem::Pos(inner) => out.push(inner.to_untyped()),
+            ast::ArrayItem::Spread(spread) => {
+                if !expand_list_spread_expr(spread.expr(), out, depth + 1) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 fn convert_list_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, is_enumerate: bool) {
+    let mut item_nodes: Vec<&SyntaxNode> = Vec::new();
+    let mut has_unresolved_spread = false;
+    if let Some(args) = children.get(1).and_then(|node| node.cast::<ast::Args>()) {
+        for item in args.items() {
+            match item {
+                ast::Arg::Pos(expr) => item_nodes.push(expr.to_untyped()),
+                ast::Arg::Spread(spread) => {
+                    if !expand_list_spread_expr(spread.expr(), &mut item_nodes, 0) {
+                        has_unresolved_spread = true;
+                    }
+                }
+                ast::Arg::Named(_) => {}
+            }
+        }
+    }
+    for child in children.iter().skip(2) {
+        if child.kind() == SyntaxKind::ContentBlock {
+            item_nodes.push(child);
+        }
+    }
+
+    if has_unresolved_spread {
+        preserve_unconverted_layout("could not expand spread argument", children, ctx);
+        return;
+    }
+    if item_nodes.is_empty() {
+        return;
+    }
+
+    if ctx.is_in_env(&EnvironmentContext::Table) {
+        let start = FuncArgs::from_func_call(children)
+            .named_usize("start")
+            .and_then(|n| u64::try_from(n).ok())
+            .unwrap_or(1);
+        let mut counter = TableEnumCounter::new(start);
+        let mut items = Vec::new();
+        for item in item_nodes {
+            let body = collapse_table_text(&render_in_table_cell(ctx, |item_ctx| {
+                convert_markup_node(item, item_ctx);
+            }));
+            let marker = if is_enumerate {
+                counter.next_marker(None)
+            } else {
+                "\\textbullet~".to_string()
+            };
+            items.push(format_table_list_entry(&marker, &body));
+        }
+        emit_table_cell_lines(items, ctx);
+        return;
+    }
+
     let env_name = if is_enumerate { "enumerate" } else { "itemize" };
     let env = if is_enumerate {
         EnvironmentContext::Enumerate
@@ -2217,53 +2308,49 @@ fn convert_list_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, is_
         EnvironmentContext::Itemize
     };
 
-    ctx.ensure_paragraph_break();
+    let nested_in_list = ctx.is_in_env(&EnvironmentContext::Itemize)
+        || ctx.is_in_env(&EnvironmentContext::Enumerate);
+    if nested_in_list {
+        ctx.newline();
+    } else {
+        ctx.ensure_paragraph_break();
+    }
     ctx.push(&ctx.list_indent());
     ctx.push_line(&format!("\\begin{{{}}}", env_name));
 
     ctx.push_env(env);
 
     // Process list items
-    if let Some(args) = children.get(1) {
-        for child in args.children() {
-            match child.kind() {
-                SyntaxKind::ContentBlock | SyntaxKind::Markup => {
-                    ctx.push(&ctx.list_indent());
-                    ctx.push("  \\item ");
-
-                    let mut item_ctx = ConvertContext::new();
-                    item_ctx.list_depth = ctx.list_depth;
-                    convert_markup_node(child, &mut item_ctx);
-                    let item_text = item_ctx.finish_into(ctx);
-                    ctx.push(&item_text);
-                    ctx.newline();
-                }
-                SyntaxKind::FuncCall => {
-                    // Might be a nested list
-                    let func_children: Vec<&SyntaxNode> = child.children().collect();
-                    if !func_children.is_empty() {
-                        let func_name = func_children[0].text().to_string();
-                        if func_name == "list" {
-                            convert_list_to_latex(&func_children, ctx, false);
-                        } else if func_name == "enum" {
-                            convert_list_to_latex(&func_children, ctx, true);
-                        } else {
-                            ctx.push(&ctx.list_indent());
-                            ctx.push("  \\item ");
-                            convert_markup_node(child, ctx);
-                            ctx.newline();
-                        }
-                    }
-                }
-                _ => {
-                    let text = get_simple_text(child);
-                    if !text.is_empty() && text != "," {
+    for child in item_nodes {
+        match child.kind() {
+            SyntaxKind::FuncCall => {
+                // Might be a nested list
+                let func_children: Vec<&SyntaxNode> = child.children().collect();
+                if !func_children.is_empty() {
+                    let func_name = func_children[0].text().to_string();
+                    if func_name == "list" || func_name == "enum" {
+                        ctx.push(&ctx.list_indent());
+                        ctx.push_line("  \\item");
+                        convert_list_to_latex(&func_children, ctx, func_name == "enum");
+                    } else {
                         ctx.push(&ctx.list_indent());
                         ctx.push("  \\item ");
-                        ctx.push(&escape_latex_text(&text));
+                        convert_markup_node(child, ctx);
                         ctx.newline();
                     }
                 }
+            }
+            _ => {
+                ctx.push(&ctx.list_indent());
+                ctx.push("  \\item ");
+
+                let mut item_ctx = ConvertContext::new();
+                item_ctx.options = ctx.options.clone();
+                item_ctx.list_depth = ctx.list_depth;
+                convert_markup_node(child, &mut item_ctx);
+                let item_text = item_ctx.finish_into(ctx);
+                ctx.push(&item_text);
+                ctx.newline();
             }
         }
     }
@@ -2302,6 +2389,10 @@ fn convert_raw_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
     }
 
     if is_block || content.contains('\n') {
+        if ctx.is_in_env(&EnvironmentContext::Table) {
+            emit_table_raw_code(&content, ctx);
+            return;
+        }
         ctx.ensure_paragraph_break();
         if !lang.is_empty() && is_listings_supported(&lang) {
             // Use listings package with language (only if supported)
@@ -2343,12 +2434,305 @@ fn convert_list_item(node: &SyntaxNode, ctx: &mut ConvertContext) {
     ctx.newline();
 }
 
+fn is_list_group_trivia(node: &SyntaxNode) -> bool {
+    matches!(
+        node.kind(),
+        SyntaxKind::Space
+            | SyntaxKind::Parbreak
+            | SyntaxKind::LineComment
+            | SyntaxKind::BlockComment
+    )
+}
+
+fn collect_following_kind<'a>(
+    children: &[&'a SyntaxNode],
+    i: &mut usize,
+    kind: SyntaxKind,
+    mut on_item: impl FnMut(&'a SyntaxNode),
+) {
+    while *i < children.len() {
+        let mut next_idx = *i;
+        while children
+            .get(next_idx)
+            .is_some_and(|c| is_list_group_trivia(c))
+        {
+            next_idx += 1;
+        }
+        if let Some(&item) = children.get(next_idx).filter(|c| c.kind() == kind) {
+            on_item(item);
+            *i = next_idx + 1;
+        } else {
+            break;
+        }
+    }
+}
+
+fn format_table_list_entry(marker: &str, body: &str) -> String {
+    if body.is_empty() {
+        marker.trim_end_matches('~').to_string()
+    } else {
+        format!("{marker}{body}")
+    }
+}
+
+fn render_in_table_cell(
+    ctx: &mut ConvertContext,
+    render: impl FnOnce(&mut ConvertContext),
+) -> String {
+    let mut inner = ConvertContext::new();
+    inner.options = ctx.options.clone();
+    inner.push_env(EnvironmentContext::Table);
+    render(&mut inner);
+    inner.finish_into(ctx)
+}
+
+fn render_table_list_item(node: &SyntaxNode, marker: &str, ctx: &mut ConvertContext) -> String {
+    let body = collapse_table_text(&render_in_table_cell(ctx, |inner| {
+        for child in node.children() {
+            if !matches!(
+                child.kind(),
+                SyntaxKind::ListMarker | SyntaxKind::EnumMarker
+            ) {
+                convert_markup_node(child, inner);
+            }
+        }
+    }));
+    format_table_list_entry(marker, &body)
+}
+
+fn escape_latex_table_code_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut plain = String::new();
+    let chars: Vec<char> = line.chars().collect();
+    let mut at_line_start = true;
+
+    for (idx, &ch) in chars.iter().enumerate() {
+        match ch {
+            ' ' => {
+                let prev_space = idx > 0 && chars[idx - 1] == ' ';
+                let next_space = chars.get(idx + 1).copied() == Some(' ');
+                if at_line_start || prev_space || next_space {
+                    if !plain.is_empty() {
+                        out.push_str(&escape_latex_text(&plain));
+                        plain.clear();
+                    }
+                    out.push('~');
+                } else {
+                    plain.push(' ');
+                }
+            }
+            '\t' => {
+                if !plain.is_empty() {
+                    out.push_str(&escape_latex_text(&plain));
+                    plain.clear();
+                }
+                out.push_str("~~~~");
+            }
+            other => {
+                at_line_start = false;
+                plain.push(other);
+            }
+        }
+    }
+    if !plain.is_empty() {
+        out.push_str(&escape_latex_text(&plain));
+    }
+    out
+}
+
+fn emit_table_raw_code(text: &str, ctx: &mut ConvertContext) {
+    let trimmed = text.trim_matches(['\r', '\n']);
+    if trimmed.is_empty() {
+        emit_table_cell_lines(vec!["\\texttt{}".to_string()], ctx);
+        return;
+    }
+    let lines: Vec<String> = trimmed
+        .split('\n')
+        .map(|line| {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if line.is_empty() {
+                "\\strut".to_string()
+            } else {
+                format!("\\texttt{{{}}}", escape_latex_table_code_line(line))
+            }
+        })
+        .collect();
+    emit_table_cell_lines(lines, ctx);
+}
+
+fn has_unescaped_latex_comment(line: &str) -> bool {
+    let mut escaped = false;
+    for ch in line.chars() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '%' {
+            return true;
+        }
+    }
+    false
+}
+
+fn collapse_table_text(s: &str) -> String {
+    let mut out = String::new();
+    let mut prev_has_comment = false;
+    for line in s
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('%'))
+    {
+        if !out.is_empty() {
+            out.push(if prev_has_comment { '\n' } else { ' ' });
+        }
+        out.push_str(line);
+        prev_has_comment = has_unescaped_latex_comment(line);
+    }
+    if prev_has_comment {
+        out.push('\n');
+    }
+    out
+}
+
+fn emit_table_cell_lines(lines: Vec<String>, ctx: &mut ConvertContext) {
+    let lines: Vec<String> = lines.into_iter().filter(|line| !line.is_empty()).collect();
+    if lines.is_empty() {
+        return;
+    }
+    if !ctx.output.is_empty() && !ctx.output.ends_with(' ') && !ctx.output.ends_with('\n') {
+        ctx.push(" ");
+    }
+    if lines.len() == 1 {
+        ctx.push(&lines[0]);
+        ctx.last_token = TokenType::Text;
+    } else {
+        ctx.push("\\begin{tabular}[t]{@{}l@{}}");
+        ctx.push(&lines.join(" \\\\ "));
+        ctx.push("\\end{tabular}");
+        ctx.last_token = TokenType::Command;
+    }
+}
+
 fn push_escaped_latex_text(ctx: &mut ConvertContext, text: &str) {
     let escaped = escape_latex_text(text);
     if ctx.output.ends_with('-') && escaped.starts_with('-') {
         ctx.push("{}");
     }
     ctx.push(&escaped);
+}
+
+fn convert_markup_children(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
+    let mut i = 0;
+    while i < children.len() {
+        let child = children[i];
+        match child.kind() {
+            SyntaxKind::ListItem => {
+                if ctx.is_in_env(&EnvironmentContext::Table) {
+                    let mut items = vec![render_table_list_item(child, "\\textbullet~", ctx)];
+                    i += 1;
+                    collect_following_kind(children, &mut i, SyntaxKind::ListItem, |item| {
+                        items.push(render_table_list_item(item, "\\textbullet~", ctx));
+                    });
+                    emit_table_cell_lines(items, ctx);
+                } else {
+                    ctx.ensure_paragraph_break();
+                    ctx.push_line("\\begin{itemize}");
+                    ctx.indent_level += 1;
+
+                    while i < children.len()
+                        && (children[i].kind() == SyntaxKind::ListItem
+                            || is_list_group_trivia(children[i]))
+                    {
+                        if children[i].kind() == SyntaxKind::ListItem {
+                            convert_list_item(children[i], ctx);
+                        }
+                        i += 1;
+                    }
+
+                    ctx.indent_level -= 1;
+                    ctx.push_line("\\end{itemize}");
+                }
+            }
+            SyntaxKind::EnumItem => {
+                if ctx.is_in_env(&EnvironmentContext::Table) {
+                    let mut counter = TableEnumCounter::new(1);
+                    let mut items = Vec::new();
+                    let mut push_enum = |item: &SyntaxNode| {
+                        let explicit = item.cast::<ast::EnumItem>().and_then(|e| e.number());
+                        let marker = counter.next_marker(explicit);
+                        items.push(render_table_list_item(item, &marker, ctx));
+                    };
+                    push_enum(child);
+                    i += 1;
+                    collect_following_kind(children, &mut i, SyntaxKind::EnumItem, push_enum);
+                    emit_table_cell_lines(items, ctx);
+                } else {
+                    ctx.ensure_paragraph_break();
+                    ctx.push_line("\\begin{enumerate}");
+                    ctx.indent_level += 1;
+
+                    while i < children.len()
+                        && (children[i].kind() == SyntaxKind::EnumItem
+                            || is_list_group_trivia(children[i]))
+                    {
+                        if children[i].kind() == SyntaxKind::EnumItem {
+                            convert_enum_item(children[i], ctx);
+                        }
+                        i += 1;
+                    }
+
+                    ctx.indent_level -= 1;
+                    ctx.push_line("\\end{enumerate}");
+                }
+            }
+            SyntaxKind::FuncCall => {
+                let func_name = child
+                    .children()
+                    .next()
+                    .map(|n| n.text().to_string())
+                    .unwrap_or_default();
+
+                if func_name == "figure" {
+                    let mut label_text: Option<String> = None;
+                    let mut label_idx: Option<usize> = None;
+
+                    for (j, sibling) in children.iter().enumerate().skip(i + 1) {
+                        match sibling.kind() {
+                            SyntaxKind::Space | SyntaxKind::Linebreak => continue,
+                            SyntaxKind::Label => {
+                                let text = sibling.text().to_string();
+                                label_text = Some(
+                                    text.trim_start_matches('<')
+                                        .trim_end_matches('>')
+                                        .to_string(),
+                                );
+                                label_idx = Some(j);
+                                break;
+                            }
+                            _ => break,
+                        }
+                    }
+
+                    ctx.pending_label = label_text;
+                    convert_markup_node(child, ctx);
+                    ctx.pending_label = None;
+
+                    if let Some(j) = label_idx {
+                        i = j + 1;
+                    } else {
+                        i += 1;
+                    }
+                } else {
+                    convert_markup_node(child, ctx);
+                    i += 1;
+                }
+            }
+            _ => {
+                convert_markup_node(child, ctx);
+                i += 1;
+            }
+        }
+    }
 }
 
 /// Convert a single enum item (ordered)
