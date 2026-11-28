@@ -2497,16 +2497,22 @@ impl MiniEval {
             .vfs
             .read_text(resolved_path)
             .map_err(|e| EvalError::other(e.to_string()))?;
-        if self
-            .import_bytes_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |rem| {
-                rem.checked_sub(content.len())
-            })
-            .is_err()
-        {
-            return Err(EvalError::other(format!(
-                "maximum {kind} byte limit exceeded"
-            )));
+        let mut rem = self.import_bytes_remaining.load(Ordering::SeqCst);
+        loop {
+            let Some(next) = rem.checked_sub(content.len()) else {
+                return Err(EvalError::other(format!(
+                    "maximum {kind} byte limit exceeded"
+                )));
+            };
+            match self.import_bytes_remaining.compare_exchange_weak(
+                rem,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => rem = actual,
+            }
         }
         Ok(content)
     }
