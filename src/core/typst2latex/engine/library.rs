@@ -73,6 +73,7 @@ pub fn call_builtin(
         "regex" => builtin_regex(args).into(),
         "version" => builtin_version(args).into(),
         "label" => builtin_label(args).into(),
+        "selector" => builtin_selector(args).into(),
         "cite" => builtin_cite(args, named).into(),
         "ref" => builtin_ref(args).into(),
         "bibliography" => builtin_bibliography(args, named).into(),
@@ -122,6 +123,11 @@ pub fn call_builtin(
         "table.header" | "table.cell" | "table.hline" | "table.vline" => {
             builtin_layout_func(name, args, named).into()
         }
+        "strong" => builtin_strong(args).into(),
+        "emph" => builtin_emph(args).into(),
+        "raw" => builtin_raw(args, named).into(),
+        "list.item" => builtin_list_item(args, named).into(),
+        "enum.item" => builtin_enum_item(args, named).into(),
         "terms.item" => builtin_terms_item(args, named).into(),
         "h" => builtin_layout_func("h", args, named).into(),
         "v" => builtin_layout_func("v", args, named).into(),
@@ -271,7 +277,7 @@ fn builtin_repr(args: Vec<Value>) -> EvalResult<Value> {
 
 fn builtin_len(args: Vec<Value>) -> EvalResult<Value> {
     match args.as_slice() {
-        [Value::Str(s)] => Ok(Value::Int(s.chars().count() as i64)),
+        [Value::Str(s)] => Ok(Value::Int(s.len() as i64)),
         [Value::Array(arr)] => Ok(Value::Int(arr.len() as i64)),
         [Value::Dict(dict)] => Ok(Value::Int(dict.len() as i64)),
         [Value::Bytes(b)] => Ok(Value::Int(b.len() as i64)),
@@ -547,6 +553,22 @@ fn builtin_label(args: Vec<Value>) -> EvalResult<Value> {
         [value] => Ok(label_content_value(value_to_ref_target(value)?)),
         _ => Err(EvalError::argument(
             "label expects 1 string argument".to_string(),
+        )),
+    }
+}
+
+fn builtin_selector(args: Vec<Value>) -> EvalResult<Value> {
+    match args.as_slice() {
+        [value] => Selector::from_value(value)
+            .map(Value::Selector)
+            .ok_or_else(|| {
+                EvalError::type_mismatch(
+                    "selector, function, string, regex, or label",
+                    value.type_name(),
+                )
+            }),
+        _ => Err(EvalError::argument(
+            "selector expects 1 target argument".to_string(),
         )),
     }
 }
@@ -952,7 +974,7 @@ pub fn call_calc(name: &str, args: Vec<Value>) -> EvalResult<Value> {
 
 fn call_str_method(s: &str, method: &str, args: Vec<Value>) -> EvalResult<Value> {
     match method {
-        "len" => Ok(Value::Int(s.chars().count() as i64)),
+        "len" => Ok(Value::Int(s.len() as i64)),
         "contains" => {
             let needle = args
                 .first()
@@ -1508,36 +1530,43 @@ fn call_datetime_method(dt: &DateTime, method: &str, _args: Vec<Value>) -> EvalR
 
 fn call_content_method(c: &[ContentNode], method: &str, args: Vec<Value>) -> EvalResult<Value> {
     match method {
-        // Introspection: Get the element function name
+        // Introspection: Get the element function value
         "func" => {
-            if let Some(first) = c.first() {
-                let name = match first {
-                    ContentNode::Element { name, .. } => name.clone(),
-                    ContentNode::Heading { .. } => "heading".to_string(),
-                    ContentNode::Strong(_) => "strong".to_string(),
-                    ContentNode::Emph(_) => "emph".to_string(),
-                    ContentNode::Raw { .. } => "raw".to_string(),
-                    ContentNode::Math { .. } => "math".to_string(),
-                    ContentNode::ListItem(_) => "list.item".to_string(),
-                    ContentNode::EnumItem { .. } => "enum.item".to_string(),
-                    ContentNode::Text(_) => "text".to_string(),
-                    ContentNode::Space => "space".to_string(),
-                    ContentNode::Linebreak => "linebreak".to_string(),
-                    ContentNode::Parbreak => "parbreak".to_string(),
-                    ContentNode::Label(_) => "label".to_string(),
-                    ContentNode::Citation { .. } => "cite".to_string(),
-                    ContentNode::Reference { .. } => "ref".to_string(),
-                    ContentNode::LabelDef(_) => "label".to_string(),
-                    ContentNode::Bibliography { .. } => "bibliography".to_string(),
-                    ContentNode::FuncCall { name, .. } => name.clone(),
-                    ContentNode::RawSource(_) => "raw".to_string(),
-                    ContentNode::State { .. } => "state".to_string(),
-                    ContentNode::CounterDisplay { .. } => "counter".to_string(),
-                };
-                Ok(Value::Str(name))
-            } else {
-                Err(EvalError::other("empty content"))
+            if c.is_empty() {
+                return Err(EvalError::other("empty content"));
             }
+            if c.len() > 1 {
+                return Ok(Value::Func(Arc::new(Closure::builtin("sequence"))));
+            }
+            let first = match c[0].labeled_parts() {
+                Some((target, _, _, _)) => match target {
+                    [single] => single,
+                    _ => return Ok(Value::Func(Arc::new(Closure::builtin("sequence")))),
+                },
+                None => &c[0],
+            };
+            let name = match first {
+                ContentNode::Element { name, .. } => name.as_str(),
+                ContentNode::Heading { .. } => "heading",
+                ContentNode::Strong(_) => "strong",
+                ContentNode::Emph(_) => "emph",
+                ContentNode::Raw { .. } | ContentNode::RawSource(_) => "raw",
+                ContentNode::Math { .. } => "math.equation",
+                ContentNode::ListItem(_) => "list.item",
+                ContentNode::EnumItem { .. } => "enum.item",
+                ContentNode::Text(_) => "text",
+                ContentNode::Space => "space",
+                ContentNode::Linebreak => "linebreak",
+                ContentNode::Parbreak => "parbreak",
+                ContentNode::Label(_) | ContentNode::LabelDef(_) => "label",
+                ContentNode::Citation { .. } => "cite",
+                ContentNode::Reference { .. } => "ref",
+                ContentNode::Bibliography { .. } => "bibliography",
+                ContentNode::FuncCall { name, .. } => name.as_str(),
+                ContentNode::State { .. } => "state",
+                ContentNode::CounterDisplay { .. } => "counter",
+            };
+            Ok(Value::Func(Arc::new(Closure::builtin(name))))
         }
         // Introspection: Get all fields as a dictionary
         "fields" => {
@@ -1607,8 +1636,21 @@ fn call_content_method(c: &[ContentNode], method: &str, args: Vec<Value>) -> Eva
 
 /// Convert a ContentNode to its fields dictionary for introspection.
 fn content_node_to_fields(node: &ContentNode) -> IndexMap<String, Value> {
+    if let Some((target, _, label, _)) = node.labeled_parts() {
+        let mut fields = if target.len() == 1 {
+            content_node_to_fields(&target[0])
+        } else {
+            IndexMap::new()
+        };
+        fields.insert("label".to_string(), Value::Label(label.to_string()));
+        return fields;
+    }
     match node {
-        ContentNode::Element { fields, .. } => fields.clone(),
+        ContentNode::Element { fields, .. } => fields
+            .iter()
+            .filter(|(k, _)| !k.starts_with("__tylax_"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
         ContentNode::Heading { level, content } => {
             let mut fields = IndexMap::new();
             fields.insert("level".to_string(), Value::Int(*level as i64));
@@ -1729,6 +1771,9 @@ fn content_node_to_fields(node: &ContentNode) -> IndexMap<String, Value> {
 
 /// Extract plain text from a ContentNode for text() method.
 fn content_node_to_text(node: &ContentNode) -> String {
+    if let Some((target, _, _, _)) = node.labeled_parts() {
+        return target.iter().map(content_node_to_text).collect();
+    }
     if let Some((term, description)) = node.term_item_parts() {
         let mut text: String = term.iter().map(content_node_to_text).collect();
         let description: String = description.iter().map(content_node_to_text).collect();
@@ -1749,6 +1794,27 @@ fn content_node_to_text(node: &ContentNode) -> String {
         ContentNode::Heading { content, .. } => content.iter().map(content_node_to_text).collect(),
         ContentNode::Raw { text, .. } => text.clone(),
         ContentNode::Math { segments, .. } => render_math_segments_to_typst_source(segments),
+        ContentNode::Element { name, fields }
+            if matches!(name.as_str(), "list" | "enum" | "terms") =>
+        {
+            let Some(Value::Array(items)) = fields.get("children") else {
+                return String::new();
+            };
+            let mut out = String::new();
+            for item in items {
+                let text = match item {
+                    Value::Content(nodes) => {
+                        nodes.iter().map(content_node_to_text).collect::<String>()
+                    }
+                    other => other.display(),
+                };
+                if !out.is_empty() && !text.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&text);
+            }
+            out
+        }
         ContentNode::Element { fields, .. } => fields
             .get("body")
             .and_then(|v| {
@@ -1861,15 +1927,7 @@ fn call_func_method(f: &Arc<Closure>, method: &str, _args: Vec<Value>) -> EvalRe
         // Usage: heading.where(level: 1)
         "where" => {
             // The function name becomes the element name
-            let element_name = f
-                .name
-                .clone()
-                .map(|n| {
-                    n.trim_start_matches("<builtin:")
-                        .trim_end_matches('>')
-                        .to_string()
-                })
-                .unwrap_or_default();
+            let element_name = f.builtin_name().unwrap_or_default().to_string();
 
             // All arguments to .where() are named - they become filters
             // In this context, args would be named pairs, but since we receive Vec<Value>,
@@ -1892,61 +1950,37 @@ fn call_func_method(f: &Arc<Closure>, method: &str, _args: Vec<Value>) -> EvalRe
 /// Call methods on selectors (or, and, before, after).
 fn call_selector_method(s: &Selector, method: &str, args: Vec<Value>) -> EvalResult<Value> {
     match method {
-        // Union: selector.or(other)
-        "or" => {
-            let other = args
-                .first()
-                .ok_or(EvalError::argument("or expects a selector"))?;
-            if let Value::Selector(other_sel) = other {
-                Ok(Value::Selector(Selector::Or(
-                    Box::new(s.clone()),
-                    Box::new(other_sel.clone()),
-                )))
-            } else {
-                Err(EvalError::type_mismatch("selector", other.type_name()))
+        "or" | "and" => {
+            let mut acc = s.clone();
+            for arg in &args {
+                let other_sel = Selector::from_value(arg)
+                    .ok_or_else(|| EvalError::type_mismatch("selector", arg.type_name()))?;
+                acc = if method == "or" {
+                    Selector::Or(Box::new(acc), Box::new(other_sel))
+                } else {
+                    Selector::And(Box::new(acc), Box::new(other_sel))
+                };
             }
+            Ok(Value::Selector(acc))
         }
-        // Intersection: selector.and(other)
-        "and" => {
-            let other = args
-                .first()
-                .ok_or(EvalError::argument("and expects a selector"))?;
-            if let Value::Selector(other_sel) = other {
-                Ok(Value::Selector(Selector::And(
-                    Box::new(s.clone()),
-                    Box::new(other_sel.clone()),
-                )))
-            } else {
-                Err(EvalError::type_mismatch("selector", other.type_name()))
+        "before" | "after" => {
+            if args.len() != 1 {
+                return Err(EvalError::argument(format!(
+                    "{method} expects 1 selector argument"
+                )));
             }
-        }
-        // Context selector: selector.before(other)
-        "before" => {
-            let other = args
-                .first()
-                .ok_or(EvalError::argument("before expects a selector"))?;
-            if let Value::Selector(other_sel) = other {
-                Ok(Value::Selector(Selector::Before(
-                    Box::new(s.clone()),
-                    Box::new(other_sel.clone()),
-                )))
+            let other = &args[0];
+            let other_sel = Selector::from_value(other)
+                .ok_or_else(|| EvalError::type_mismatch("selector", other.type_name()))?;
+            let ctor = if method == "before" {
+                Selector::Before
             } else {
-                Err(EvalError::type_mismatch("selector", other.type_name()))
-            }
-        }
-        // Context selector: selector.after(other)
-        "after" => {
-            let other = args
-                .first()
-                .ok_or(EvalError::argument("after expects a selector"))?;
-            if let Value::Selector(other_sel) = other {
-                Ok(Value::Selector(Selector::After(
-                    Box::new(s.clone()),
-                    Box::new(other_sel.clone()),
-                )))
-            } else {
-                Err(EvalError::type_mismatch("selector", other.type_name()))
-            }
+                Selector::After
+            };
+            Ok(Value::Selector(ctor(
+                Box::new(s.clone()),
+                Box::new(other_sel),
+            )))
         }
         _ => Err(EvalError::invalid_op(format!(
             "selector has no method '{}'",
@@ -1973,6 +2007,103 @@ fn builtin_layout_func(
         name: name.to_string(),
         args: func_args,
     }]))
+}
+
+/// Build a strong (`*body*`) content node.
+fn builtin_strong(args: Vec<Value>) -> EvalResult<Value> {
+    let mut iter = args.into_iter();
+    let body = iter
+        .next()
+        .ok_or_else(|| EvalError::argument("strong expects 1 body argument".to_string()))?;
+    if iter.next().is_some() {
+        return Err(EvalError::argument(
+            "strong expects 1 positional argument".to_string(),
+        ));
+    }
+    Ok(Value::Content(vec![ContentNode::Strong(
+        body.into_content(),
+    )]))
+}
+
+/// Build an emph (`_body_`) content node.
+fn builtin_emph(args: Vec<Value>) -> EvalResult<Value> {
+    let mut iter = args.into_iter();
+    let body = iter
+        .next()
+        .ok_or_else(|| EvalError::argument("emph expects 1 body argument".to_string()))?;
+    if iter.next().is_some() {
+        return Err(EvalError::argument(
+            "emph expects 1 positional argument".to_string(),
+        ));
+    }
+    Ok(Value::Content(vec![ContentNode::Emph(body.into_content())]))
+}
+
+/// Build a raw code block/inline content node.
+fn builtin_raw(args: Vec<Value>, named: IndexMap<String, Value>) -> EvalResult<Value> {
+    let mut iter = args.into_iter();
+    let text_val = iter
+        .next()
+        .ok_or_else(|| EvalError::argument("raw expects 1 text argument".to_string()))?;
+    if iter.next().is_some() {
+        return Err(EvalError::argument(
+            "raw expects 1 positional argument".to_string(),
+        ));
+    }
+    let text = match text_val {
+        Value::Str(s) => s,
+        other => other.display(),
+    };
+    let lang = named.get("lang").and_then(|v| match v {
+        Value::None | Value::Auto => None,
+        Value::Str(s) => Some(s.clone()),
+        other => Some(other.display()),
+    });
+    let block = named
+        .get("block")
+        .and_then(|v| v.as_bool().ok())
+        .unwrap_or(false);
+    Ok(Value::Content(vec![ContentNode::Raw { text, lang, block }]))
+}
+
+/// Build a bullet list item node for `list.item(body)`.
+fn builtin_list_item(args: Vec<Value>, named: IndexMap<String, Value>) -> EvalResult<Value> {
+    if !named.is_empty() || args.len() != 1 {
+        return Err(EvalError::argument(
+            "list.item expects 1 positional argument".to_string(),
+        ));
+    }
+    let body = args.into_iter().next().unwrap().into_content();
+    Ok(Value::Content(vec![ContentNode::ListItem(body)]))
+}
+
+/// Build a numbered list item node for `enum.item(body)` or `enum.item(number, body)`.
+fn builtin_enum_item(args: Vec<Value>, named: IndexMap<String, Value>) -> EvalResult<Value> {
+    if !named.is_empty() {
+        return Err(EvalError::argument(
+            "enum.item does not accept named arguments".to_string(),
+        ));
+    }
+    let mut iter = args.into_iter();
+    match (iter.next(), iter.next(), iter.next()) {
+        (Some(body), None, None) => Ok(Value::Content(vec![ContentNode::EnumItem {
+            number: None,
+            content: body.into_content(),
+        }])),
+        (Some(num), Some(body), None) => {
+            let number = match num {
+                Value::Auto | Value::None => None,
+                other => Some(other.as_int()?),
+            };
+            Ok(Value::Content(vec![ContentNode::EnumItem {
+                number,
+                content: body.into_content(),
+            }]))
+        }
+        _ => Err(EvalError::argument(
+            "enum.item expects 1 or 2 positional arguments".to_string(),
+        )),
+    }
 }
 
 /// Build an evaluated term-list item node for `#terms.item(term, description)`.

@@ -3,9 +3,15 @@
 //! Handles document structure, text formatting, and non-math content.
 
 use super::context::{ConvertContext, EnvironmentContext, T2LOptions, TokenType};
-use super::engine::{render_math_segments_to_typst_source, ContentNode};
+use super::engine::{
+    render_math_segments_to_typst_source, ContentNode, DUP_ELEMENT_NAME, DUP_SNAPSHOT_NAME,
+    REF_ANCHOR_ELEMENT_NAME,
+};
 use super::math::convert_math_node;
-use super::supplement::{mark_at_reference, mark_reference};
+use super::supplement::{
+    custom_figure_counter_name, default_custom_figure_supplement, mark_at_reference,
+    mark_reference, node_contains_call, unwrap_balanced_parens,
+};
 use super::table::{
     infer_table_columns, is_empty_spread, is_none_value, table_rule, LatexCell, LatexCellAlign,
     LatexHLine, LatexTableGenerator, MAX_TABLE_COLUMNS,
@@ -24,8 +30,531 @@ use crate::features::refs::{
     CiteGroup, Reference,
 };
 use crate::tikz::{convert_cetz_to_tikz, is_cetz_code};
+use std::cell::RefCell;
 use typst_syntax::ast::{self, AstNode};
 use typst_syntax::{SyntaxKind, SyntaxNode};
+
+#[derive(Debug, Clone)]
+enum MarkupMarkerSpec {
+    Single(String),
+    Cycle(Vec<String>),
+}
+
+#[derive(Debug, Clone, Default)]
+struct MarkupStyleFrame {
+    list_marker: Option<MarkupMarkerSpec>,
+    enum_start: Option<u64>,
+    enum_numbering: Option<String>,
+    heading_unnumbered: bool,
+    figure_unnumbered: bool,
+    itemize_depth: usize,
+    enum_depth: usize,
+}
+
+thread_local! {
+    static MARKUP_STYLE_STACK: RefCell<Vec<MarkupStyleFrame>> = const { RefCell::new(Vec::new()) };
+}
+
+struct MarkupStyleGuard;
+
+impl Drop for MarkupStyleGuard {
+    fn drop(&mut self) {
+        MARKUP_STYLE_STACK.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+}
+
+pub(crate) fn with_fresh_markup_styles<R>(f: impl FnOnce() -> R) -> R {
+    MARKUP_STYLE_STACK.with(|stack| {
+        stack.borrow_mut().push(MarkupStyleFrame::default());
+    });
+    let _guard = MarkupStyleGuard;
+    f()
+}
+
+fn with_scoped_markup_styles<R>(f: impl FnOnce() -> R) -> R {
+    MARKUP_STYLE_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let top = stack.last().cloned().unwrap_or_default();
+        stack.push(top);
+    });
+    let _guard = MarkupStyleGuard;
+    f()
+}
+
+struct ListDepthGuard {
+    is_enum: bool,
+    tracked: bool,
+}
+
+impl Drop for ListDepthGuard {
+    fn drop(&mut self) {
+        if !self.tracked {
+            return;
+        }
+        MARKUP_STYLE_STACK.with(|stack| {
+            if let Some(frame) = stack.borrow_mut().last_mut() {
+                if self.is_enum {
+                    frame.enum_depth = frame.enum_depth.saturating_sub(1);
+                } else {
+                    frame.itemize_depth = frame.itemize_depth.saturating_sub(1);
+                }
+            }
+        });
+    }
+}
+
+fn enter_list_depth(is_enum: bool) -> (usize, ListDepthGuard) {
+    let (depth, tracked) = MARKUP_STYLE_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if let Some(frame) = stack.last_mut() {
+            let d = if is_enum {
+                let d = frame.enum_depth;
+                frame.enum_depth += 1;
+                d
+            } else {
+                let d = frame.itemize_depth;
+                frame.itemize_depth += 1;
+                d
+            };
+            (d, true)
+        } else {
+            (0, false)
+        }
+    });
+    (depth, ListDepthGuard { is_enum, tracked })
+}
+
+fn resolve_marker_at_depth(spec: &MarkupMarkerSpec, depth: usize) -> String {
+    match spec {
+        MarkupMarkerSpec::Single(s) => s.clone(),
+        MarkupMarkerSpec::Cycle(items) => {
+            if items.is_empty() {
+                String::new()
+            } else {
+                items[depth % items.len()].clone()
+            }
+        }
+    }
+}
+
+fn active_list_marker(depth: usize) -> Option<String> {
+    MARKUP_STYLE_STACK.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .and_then(|f| f.list_marker.as_ref())
+            .map(|spec| resolve_marker_at_depth(spec, depth))
+    })
+}
+
+fn active_enum_start() -> Option<u64> {
+    MARKUP_STYLE_STACK.with(|stack| stack.borrow().last().and_then(|f| f.enum_start))
+}
+
+fn active_enum_numbering() -> Option<String> {
+    MARKUP_STYLE_STACK.with(|stack| stack.borrow().last().and_then(|f| f.enum_numbering.clone()))
+}
+
+fn active_heading_unnumbered() -> bool {
+    MARKUP_STYLE_STACK.with(|stack| stack.borrow().last().is_some_and(|f| f.heading_unnumbered))
+}
+
+fn active_figure_unnumbered() -> bool {
+    MARKUP_STYLE_STACK.with(|stack| stack.borrow().last().is_some_and(|f| f.figure_unnumbered))
+}
+
+fn format_latex_list_item_prefix(marker: Option<&str>) -> String {
+    match marker {
+        None => "\\item ".to_string(),
+        Some("") => "\\item[] ".to_string(),
+        Some(m) if m.contains(']') => format!("\\item[{{{m}}}] "),
+        Some(m) => format!("\\item[{m}] "),
+    }
+}
+
+fn format_table_list_marker(marker: Option<&str>) -> String {
+    match marker {
+        None => "\\textbullet~".to_string(),
+        Some("") => String::new(),
+        Some(m) => format!("{m}~"),
+    }
+}
+
+fn latex_enum_counter_name(depth: usize) -> &'static str {
+    match depth {
+        0 => "enumi",
+        1 => "enumii",
+        2 => "enumiii",
+        _ => "enumiv",
+    }
+}
+
+fn emit_enum_start_counter(
+    indent: &str,
+    depth: usize,
+    start: Option<u64>,
+    ctx: &mut ConvertContext,
+) {
+    if let Some(s) = start.filter(|&s| s != 1) {
+        if let Some(counter_val) = (s as i128).checked_sub(1) {
+            ctx.push(indent);
+            ctx.push_line(&format!(
+                "\\setcounter{{{}}}{{{}}}",
+                latex_enum_counter_name(depth),
+                counter_val
+            ));
+        }
+    }
+}
+
+fn emit_enum_item_counter_override(
+    indent: &str,
+    depth: usize,
+    explicit: Option<u64>,
+    next_expected: &mut Option<u64>,
+    ctx: &mut ConvertContext,
+) {
+    if let Some(n) = explicit {
+        if *next_expected != Some(n) {
+            if let Some(counter_val) = (n as i128).checked_sub(1) {
+                ctx.push(indent);
+                ctx.push_line(&format!(
+                    "\\setcounter{{{}}}{{{}}}",
+                    latex_enum_counter_name(depth),
+                    counter_val
+                ));
+            }
+        }
+        *next_expected = n.checked_add(1);
+    } else {
+        *next_expected = next_expected.and_then(|v| v.checked_add(1));
+    }
+}
+
+fn is_enum_numbering_token(ch: char) -> bool {
+    matches!(ch, '1' | 'a' | 'A' | 'i' | 'I')
+}
+
+fn typst_enum_token_to_latex_macro(token: char, counter: &str) -> String {
+    match token {
+        'I' => format!("\\Roman{{{counter}}}"),
+        'i' => format!("\\roman{{{counter}}}"),
+        'A' => format!("\\Alph{{{counter}}}"),
+        'a' => format!("\\alph{{{counter}}}"),
+        _ => format!("\\arabic{{{counter}}}"),
+    }
+}
+
+fn typst_enum_numbering_to_latex_label(pattern: &str, depth: usize) -> Option<String> {
+    let token_count = pattern
+        .chars()
+        .filter(|&c| is_enum_numbering_token(c))
+        .count();
+    if token_count == 0 {
+        return None;
+    }
+
+    let mut out = String::new();
+    let mut literal = String::new();
+    let flush_literal = |out: &mut String, literal: &mut String| {
+        if !literal.is_empty() {
+            out.push_str(&escape_latex_text(literal));
+            literal.clear();
+        }
+    };
+
+    if token_count == 1 {
+        let counter = latex_enum_counter_name(depth);
+        for ch in pattern.chars() {
+            if is_enum_numbering_token(ch) {
+                flush_literal(&mut out, &mut literal);
+                out.push_str(&typst_enum_token_to_latex_macro(ch, counter));
+            } else {
+                literal.push(ch);
+            }
+        }
+        flush_literal(&mut out, &mut literal);
+        if depth == 0 && out == "\\arabic{enumi}." {
+            return None;
+        }
+        return Some(out);
+    }
+
+    let target_tokens = (depth + 1).min(token_count);
+    let mut seen_tokens = 0usize;
+    for ch in pattern.chars() {
+        if is_enum_numbering_token(ch) {
+            if seen_tokens >= target_tokens {
+                break;
+            }
+            flush_literal(&mut out, &mut literal);
+            out.push_str(&typst_enum_token_to_latex_macro(
+                ch,
+                latex_enum_counter_name(seen_tokens),
+            ));
+            seen_tokens += 1;
+        } else {
+            literal.push(ch);
+        }
+    }
+    flush_literal(&mut out, &mut literal);
+    Some(out)
+}
+
+fn emit_enum_numbering_cmd(
+    indent: &str,
+    depth: usize,
+    numbering: Option<&str>,
+    ctx: &mut ConvertContext,
+) {
+    if let Some(label_fmt) =
+        numbering.and_then(|pat| typst_enum_numbering_to_latex_label(pat, depth))
+    {
+        ctx.push(indent);
+        ctx.push_line(&format!(
+            "\\renewcommand{{\\label{}}}{{{}}}",
+            latex_enum_counter_name(depth),
+            label_fmt
+        ));
+    }
+}
+
+fn format_roman_numeral(mut n: u64, upper: bool) -> String {
+    if n == 0 || n >= 4000 {
+        return n.to_string();
+    }
+    const TABLE: &[(u64, &str)] = &[
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ];
+    let mut out = String::new();
+    for &(val, sym) in TABLE {
+        while n >= val {
+            out.push_str(sym);
+            n -= val;
+        }
+    }
+    if upper {
+        out.to_uppercase()
+    } else {
+        out
+    }
+}
+
+fn format_alpha_numeral(n: u64, upper: bool) -> String {
+    if n == 0 || n > 26 {
+        return n.to_string();
+    }
+    let base = if upper { b'A' } else { b'a' };
+    ((base + (n as u8 - 1)) as char).to_string()
+}
+
+fn format_enum_number_with_pattern(n: u64, pattern: Option<&str>) -> String {
+    let Some(pat) = pattern else {
+        return format!("{n}.~");
+    };
+    if !pat.chars().any(is_enum_numbering_token) {
+        return format!("{n}.~");
+    }
+    let mut out = String::new();
+    let mut replaced = false;
+    let mut literal = String::new();
+    let flush_lit = |out: &mut String, literal: &mut String| {
+        if !literal.is_empty() {
+            out.push_str(&escape_latex_text(literal));
+            literal.clear();
+        }
+    };
+    for ch in pat.chars() {
+        if is_enum_numbering_token(ch) && !replaced {
+            flush_lit(&mut out, &mut literal);
+            replaced = true;
+            match ch {
+                'I' => out.push_str(&format_roman_numeral(n, true)),
+                'i' => out.push_str(&format_roman_numeral(n, false)),
+                'A' => out.push_str(&format_alpha_numeral(n, true)),
+                'a' => out.push_str(&format_alpha_numeral(n, false)),
+                _ => out.push_str(&n.to_string()),
+            }
+        } else if is_enum_numbering_token(ch) {
+            break;
+        } else {
+            literal.push(ch);
+        }
+    }
+    flush_lit(&mut out, &mut literal);
+    format!("{out}~")
+}
+
+fn render_marker_expr_to_latex(expr: ast::Expr<'_>, ctx: &ConvertContext) -> String {
+    let mut inner = ConvertContext::new();
+    inner.options = ctx.options.clone();
+    if let ast::Expr::Str(s) = expr {
+        push_escaped_latex_text(&mut inner, &s.get());
+    } else {
+        convert_markup_node(expr.to_untyped(), &mut inner);
+    }
+    collapse_table_text(&inner.finalize())
+}
+
+fn ast_expr_to_marker_spec(
+    mut expr: ast::Expr<'_>,
+    ctx: &ConvertContext,
+) -> Option<Option<MarkupMarkerSpec>> {
+    while let ast::Expr::Parenthesized(p) = expr {
+        expr = p.expr();
+    }
+    match expr {
+        ast::Expr::Auto(_) => Some(None),
+        ast::Expr::None(_) => Some(Some(MarkupMarkerSpec::Single(String::new()))),
+        ast::Expr::Closure(_) => None,
+        ast::Expr::Array(arr) => {
+            let mut markers = Vec::new();
+            for item in arr.items() {
+                if let ast::ArrayItem::Pos(inner) = item {
+                    markers.push(render_marker_expr_to_latex(inner, ctx));
+                }
+            }
+            if markers.is_empty() {
+                Some(Some(MarkupMarkerSpec::Single(String::new())))
+            } else {
+                Some(Some(MarkupMarkerSpec::Cycle(markers)))
+            }
+        }
+        other => Some(Some(MarkupMarkerSpec::Single(render_marker_expr_to_latex(
+            other, ctx,
+        )))),
+    }
+}
+
+fn valid_named_expr(named: ast::Named<'_>) -> Option<ast::Expr<'_>> {
+    if !named.to_untyped().errors().is_empty() {
+        return None;
+    }
+    let mut seen_colon = false;
+    for child in named.to_untyped().children() {
+        if !seen_colon {
+            if child.kind() == SyntaxKind::Colon {
+                seen_colon = true;
+            }
+            continue;
+        }
+        if let Some(expr) = child.cast::<ast::Expr>() {
+            return Some(expr);
+        }
+    }
+    None
+}
+
+fn apply_ast_set_rule(node: &SyntaxNode, ctx: &ConvertContext) {
+    let Some(rule) = node.cast::<ast::SetRule>() else {
+        return;
+    };
+    if rule.condition().is_some() {
+        return;
+    }
+    let ast::Expr::Ident(target) = rule.target() else {
+        return;
+    };
+    if super::scope_analysis::is_shadowed_node(target.to_untyped()) {
+        return;
+    }
+    let target_name = target.get().as_str();
+    for item in rule.args().items() {
+        let ast::Arg::Named(named) = item else {
+            continue;
+        };
+        let key = named.name().get().as_str();
+        let Some(val_expr) = valid_named_expr(named) else {
+            continue;
+        };
+        match (target_name, key) {
+            ("list", "marker") => {
+                if let Some(resolved) = ast_expr_to_marker_spec(val_expr, ctx) {
+                    MARKUP_STYLE_STACK.with(|stack| {
+                        if let Some(frame) = stack.borrow_mut().last_mut() {
+                            frame.list_marker = resolved;
+                        }
+                    });
+                }
+            }
+            ("enum", "start") => {
+                let mut inner = val_expr;
+                while let ast::Expr::Parenthesized(p) = inner {
+                    inner = p.expr();
+                }
+                let next_start = match inner {
+                    ast::Expr::Auto(_) | ast::Expr::None(_) => Some(None),
+                    ast::Expr::Int(i) => u64::try_from(i.get()).ok().map(Some),
+                    _ => None,
+                };
+                if let Some(start_val) = next_start {
+                    MARKUP_STYLE_STACK.with(|stack| {
+                        if let Some(frame) = stack.borrow_mut().last_mut() {
+                            frame.enum_start = start_val;
+                        }
+                    });
+                }
+            }
+            ("enum", "numbering") => {
+                let mut inner = val_expr;
+                while let ast::Expr::Parenthesized(p) = inner {
+                    inner = p.expr();
+                }
+                let next_numbering = match inner {
+                    ast::Expr::Auto(_) => Some(None),
+                    ast::Expr::Str(s) => Some(Some(s.get().to_string())),
+                    _ => None,
+                };
+                if let Some(num_val) = next_numbering {
+                    MARKUP_STYLE_STACK.with(|stack| {
+                        if let Some(frame) = stack.borrow_mut().last_mut() {
+                            frame.enum_numbering = num_val;
+                        }
+                    });
+                }
+            }
+            ("heading", "numbering") => {
+                let mut inner = val_expr;
+                while let ast::Expr::Parenthesized(p) = inner {
+                    inner = p.expr();
+                }
+                let unnumbered = matches!(inner, ast::Expr::None(_));
+                MARKUP_STYLE_STACK.with(|stack| {
+                    if let Some(frame) = stack.borrow_mut().last_mut() {
+                        frame.heading_unnumbered = unnumbered;
+                    }
+                });
+            }
+            ("figure", "numbering") => {
+                let mut inner = val_expr;
+                while let ast::Expr::Parenthesized(p) = inner {
+                    inner = p.expr();
+                }
+                let unnumbered = matches!(inner, ast::Expr::None(_));
+                MARKUP_STYLE_STACK.with(|stack| {
+                    if let Some(frame) = stack.borrow_mut().last_mut() {
+                        frame.figure_unnumbered = unnumbered;
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+}
 
 /// Languages supported by the listings package (case-insensitive check)
 /// This is a subset of commonly used languages that listings supports by default
@@ -168,6 +697,127 @@ fn emit_rendered_math(ctx: &mut ConvertContext, math_content: &str, is_block: bo
     ctx.last_token = TokenType::Command;
 }
 
+fn emit_evaluated_term_items<'a>(
+    ctx: &mut ConvertContext,
+    pairs: impl IntoIterator<Item = (&'a [ContentNode], &'a [ContentNode])>,
+) {
+    let pairs: Vec<_> = pairs.into_iter().collect();
+    if pairs.is_empty() {
+        return;
+    }
+    if ctx.is_in_env(&EnvironmentContext::Table) {
+        let items: Vec<String> = pairs
+            .into_iter()
+            .map(|(t, d)| {
+                render_table_term_entry(
+                    ctx,
+                    |c| convert_content_nodes_to_latex(t, c),
+                    |c| convert_content_nodes_to_latex(d, c),
+                )
+            })
+            .collect();
+        emit_table_cell_lines(items, ctx);
+    } else {
+        begin_description(ctx);
+        for (t, d) in pairs {
+            emit_description_item(
+                ctx,
+                |c| convert_content_nodes_to_latex(t, c),
+                |c| convert_content_nodes_to_latex(d, c),
+            );
+        }
+        end_description(ctx);
+    }
+}
+
+fn emit_refstepcounter(counter: &str, ctx: &mut ConvertContext) {
+    if counter.starts_with("tylaxfig") {
+        ctx.push(&format!(
+            "\\ifcsname c@{counter}\\endcsname\\else\\newcounter{{{counter}}}\\fi"
+        ));
+    }
+    ctx.push(&format!("\\refstepcounter{{{counter}}}"));
+}
+
+const HEADING_COUNTERS: [&str; 5] = [
+    "section",
+    "subsection",
+    "subsubsection",
+    "paragraph",
+    "subparagraph",
+];
+
+fn emit_dup_snapshot(counter: &str, origin_id: usize, ctx: &mut ConvertContext) {
+    if HEADING_COUNTERS.contains(&counter) {
+        for c in HEADING_COUNTERS {
+            ctx.push_line(&format!(
+                "\\expandafter\\xdef\\csname tylaxorig:{origin_id}:{c}\\endcsname{{\\number\\value{{{c}}}}}%"
+            ));
+        }
+    } else if !counter.is_empty() {
+        ctx.push_line(&format!(
+            "\\ifcsname c@{counter}\\endcsname\\expandafter\\xdef\\csname tylaxorig:{origin_id}:{counter}\\endcsname{{\\number\\value{{{counter}}}}}\\fi%"
+        ));
+    }
+}
+
+fn emit_dup_counter_prefix(counter: &str, id: usize, origin_id: usize, ctx: &mut ConvertContext) {
+    ctx.ensure_paragraph_break();
+    ctx.push_line("\\begingroup%");
+    if let Some(level_idx) = HEADING_COUNTERS.iter().position(|&c| c == counter) {
+        for c in HEADING_COUNTERS {
+            ctx.push_line(&format!("\\edef\\tylaxsaved{c}{{\\number\\value{{{c}}}}}%"));
+        }
+        if origin_id > 0 {
+            ctx.push(&format!(
+                "\\ifcsname tylaxorig:{origin_id}:{counter}\\endcsname"
+            ));
+            for parent in &HEADING_COUNTERS[..level_idx] {
+                ctx.push(&format!(
+                    "\\setcounter{{{parent}}}{{\\csname tylaxorig:{origin_id}:{parent}\\endcsname}}"
+                ));
+            }
+            ctx.push_line(&format!(
+                "\\setcounter{{{counter}}}{{\\numexpr\\csname tylaxorig:{origin_id}:{counter}\\endcsname-1\\relax}}\\else\\addtocounter{{{counter}}}{{-1}}\\fi%"
+            ));
+        } else {
+            ctx.push_line(&format!("\\addtocounter{{{counter}}}{{-1}}%"));
+        }
+        ctx.push_line(&format!(
+            "\\ifcsname theH{counter}\\endcsname\\renewcommand{{\\theH{counter}}}{{tylaxdup{id}.\\arabic{{{counter}}}}}\\fi%"
+        ));
+    } else if !counter.is_empty() {
+        ctx.push_line(&format!(
+            "\\ifcsname c@{counter}\\endcsname\\edef\\tylaxsavedctr{{\\number\\value{{{counter}}}}}\\fi%"
+        ));
+        if origin_id > 0 {
+            ctx.push_line(&format!(
+                "\\ifcsname c@{counter}\\endcsname\\ifcsname tylaxorig:{origin_id}:{counter}\\endcsname\\setcounter{{{counter}}}{{\\numexpr\\csname tylaxorig:{origin_id}:{counter}\\endcsname-1\\relax}}\\else\\addtocounter{{{counter}}}{{-1}}\\fi\\fi%"
+            ));
+        } else {
+            ctx.push_line(&format!(
+                "\\ifcsname c@{counter}\\endcsname\\addtocounter{{{counter}}}{{-1}}\\fi%"
+            ));
+        }
+        ctx.push_line(&format!(
+            "\\ifcsname theH{counter}\\endcsname\\renewcommand{{\\theH{counter}}}{{tylaxdup{id}.\\arabic{{{counter}}}}}\\fi%"
+        ));
+    }
+}
+
+fn emit_dup_counter_suffix(counter: &str, ctx: &mut ConvertContext) {
+    if HEADING_COUNTERS.contains(&counter) {
+        for c in HEADING_COUNTERS {
+            ctx.push_line(&format!("\\setcounter{{{c}}}{{\\tylaxsaved{c}}}%"));
+        }
+    } else if !counter.is_empty() {
+        ctx.push_line(&format!(
+            "\\ifcsname c@{counter}\\endcsname\\ifdefined\\tylaxsavedctr\\setcounter{{{counter}}}{{\\tylaxsavedctr}}\\fi\\fi%"
+        ));
+    }
+    ctx.push_line("\\endgroup");
+}
+
 pub fn convert_content_nodes_to_latex(nodes: &[ContentNode], ctx: &mut ConvertContext) {
     let mut buffer = String::new();
 
@@ -188,38 +838,55 @@ pub fn convert_content_nodes_to_latex(nodes: &[ContentNode], ctx: &mut ConvertCo
         }
         after_list_item = node.is_ordinary_list_item();
 
+        if let Some((counter, _kind, label, step)) = node.ref_anchor_parts() {
+            flush_typst_chunk(&mut buffer, ctx);
+            if step && !counter.is_empty() {
+                emit_refstepcounter(counter, ctx);
+            }
+            if let Some(lbl) = label.filter(|l| !l.is_empty()) {
+                ctx.push(&label_to_latex(lbl));
+            }
+            ctx.last_token = TokenType::Command;
+            continue;
+        }
+
+        if let Some((counter, origin_id)) = node.dup_snapshot_parts() {
+            flush_typst_chunk(&mut buffer, ctx);
+            emit_dup_snapshot(counter, origin_id, ctx);
+            ctx.last_token = TokenType::Command;
+            continue;
+        }
+
+        if let Some((counter, id, origin_id, body)) = node.dup_element_parts() {
+            flush_typst_chunk(&mut buffer, ctx);
+            emit_dup_counter_prefix(counter, id, origin_id, ctx);
+            convert_content_nodes_to_latex(body, ctx);
+            emit_dup_counter_suffix(counter, ctx);
+            ctx.last_token = TokenType::Command;
+            continue;
+        }
+
+        if let Some(items) = node.terms_container_items() {
+            flush_typst_chunk(&mut buffer, ctx);
+            let pairs: Vec<_> = items
+                .iter()
+                .filter_map(ContentNode::term_item_parts)
+                .collect();
+            if pairs.len() == items.len() {
+                emit_evaluated_term_items(ctx, pairs);
+            } else {
+                convert_content_nodes_to_latex(&items, ctx);
+            }
+            continue;
+        }
+
         if let Some((term, description)) = node.term_item_parts() {
             flush_typst_chunk(&mut buffer, ctx);
-            if ctx.is_in_env(&EnvironmentContext::Table) {
-                let mut items = vec![render_table_term_entry(
-                    ctx,
-                    |c| convert_content_nodes_to_latex(term, c),
-                    |c| convert_content_nodes_to_latex(description, c),
-                )];
-                collect_following_evaluated_term_items(nodes, &mut i, |t, d| {
-                    items.push(render_table_term_entry(
-                        ctx,
-                        |c| convert_content_nodes_to_latex(t, c),
-                        |c| convert_content_nodes_to_latex(d, c),
-                    ));
-                });
-                emit_table_cell_lines(items, ctx);
-            } else {
-                begin_description(ctx);
-                emit_description_item(
-                    ctx,
-                    |c| convert_content_nodes_to_latex(term, c),
-                    |c| convert_content_nodes_to_latex(description, c),
-                );
-                collect_following_evaluated_term_items(nodes, &mut i, |t, d| {
-                    emit_description_item(
-                        ctx,
-                        |c| convert_content_nodes_to_latex(t, c),
-                        |c| convert_content_nodes_to_latex(d, c),
-                    );
-                });
-                end_description(ctx);
-            }
+            let mut pairs = vec![(term, description)];
+            collect_following_evaluated_term_items(nodes, &mut i, |t, d| {
+                pairs.push((t, d));
+            });
+            emit_evaluated_term_items(ctx, pairs);
             continue;
         }
         match node {
@@ -240,7 +907,7 @@ pub fn convert_content_nodes_to_latex(nodes: &[ContentNode], ctx: &mut ConvertCo
             ContentNode::Text(s) => {
                 flush_typst_chunk(&mut buffer, ctx);
                 if !s.is_empty() {
-                    if !s.trim().is_empty() {
+                    if !is_collapsible_ascii_whitespace(s) {
                         push_escaped_latex_text(ctx, s);
                         ctx.last_token = TokenType::Text;
                     } else if ctx.last_token != TokenType::Newline && !ctx.output.ends_with(' ') {
@@ -310,7 +977,27 @@ pub fn convert_content_nodes_to_latex(nodes: &[ContentNode], ctx: &mut ConvertCo
                 );
                 emit_rendered_math(ctx, &math_content, *block);
             }
-            other => buffer.push_str(&other.to_typst()),
+            other => {
+                if other.is_block_list_like() || other.is_heading() {
+                    buffer.truncate(buffer.trim_end_matches([' ', '\t']).len());
+                    if !buffer.is_empty() && !buffer.ends_with('\n') {
+                        buffer.push('\n');
+                    }
+                }
+                buffer.push_str(&other.to_typst_for_latex());
+                if matches!(other, ContentNode::FuncCall { name, .. } if name == "figure") {
+                    let mut scan = i;
+                    while matches!(nodes.get(scan), Some(ContentNode::Space)) {
+                        scan += 1;
+                    }
+                    if let Some(ContentNode::Label(lbl) | ContentNode::LabelDef(lbl)) =
+                        nodes.get(scan)
+                    {
+                        buffer.push_str(&format!(" <{lbl}>"));
+                        i = scan + 1;
+                    }
+                }
+            }
         }
     }
 
@@ -475,7 +1162,7 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
             } else {
                 &text
             };
-            if !cleaned.trim().is_empty() {
+            if !is_collapsible_ascii_whitespace(cleaned) {
                 push_escaped_latex_text(ctx, cleaned);
                 ctx.last_token = TokenType::Text;
             } else if !cleaned.is_empty() && ctx.last_token != TokenType::Newline {
@@ -489,7 +1176,15 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
             }
         }
 
-        // Escape sequences: \$, \#, \%, etc.
+        SyntaxKind::Shorthand => {
+            if let Some(sh) = node.cast::<ast::Shorthand>() {
+                let mut buf = [0u8; 4];
+                push_escaped_latex_text(ctx, sh.get().encode_utf8(&mut buf));
+                ctx.last_token = TokenType::Text;
+            }
+        }
+
+        // Escape sequences: \$, \#, \%, \u{...}, etc.
         SyntaxKind::Escape => {
             let text = node.text().to_string();
             let decoded = node
@@ -498,26 +1193,7 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
             let escaped_char = decoded
                 .as_deref()
                 .unwrap_or_else(|| text.strip_prefix('\\').unwrap_or(&text));
-            // Map Typst escape to LaTeX escape
-            let latex = match escaped_char {
-                "$" => "\\$",
-                "#" => "\\#",
-                "%" => "\\%",
-                "&" => "\\&",
-                "_" => "\\_",
-                "{" => "\\{",
-                "}" => "\\}",
-                "\\" => "\\textbackslash{}",
-                "~" => "\\textasciitilde{}",
-                "^" => "\\textasciicircum{}",
-                "*" => "*",
-                "`" => "`",
-                _ => escaped_char,
-            };
-            if ctx.output.ends_with('-') && latex.starts_with('-') {
-                ctx.push("{}");
-            }
-            ctx.push(latex);
+            push_escaped_latex_text(ctx, escaped_char);
             ctx.last_token = TokenType::Text;
         }
 
@@ -556,6 +1232,9 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
 
             ctx.ensure_paragraph_break();
             ctx.push(section_cmd);
+            if active_heading_unnumbered() {
+                ctx.push("*");
+            }
             ctx.push("{");
 
             // Get heading content
@@ -662,34 +1341,61 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
         // Lists - these are now handled by the Markup case above
         // If we encounter them directly, we're likely in a nested context
         SyntaxKind::ListItem => {
+            let (depth, _depth_guard) = enter_list_depth(false);
+            let marker = active_list_marker(depth);
             if ctx.is_in_env(&EnvironmentContext::Table) {
-                let item = render_table_list_item(node, "\\textbullet~", ctx);
+                let table_marker = format_table_list_marker(marker.as_deref());
+                let item = render_table_list_item(node, &table_marker, ctx);
                 emit_table_cell_lines(vec![item], ctx);
             } else if ctx.in_list() {
                 // Check if we're already in an itemize environment
-                convert_list_item(node, ctx);
+                convert_list_item(node, ctx, marker.as_deref());
             } else {
                 // Standalone list item - wrap it in an environment
                 ctx.push_line("\\begin{itemize}");
-                convert_list_item(node, ctx);
+                convert_list_item(node, ctx, marker.as_deref());
                 ctx.push_line("\\end{itemize}");
             }
         }
 
         SyntaxKind::EnumItem => {
+            let (depth, _depth_guard) = enter_list_depth(true);
+            let start = active_enum_start();
+            let numbering = active_enum_numbering();
+            let explicit = node.cast::<ast::EnumItem>().and_then(|e| e.number());
             if ctx.is_in_env(&EnvironmentContext::Table) {
-                let num = node
-                    .cast::<ast::EnumItem>()
-                    .and_then(|e| e.number())
-                    .unwrap_or(1);
-                let item = render_table_list_item(node, &format!("{num}.~"), ctx);
+                let num = explicit.or(start).unwrap_or(1);
+                let marker = format_enum_number_with_pattern(num, numbering.as_deref());
+                let item = render_table_list_item(node, &marker, ctx);
                 emit_table_cell_lines(vec![item], ctx);
             } else if ctx.in_list() {
                 // Check if we're already in an enumerate environment
+                if let Some(n) = explicit {
+                    if let Some(counter_val) = (n as i128).checked_sub(1) {
+                        ctx.push_indent();
+                        ctx.push_line(&format!(
+                            "\\setcounter{{{}}}{{{}}}",
+                            latex_enum_counter_name(depth),
+                            counter_val
+                        ));
+                    }
+                }
                 convert_enum_item(node, ctx);
             } else {
                 // Standalone enum item - wrap it in an environment
                 ctx.push_line("\\begin{enumerate}");
+                emit_enum_numbering_cmd("", depth, numbering.as_deref(), ctx);
+                if explicit.is_none() {
+                    emit_enum_start_counter("", depth, start, ctx);
+                } else if let Some(n) = explicit.filter(|&n| n != 1) {
+                    if let Some(counter_val) = (n as i128).checked_sub(1) {
+                        ctx.push_line(&format!(
+                            "\\setcounter{{{}}}{{{}}}",
+                            latex_enum_counter_name(depth),
+                            counter_val
+                        ));
+                    }
+                }
                 convert_enum_item(node, ctx);
                 ctx.push_line("\\end{enumerate}");
             }
@@ -729,9 +1435,11 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
 
         // Content blocks
         SyntaxKind::ContentBlock => {
-            for child in node.children() {
-                convert_markup_node(child, ctx);
-            }
+            with_scoped_markup_styles(|| {
+                for child in node.children() {
+                    convert_markup_node(child, ctx);
+                }
+            });
         }
 
         // Code mode - process content, skip braces
@@ -743,16 +1451,23 @@ pub fn convert_markup_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
 
         // Code block {expr} - skip braces, process inner content
         SyntaxKind::CodeBlock => {
-            for child in node.children() {
-                // Skip the braces themselves
-                if child.kind() != SyntaxKind::LeftBrace && child.kind() != SyntaxKind::RightBrace {
-                    convert_markup_node(child, ctx);
+            with_scoped_markup_styles(|| {
+                for child in node.children() {
+                    // Skip the braces themselves
+                    if child.kind() != SyntaxKind::LeftBrace
+                        && child.kind() != SyntaxKind::RightBrace
+                    {
+                        convert_markup_node(child, ctx);
+                    }
                 }
-            }
+            });
         }
 
-        // Ignore set/show rules in markup (to avoid outputting them as text)
-        SyntaxKind::SetRule | SyntaxKind::ShowRule => {
+        // Track set rules for list/enum/heading and skip show rules
+        SyntaxKind::SetRule => {
+            apply_ast_set_rule(node, ctx);
+        }
+        SyntaxKind::ShowRule => {
             // Do nothing
         }
 
@@ -914,6 +1629,65 @@ pub fn convert_func_call_markup(node: &SyntaxNode, ctx: &mut ConvertContext) {
     }
 
     let func_name = children[0].text().to_string();
+
+    if func_name == REF_ANCHOR_ELEMENT_NAME {
+        let args = FuncArgs::from_func_call(&children);
+        let counter = args
+            .named_text("counter")
+            .map(|s| s.trim().trim_matches('"'))
+            .unwrap_or("");
+        let step = args.named_bool("step").unwrap_or(true);
+        let label = args
+            .named("label")
+            .map(normalize_label_like_text)
+            .filter(|l| !l.is_empty());
+        if step && !counter.is_empty() {
+            emit_refstepcounter(counter, ctx);
+        }
+        if let Some(lbl) = label {
+            ctx.push(&label_to_latex(&lbl));
+        }
+        ctx.last_token = TokenType::Command;
+        return;
+    }
+
+    if func_name == DUP_SNAPSHOT_NAME {
+        let args = FuncArgs::from_func_call(&children);
+        let counter = args
+            .named_text("counter")
+            .map(|s| s.trim().trim_matches('"'))
+            .unwrap_or("");
+        let origin_id = args.named_usize("id").unwrap_or(0);
+        emit_dup_snapshot(counter, origin_id, ctx);
+        ctx.last_token = TokenType::Command;
+        return;
+    }
+
+    if func_name == DUP_ELEMENT_NAME {
+        let args = FuncArgs::from_func_call(&children);
+        let counter = args
+            .named_text("counter")
+            .map(|s| s.trim().trim_matches('"'))
+            .unwrap_or("");
+        let id = args.named_usize("id").unwrap_or(1);
+        let origin_id = args.named_usize("origin").unwrap_or(0);
+        emit_dup_counter_prefix(counter, id, origin_id, ctx);
+        for arg in args.iter() {
+            if arg.is_positional {
+                if let Some(body) = arg.value_node {
+                    convert_markup_node(body, ctx);
+                }
+            }
+        }
+        for child in children.iter().skip(2) {
+            if child.kind() == SyntaxKind::ContentBlock {
+                convert_markup_node(child, ctx);
+            }
+        }
+        emit_dup_counter_suffix(counter, ctx);
+        ctx.last_token = TokenType::Command;
+        return;
+    }
 
     // Check if this is a math function that needs $ wrapping
     if is_math_func_in_markup(&func_name) {
@@ -1137,6 +1911,11 @@ fn handle_special_markup_func(func_name: &str, children: &[&SyntaxNode], ctx: &m
             convert_cetz_to_latex(children, ctx);
         }
 
+        // Headings
+        "heading" => {
+            convert_heading_func(children, ctx);
+        }
+
         // Lists
         "list" => {
             convert_list_to_latex(children, ctx, false);
@@ -1144,6 +1923,10 @@ fn handle_special_markup_func(func_name: &str, children: &[&SyntaxNode], ctx: &m
 
         "enum" => {
             convert_list_to_latex(children, ctx, true);
+        }
+
+        "terms" => {
+            convert_terms_func(children, ctx);
         }
 
         // Raw/verbatim blocks
@@ -1872,92 +2655,205 @@ fn preserve_unconverted_layout(reason: &str, children: &[&SyntaxNode], ctx: &mut
 // Enhanced Figure Conversion
 // ============================================================================
 
+fn unwrap_paren_syntax_node(mut node: &SyntaxNode) -> &SyntaxNode {
+    while node.kind() == SyntaxKind::Parenthesized {
+        let Some(inner) = node.children().find(|c| {
+            !matches!(
+                c.kind(),
+                SyntaxKind::LeftParen
+                    | SyntaxKind::RightParen
+                    | SyntaxKind::Space
+                    | SyntaxKind::Linebreak
+                    | SyntaxKind::Parbreak
+                    | SyntaxKind::LineComment
+                    | SyntaxKind::BlockComment
+            )
+        }) else {
+            break;
+        };
+        node = inner;
+    }
+    node
+}
+
+fn process_figure_positional_body(
+    child: &SyntaxNode,
+    ctx: &mut ConvertContext,
+    inferred_is_table: &mut bool,
+    content: &mut String,
+) {
+    let inner = unwrap_paren_syntax_node(child);
+    if node_contains_call(inner, &["table", "grid"]) {
+        *inferred_is_table = true;
+    }
+    let mut content_ctx = ConvertContext::new();
+    content_ctx.options = ctx.options.clone();
+    convert_markup_node(inner, &mut content_ctx);
+    let c = content_ctx.finish_into(ctx);
+    if !c.is_empty() {
+        *content = c;
+    }
+}
+
 fn convert_figure_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
     let mut caption: Option<String> = None;
     let mut label: Option<String> = None;
+    let mut explicit_supplement: Option<String> = None;
     let mut content = String::new();
-    let mut is_table = false;
+    let mut inferred_is_table = false;
+
+    let func_args = FuncArgs::from_func_call(children);
+    #[derive(Clone, PartialEq, Eq)]
+    enum ExplicitFigureKind {
+        Auto,
+        Image,
+        Table,
+        Custom(String),
+    }
+    let explicit_kind = func_args
+        .iter()
+        .filter(|arg| arg.name.as_deref() == Some("kind"))
+        .last()
+        .map(|arg| {
+            let cleaned = unwrap_balanced_parens(arg.value.trim())
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim();
+            match cleaned {
+                "" | "auto" => ExplicitFigureKind::Auto,
+                "table" => ExplicitFigureKind::Table,
+                "image" | "figure" => ExplicitFigureKind::Image,
+                other => ExplicitFigureKind::Custom(other.to_string()),
+            }
+        });
+    let unnumbered = match func_args
+        .iter()
+        .filter(|arg| arg.name.as_deref() == Some("numbering"))
+        .last()
+    {
+        Some(arg) => {
+            let trimmed = unwrap_balanced_parens(arg.value.trim());
+            if trimmed == "auto" {
+                active_figure_unnumbered()
+            } else {
+                trimmed == "none"
+            }
+        }
+        None => active_figure_unnumbered(),
+    };
 
     if let Some(args) = children.get(1) {
         for child in args.children() {
             match child.kind() {
                 SyntaxKind::Named => {
                     let named_children: Vec<_> = child.children().collect();
-                    // named_children typically: [Ident(key), Colon, Space, Content...]
-                    // We want to find the key, and then process the value part
                     if !named_children.is_empty() {
                         let key = named_children[0].text().to_string();
+                        let value_node = named_children.iter().find(|n| {
+                            n.kind() != SyntaxKind::Ident
+                                && n.kind() != SyntaxKind::Colon
+                                && n.kind() != SyntaxKind::Space
+                        });
                         match key.as_str() {
                             "caption" => {
-                                // Find value node (skip key, colon, whitespace)
-                                if let Some(value_node) = named_children.iter().find(|n| {
-                                    n.kind() != SyntaxKind::Ident
-                                        && n.kind() != SyntaxKind::Colon
-                                        && n.kind() != SyntaxKind::Space
-                                }) {
-                                    let mut cap_ctx = ConvertContext::new();
-                                    convert_markup_node(value_node, &mut cap_ctx);
-                                    caption = Some(cap_ctx.finish_into(ctx));
+                                if let Some(value_node) = value_node {
+                                    let unwrapped = unwrap_paren_syntax_node(value_node);
+                                    if unwrapped.kind() == SyntaxKind::None
+                                        || matches!(
+                                            unwrap_balanced_parens(unwrapped.text().trim()),
+                                            "none" | "auto"
+                                        )
+                                    {
+                                        caption = None;
+                                    } else {
+                                        let mut cap_ctx = ConvertContext::new();
+                                        cap_ctx.options = ctx.options.clone();
+                                        convert_markup_node(unwrapped, &mut cap_ctx);
+                                        caption = Some(cap_ctx.finish_into(ctx));
+                                    }
                                 }
                             }
-                            "label" | "supplement" => {
-                                if let Some(value_node) = named_children.iter().find(|n| {
-                                    n.kind() != SyntaxKind::Ident
-                                        && n.kind() != SyntaxKind::Colon
-                                        && n.kind() != SyntaxKind::Space
-                                }) {
+                            "label" => {
+                                if let Some(value_node) = value_node {
                                     label = Some(get_simple_text(value_node));
+                                }
+                            }
+                            "supplement" => {
+                                if let Some(value_node) = value_node {
+                                    let unwrapped = unwrap_paren_syntax_node(value_node);
+                                    let raw_trimmed =
+                                        unwrap_balanced_parens(unwrapped.text().trim());
+                                    if unwrapped.kind() == SyntaxKind::Auto || raw_trimmed == "auto"
+                                    {
+                                        explicit_supplement = None;
+                                    } else if unwrapped.kind() == SyntaxKind::None
+                                        || raw_trimmed == "none"
+                                    {
+                                        explicit_supplement = Some(String::new());
+                                    } else {
+                                        let mut supp_ctx = ConvertContext::new();
+                                        supp_ctx.options = ctx.options.clone();
+                                        convert_markup_node(unwrapped, &mut supp_ctx);
+                                        explicit_supplement =
+                                            Some(supp_ctx.finish_into(ctx).trim().to_string());
+                                    }
                                 }
                             }
                             _ => {}
                         }
                     }
                 }
-                SyntaxKind::FuncCall => {
-                    // Check if this is a table function
-                    let func_name = child
-                        .children()
-                        .next()
-                        .map(|n| n.text().to_string())
-                        .unwrap_or_default();
-                    if func_name == "table" {
-                        is_table = true;
-                    }
-
-                    let mut content_ctx = ConvertContext::new();
-                    convert_markup_node(child, &mut content_ctx);
-                    content = content_ctx.finish_into(ctx);
+                SyntaxKind::LeftParen
+                | SyntaxKind::RightParen
+                | SyntaxKind::Comma
+                | SyntaxKind::Space
+                | SyntaxKind::Linebreak
+                | SyntaxKind::Parbreak
+                | SyntaxKind::LineComment
+                | SyntaxKind::BlockComment => {}
+                _ => {
+                    process_figure_positional_body(
+                        child,
+                        ctx,
+                        &mut inferred_is_table,
+                        &mut content,
+                    );
                 }
-                SyntaxKind::ContentBlock => {
-                    // Peek inside content block to see if it contains a table
-                    for sub in child.children() {
-                        if sub.kind() == SyntaxKind::FuncCall {
-                            let func_name = sub
-                                .children()
-                                .next()
-                                .map(|n| n.text().to_string())
-                                .unwrap_or_default();
-                            if func_name == "table" {
-                                is_table = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    let mut content_ctx = ConvertContext::new();
-                    convert_markup_node(child, &mut content_ctx);
-                    let c = content_ctx.finish_into(ctx);
-                    if !c.is_empty() {
-                        content = c;
-                    }
-                }
-                _ => {}
             }
         }
     }
+    for child in children.iter().skip(2) {
+        if child.kind() == SyntaxKind::ContentBlock {
+            process_figure_positional_body(child, ctx, &mut inferred_is_table, &mut content);
+        }
+    }
+
+    enum RenderedFigureKind {
+        Image,
+        Table,
+        Custom { counter: String, supplement: String },
+    }
+    let rendered_kind = match explicit_kind {
+        None | Some(ExplicitFigureKind::Auto) => {
+            if inferred_is_table {
+                RenderedFigureKind::Table
+            } else {
+                RenderedFigureKind::Image
+            }
+        }
+        Some(ExplicitFigureKind::Table) => RenderedFigureKind::Table,
+        Some(ExplicitFigureKind::Image) => RenderedFigureKind::Image,
+        Some(ExplicitFigureKind::Custom(raw_kind)) => RenderedFigureKind::Custom {
+            counter: custom_figure_counter_name(&raw_kind),
+            supplement: default_custom_figure_supplement(&raw_kind),
+        },
+    };
 
     ctx.ensure_paragraph_break();
-    let env_name = if is_table { "table" } else { "figure" };
+    let env_name = match rendered_kind {
+        RenderedFigureKind::Table => "table",
+        RenderedFigureKind::Image | RenderedFigureKind::Custom { .. } => "figure",
+    };
     ctx.push_line(&format!("\\begin{{{}}}[htbp]", env_name));
     ctx.push_line("\\centering");
 
@@ -1967,16 +2863,59 @@ fn convert_figure_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
         ctx.newline();
     }
 
-    if let Some(cap) = caption {
-        // Clean up caption: remove escaped braces from [{...}] pattern
-        let clean_cap = cap
-            .trim()
+    let clean_caption = caption.as_deref().map(|cap| {
+        cap.trim()
             .trim_start_matches("\\{")
             .trim_end_matches("\\}")
-            .trim();
-        ctx.push("  \\caption{");
-        ctx.push(clean_cap);
-        ctx.push("}\n");
+            .trim()
+            .to_string()
+    });
+
+    match rendered_kind {
+        RenderedFigureKind::Custom {
+            counter,
+            supplement,
+        } => {
+            let supp_label = explicit_supplement.unwrap_or(supplement);
+            if !unnumbered {
+                ctx.push_line(&format!(
+                    "  \\ifcsname c@{counter}\\endcsname\\else\\newcounter{{{counter}}}\\fi"
+                ));
+                ctx.push_line(&format!("  \\refstepcounter{{{counter}}}"));
+                if let Some(ref clean_cap) = clean_caption {
+                    if !clean_cap.is_empty() {
+                        if supp_label.is_empty() {
+                            ctx.push_line(&format!(
+                                "  \\par\\smallskip \\the{counter}: {clean_cap}"
+                            ));
+                        } else {
+                            ctx.push_line(&format!(
+                                "  \\par\\smallskip {supp_label}~\\the{counter}: {clean_cap}"
+                            ));
+                        }
+                    }
+                }
+            } else if let Some(ref clean_cap) = clean_caption {
+                if !clean_cap.is_empty() {
+                    ctx.push_line(&format!("  \\par\\smallskip {clean_cap}"));
+                }
+            }
+        }
+        RenderedFigureKind::Image | RenderedFigureKind::Table => {
+            if let Some(ref clean_cap) = clean_caption {
+                if unnumbered {
+                    if !clean_cap.is_empty() {
+                        ctx.push_line(&format!("  \\par\\smallskip {clean_cap}"));
+                    }
+                } else {
+                    ctx.push("  \\caption{");
+                    ctx.push(clean_cap);
+                    ctx.push("}\n");
+                }
+            } else if !unnumbered {
+                ctx.push_line(&format!("  \\refstepcounter{{{env_name}}}"));
+            }
+        }
     }
 
     // Use label from argument, or from pending_label (set by parent when processing figure + <label>)
@@ -2246,20 +3185,24 @@ fn convert_cetz_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
 
 struct TableEnumCounter {
     next: Option<u64>,
+    numbering: Option<String>,
 }
 
 impl TableEnumCounter {
-    fn new(start: u64) -> Self {
-        Self { next: Some(start) }
+    fn new(start: u64, numbering: Option<String>) -> Self {
+        Self {
+            next: Some(start),
+            numbering,
+        }
     }
 
     fn next_marker(&mut self, explicit: Option<u64>) -> String {
         if let Some(n) = explicit {
             self.next = n.checked_add(1);
-            format!("{n}.~")
+            format_enum_number_with_pattern(n, self.numbering.as_deref())
         } else if let Some(n) = self.next {
             self.next = n.checked_add(1);
-            format!("{n}.~")
+            format_enum_number_with_pattern(n, self.numbering.as_deref())
         } else {
             // Explicit item hit u64::MAX; avoid wrapping a subsequent implicit item to 0.
             "\\textbullet~".to_string()
@@ -2294,9 +3237,179 @@ fn expand_list_spread_expr<'a>(
     true
 }
 
+fn convert_heading_func(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
+    let args = FuncArgs::from_func_call(children);
+    let level = args
+        .named_usize("level")
+        .or_else(|| args.named_usize("depth"))
+        .map(|l| l.clamp(1, 6))
+        .unwrap_or(1);
+    let unnumbered = match args.named("numbering") {
+        Some(v) => {
+            let trimmed = unwrap_balanced_parens(v.trim());
+            if trimmed == "auto" {
+                active_heading_unnumbered()
+            } else {
+                trimmed == "none"
+            }
+        }
+        None => active_heading_unnumbered(),
+    };
+
+    let render_body = |target_ctx: &mut ConvertContext| {
+        for arg in args.iter() {
+            if arg.is_positional || arg.name.as_deref() == Some("body") {
+                if let Some(node) = arg.value_node {
+                    convert_markup_node(node, target_ctx);
+                }
+            }
+        }
+    };
+
+    if ctx.is_in_env(&EnvironmentContext::Table) {
+        let rendered = render_in_table_cell(ctx, render_body);
+        let title = collapse_table_text(&rendered);
+        if !title.is_empty() {
+            emit_table_cell_lines(vec![format!("\\textbf{{{title}}}")], ctx);
+        }
+        return;
+    }
+
+    let section_cmd = get_heading_command(level);
+    ctx.ensure_paragraph_break();
+    ctx.push(section_cmd);
+    if unnumbered {
+        ctx.push("*");
+    }
+    ctx.push("{");
+    render_body(ctx);
+    ctx.push("}\n");
+    ctx.last_token = TokenType::Newline;
+}
+
+fn convert_terms_func(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
+    let mut pairs: Vec<(TermPart<'_>, TermPart<'_>)> = Vec::new();
+    let mut has_unresolved = false;
+
+    if let Some(args) = children.get(1).and_then(|node| node.cast::<ast::Args>()) {
+        for item in args.items() {
+            match item {
+                ast::Arg::Pos(mut expr) => {
+                    while let ast::Expr::Parenthesized(p) = expr {
+                        expr = p.expr();
+                    }
+                    if let ast::Expr::Array(arr) = expr {
+                        let mut elems = arr.items().filter_map(|it| match it {
+                            ast::ArrayItem::Pos(e) => Some(TermPart::Expr(e)),
+                            ast::ArrayItem::Spread(_) => None,
+                        });
+                        if let (Some(t), Some(d), None) = (elems.next(), elems.next(), elems.next())
+                        {
+                            pairs.push((t, d));
+                        } else {
+                            has_unresolved = true;
+                        }
+                    } else if let Some(td) = term_item_parts(expr.to_untyped()) {
+                        pairs.push(td);
+                    } else {
+                        has_unresolved = true;
+                    }
+                }
+                ast::Arg::Spread(_) => {
+                    has_unresolved = true;
+                }
+                ast::Arg::Named(_) => {}
+            }
+        }
+    }
+
+    if has_unresolved {
+        preserve_unconverted_layout("could not expand terms argument", children, ctx);
+        return;
+    }
+    if pairs.is_empty() {
+        return;
+    }
+
+    if ctx.is_in_env(&EnvironmentContext::Table) {
+        let items: Vec<String> = pairs
+            .into_iter()
+            .map(|(t, d)| {
+                render_table_term_entry(
+                    ctx,
+                    |c| convert_term_part(t, c),
+                    |c| convert_term_part(d, c),
+                )
+            })
+            .collect();
+        emit_table_cell_lines(items, ctx);
+    } else {
+        begin_description(ctx);
+        for (t, d) in pairs {
+            emit_description_item(
+                ctx,
+                |c| convert_term_part(t, c),
+                |c| convert_term_part(d, c),
+            );
+        }
+        end_description(ctx);
+    }
+}
+
+fn enum_item_func_parts<'a>(node: &'a SyntaxNode) -> Option<(Option<u64>, Vec<&'a SyntaxNode>)> {
+    if node.kind() != SyntaxKind::FuncCall {
+        return None;
+    }
+    let func_children: Vec<&'a SyntaxNode> = node.children().collect();
+    let first = func_children.first()?;
+    if get_func_call_name(first) != "enum.item" {
+        return None;
+    }
+    let mut pos_nodes: Vec<&'a SyntaxNode> = Vec::new();
+    if let Some(args_node) = func_children.get(1) {
+        for arg in args_node.children() {
+            if matches!(
+                arg.kind(),
+                SyntaxKind::Named
+                    | SyntaxKind::LeftParen
+                    | SyntaxKind::RightParen
+                    | SyntaxKind::Comma
+                    | SyntaxKind::Space
+                    | SyntaxKind::Linebreak
+                    | SyntaxKind::Parbreak
+                    | SyntaxKind::LineComment
+                    | SyntaxKind::BlockComment
+            ) {
+                continue;
+            }
+            pos_nodes.push(arg);
+        }
+    }
+    for extra in func_children.iter().skip(2) {
+        if extra.kind() == SyntaxKind::ContentBlock {
+            pos_nodes.push(extra);
+        }
+    }
+    match pos_nodes.len() {
+        1 => Some((None, pos_nodes)),
+        2 => {
+            let num_node = unwrap_paren_syntax_node(pos_nodes[0]);
+            let explicit = match num_node.cast::<ast::Expr>() {
+                Some(ast::Expr::Int(i)) => u64::try_from(i.get()).ok(),
+                _ => None,
+            };
+            Some((explicit, vec![pos_nodes[1]]))
+        }
+        _ => None,
+    }
+}
+
 fn convert_list_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, is_enumerate: bool) {
     let mut item_nodes: Vec<&SyntaxNode> = Vec::new();
     let mut has_unresolved_spread = false;
+    let mut explicit_marker: Option<Option<MarkupMarkerSpec>> = None;
+    let mut explicit_start: Option<Option<u64>> = None;
+    let mut explicit_numbering: Option<Option<String>> = None;
     if let Some(args) = children.get(1).and_then(|node| node.cast::<ast::Args>()) {
         for item in args.items() {
             match item {
@@ -2306,7 +3419,49 @@ fn convert_list_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, is_
                         has_unresolved_spread = true;
                     }
                 }
-                ast::Arg::Named(_) => {}
+                ast::Arg::Named(named) => {
+                    let Some(val_expr) = valid_named_expr(named) else {
+                        continue;
+                    };
+                    match (is_enumerate, named.name().get().as_str()) {
+                        (false, "marker") => {
+                            explicit_marker = ast_expr_to_marker_spec(val_expr, ctx);
+                        }
+                        (true, "start") => {
+                            let mut inner = val_expr;
+                            while let ast::Expr::Parenthesized(p) = inner {
+                                inner = p.expr();
+                            }
+                            match inner {
+                                ast::Expr::Auto(_) | ast::Expr::None(_) => {
+                                    explicit_start = Some(None);
+                                }
+                                ast::Expr::Int(i) => {
+                                    if let Ok(n) = u64::try_from(i.get()) {
+                                        explicit_start = Some(Some(n));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        (true, "numbering") => {
+                            let mut inner = val_expr;
+                            while let ast::Expr::Parenthesized(p) = inner {
+                                inner = p.expr();
+                            }
+                            match inner {
+                                ast::Expr::Auto(_) => {
+                                    explicit_numbering = Some(None);
+                                }
+                                ast::Expr::Str(s) => {
+                                    explicit_numbering = Some(Some(s.get().to_string()));
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
     }
@@ -2324,23 +3479,75 @@ fn convert_list_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, is_
         return;
     }
 
+    let (depth, _depth_guard) = enter_list_depth(is_enumerate);
+    let _style_guard = if !is_enumerate {
+        explicit_marker.map(|marker_override| {
+            MARKUP_STYLE_STACK.with(|stack| {
+                let mut stack = stack.borrow_mut();
+                let mut frame = stack.last().cloned().unwrap_or_default();
+                frame.list_marker = marker_override;
+                stack.push(frame);
+            });
+            MarkupStyleGuard
+        })
+    } else if explicit_start.is_some() || explicit_numbering.is_some() {
+        MARKUP_STYLE_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let mut frame = stack.last().cloned().unwrap_or_default();
+            if let Some(start_override) = explicit_start {
+                frame.enum_start = start_override;
+            }
+            if let Some(num_override) = explicit_numbering.clone() {
+                frame.enum_numbering = num_override;
+            }
+            stack.push(frame);
+        });
+        Some(MarkupStyleGuard)
+    } else {
+        None
+    };
+
+    let marker = if is_enumerate {
+        None
+    } else {
+        active_list_marker(depth)
+    };
+    let enum_start = if is_enumerate {
+        explicit_start.unwrap_or_else(active_enum_start)
+    } else {
+        None
+    };
+    let enum_numbering = if is_enumerate {
+        explicit_numbering.unwrap_or_else(active_enum_numbering)
+    } else {
+        None
+    };
+
     if ctx.is_in_env(&EnvironmentContext::Table) {
-        let start = FuncArgs::from_func_call(children)
-            .named_usize("start")
-            .and_then(|n| u64::try_from(n).ok())
-            .unwrap_or(1);
-        let mut counter = TableEnumCounter::new(start);
+        let mut counter = TableEnumCounter::new(enum_start.unwrap_or(1), enum_numbering);
         let mut items = Vec::new();
         for item in item_nodes {
+            if is_enumerate {
+                if let Some((explicit, body_nodes)) = enum_item_func_parts(item) {
+                    let body = collapse_table_text(&render_in_table_cell(ctx, |item_ctx| {
+                        for b in body_nodes {
+                            convert_markup_node(b, item_ctx);
+                        }
+                    }));
+                    let table_marker = counter.next_marker(explicit);
+                    items.push(format_table_list_entry(&table_marker, &body));
+                    continue;
+                }
+            }
             let body = collapse_table_text(&render_in_table_cell(ctx, |item_ctx| {
                 convert_markup_node(item, item_ctx);
             }));
-            let marker = if is_enumerate {
+            let table_marker = if is_enumerate {
                 counter.next_marker(None)
             } else {
-                "\\textbullet~".to_string()
+                format_table_list_marker(marker.as_deref())
             };
-            items.push(format_table_list_entry(&marker, &body));
+            items.push(format_table_list_entry(&table_marker, &body));
         }
         emit_table_cell_lines(items, ctx);
         return;
@@ -2364,9 +3571,51 @@ fn convert_list_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, is_
     ctx.push_line(&format!("\\begin{{{}}}", env_name));
 
     ctx.push_env(env);
+    let first_explicit = if is_enumerate {
+        item_nodes
+            .first()
+            .and_then(|child| enum_item_func_parts(child).and_then(|(n, _)| n))
+    } else {
+        None
+    };
+    let mut next_expected = if is_enumerate {
+        emit_enum_numbering_cmd(&ctx.list_indent(), depth, enum_numbering.as_deref(), ctx);
+        if first_explicit.is_none() {
+            emit_enum_start_counter(&ctx.list_indent(), depth, enum_start, ctx);
+            Some(enum_start.unwrap_or(1))
+        } else {
+            Some(1)
+        }
+    } else {
+        None
+    };
 
     // Process list items
     for child in item_nodes {
+        if is_enumerate {
+            if let Some((explicit, body_nodes)) = enum_item_func_parts(child) {
+                emit_enum_item_counter_override(
+                    &format!("{}  ", ctx.list_indent()),
+                    depth,
+                    explicit,
+                    &mut next_expected,
+                    ctx,
+                );
+                ctx.push(&ctx.list_indent());
+                ctx.push("  \\item ");
+                let mut item_ctx = ConvertContext::new();
+                item_ctx.options = ctx.options.clone();
+                item_ctx.list_depth = ctx.list_depth;
+                for b in body_nodes {
+                    convert_markup_node(b, &mut item_ctx);
+                }
+                let item_text = item_ctx.finish_into(ctx);
+                ctx.push(&item_text);
+                ctx.newline();
+                continue;
+            }
+            next_expected = next_expected.and_then(|v| v.checked_add(1));
+        }
         match child.kind() {
             SyntaxKind::FuncCall => {
                 // Might be a nested list
@@ -2375,11 +3624,15 @@ fn convert_list_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, is_
                     let func_name = func_children[0].text().to_string();
                     if func_name == "list" || func_name == "enum" {
                         ctx.push(&ctx.list_indent());
-                        ctx.push_line("  \\item");
+                        ctx.push_line(&format!(
+                            "  {}",
+                            format_latex_list_item_prefix(marker.as_deref()).trim_end()
+                        ));
                         convert_list_to_latex(&func_children, ctx, func_name == "enum");
                     } else {
                         ctx.push(&ctx.list_indent());
-                        ctx.push("  \\item ");
+                        ctx.push("  ");
+                        ctx.push(&format_latex_list_item_prefix(marker.as_deref()));
                         convert_markup_node(child, ctx);
                         ctx.newline();
                     }
@@ -2387,7 +3640,8 @@ fn convert_list_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext, is_
             }
             _ => {
                 ctx.push(&ctx.list_indent());
-                ctx.push("  \\item ");
+                ctx.push("  ");
+                ctx.push(&format_latex_list_item_prefix(marker.as_deref()));
 
                 let mut item_ctx = ConvertContext::new();
                 item_ctx.options = ctx.options.clone();
@@ -2468,9 +3722,9 @@ fn convert_raw_to_latex(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
 // ============================================================================
 
 /// Convert a single list item (unordered)
-fn convert_list_item(node: &SyntaxNode, ctx: &mut ConvertContext) {
+fn convert_list_item(node: &SyntaxNode, ctx: &mut ConvertContext, marker: Option<&str>) {
     ctx.push_indent();
-    ctx.push("\\item ");
+    ctx.push(&format_latex_list_item_prefix(marker));
     for child in node.children() {
         if child.kind() != SyntaxKind::ListMarker {
             convert_markup_node(child, ctx);
@@ -2811,6 +4065,10 @@ fn end_description(ctx: &mut ConvertContext) {
     ctx.push_line("\\end{description}");
 }
 
+fn is_collapsible_ascii_whitespace(s: &str) -> bool {
+    s.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+}
+
 fn push_escaped_latex_text(ctx: &mut ConvertContext, text: &str) {
     let escaped = escape_latex_text(text);
     if ctx.output.ends_with('-') && escaped.starts_with('-') {
@@ -2825,11 +4083,14 @@ fn convert_markup_children(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
         let child = children[i];
         match child.kind() {
             SyntaxKind::ListItem => {
+                let (depth, _depth_guard) = enter_list_depth(false);
+                let marker = active_list_marker(depth);
                 if ctx.is_in_env(&EnvironmentContext::Table) {
-                    let mut items = vec![render_table_list_item(child, "\\textbullet~", ctx)];
+                    let table_marker = format_table_list_marker(marker.as_deref());
+                    let mut items = vec![render_table_list_item(child, &table_marker, ctx)];
                     i += 1;
                     collect_following_kind(children, &mut i, SyntaxKind::ListItem, |item| {
-                        items.push(render_table_list_item(item, "\\textbullet~", ctx));
+                        items.push(render_table_list_item(item, &table_marker, ctx));
                     });
                     emit_table_cell_lines(items, ctx);
                 } else {
@@ -2842,7 +4103,7 @@ fn convert_markup_children(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
                             || is_list_group_trivia(children[i]))
                     {
                         if children[i].kind() == SyntaxKind::ListItem {
-                            convert_list_item(children[i], ctx);
+                            convert_list_item(children[i], ctx, marker.as_deref());
                         }
                         i += 1;
                     }
@@ -2852,8 +4113,11 @@ fn convert_markup_children(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
                 }
             }
             SyntaxKind::EnumItem => {
+                let (depth, _depth_guard) = enter_list_depth(true);
+                let start = active_enum_start();
+                let numbering = active_enum_numbering();
                 if ctx.is_in_env(&EnvironmentContext::Table) {
-                    let mut counter = TableEnumCounter::new(1);
+                    let mut counter = TableEnumCounter::new(start.unwrap_or(1), numbering);
                     let mut items = Vec::new();
                     let mut push_enum = |item: &SyntaxNode| {
                         let explicit = item.cast::<ast::EnumItem>().and_then(|e| e.number());
@@ -2868,12 +4132,32 @@ fn convert_markup_children(children: &[&SyntaxNode], ctx: &mut ConvertContext) {
                     ctx.ensure_paragraph_break();
                     ctx.push_line("\\begin{enumerate}");
                     ctx.indent_level += 1;
+                    let indent = "  ".repeat(ctx.indent_level);
+                    let first_explicit = child.cast::<ast::EnumItem>().and_then(|e| e.number());
+                    emit_enum_numbering_cmd(&indent, depth, numbering.as_deref(), ctx);
+                    if first_explicit.is_none() {
+                        emit_enum_start_counter(&indent, depth, start, ctx);
+                    }
+                    let mut next_expected = Some(if first_explicit.is_none() {
+                        start.unwrap_or(1)
+                    } else {
+                        1
+                    });
 
                     while i < children.len()
                         && (children[i].kind() == SyntaxKind::EnumItem
                             || is_list_group_trivia(children[i]))
                     {
                         if children[i].kind() == SyntaxKind::EnumItem {
+                            let explicit =
+                                children[i].cast::<ast::EnumItem>().and_then(|e| e.number());
+                            emit_enum_item_counter_override(
+                                &indent,
+                                depth,
+                                explicit,
+                                &mut next_expected,
+                                ctx,
+                            );
                             convert_enum_item(children[i], ctx);
                         }
                         i += 1;

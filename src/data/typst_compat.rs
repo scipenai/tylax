@@ -44,9 +44,10 @@ lazy_static! {
         m.insert("super", MarkupHandler::Wrap { prefix: "\\textsuperscript{", suffix: "}" });
 
         // Document structure
-        m.insert("heading", MarkupHandler::Wrap { prefix: "\\section{", suffix: "}\n" });
+        m.insert("heading", MarkupHandler::Special);
         m.insert("list", MarkupHandler::Special);
         m.insert("enum", MarkupHandler::Special);
+        m.insert("terms", MarkupHandler::Special);
         m.insert("quote", MarkupHandler::Environment { name: "quote" });
         m.insert("figure", MarkupHandler::Special);
         m.insert("table", MarkupHandler::Special);

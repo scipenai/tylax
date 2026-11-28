@@ -178,6 +178,11 @@ impl Scopes {
             .unwrap_or_default()
     }
 
+    /// Borrow bindings of the root (outermost) scope frame.
+    pub(crate) fn root_bindings(&self) -> Option<&IndexMap<String, Value>> {
+        self.stack.first().map(|s| s.bindings())
+    }
+
     /// Capture all visible variables for a closure.
     ///
     /// This creates a snapshot of all variables visible from the current scope,

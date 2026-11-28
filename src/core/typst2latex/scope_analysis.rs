@@ -1,13 +1,13 @@
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-#[cfg(not(target_arch = "wasm32"))]
-use std::path::Component;
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use typst_syntax::ast::{self, AstNode};
 use typst_syntax::{LinkedNode, SyntaxKind, SyntaxNode};
 use unicode_segmentation::UnicodeSegmentation;
 
+use super::engine::{default_import_binding_name, VirtualFileSystem};
 use super::math_ir::{llap_body, ungroup_expr};
 
 const MAX_STATIC_LOOP_ITERS: usize = 64;
@@ -15,14 +15,120 @@ const MAX_STATIC_LOOP_STEPS: usize = 512;
 const MAX_STATIC_CALL_DEPTH: usize = 4;
 const MAX_STATIC_VALUE_BYTES: usize = 64 * 1024;
 const MAX_STATIC_TOTAL_VALUE_BYTES: usize = 256 * 1024;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 const MAX_STATIC_IMPORT_DEPTH: usize = 8;
-#[cfg(not(target_arch = "wasm32"))]
 const MAX_STATIC_IMPORT_BYTES: usize = 1024 * 1024;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 const MAX_STATIC_TOTAL_IMPORT_BYTES: usize = 4 * 1024 * 1024;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 const MAX_STATIC_TOTAL_EXPORT_ENTRIES: usize = 8 * 1024;
+const MAX_IMPORTED_SETS_PER_SCOPE: usize = 64;
+
+thread_local! {
+    static ACTIVE_SHADOW_MARKERS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+struct ShadowSessionGuard;
+
+impl Drop for ShadowSessionGuard {
+    fn drop(&mut self) {
+        ACTIVE_SHADOW_MARKERS.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+}
+
+pub(crate) fn with_shadow_session<R>(marker: &str, f: impl FnOnce() -> R) -> R {
+    ACTIVE_SHADOW_MARKERS.with(|stack| stack.borrow_mut().push(marker.to_string()));
+    let _guard = ShadowSessionGuard;
+    f()
+}
+
+pub(crate) fn is_shadowed_node(node: &SyntaxNode) -> bool {
+    ACTIVE_SHADOW_MARKERS.with(|stack| {
+        let stack = stack.borrow();
+        let Some(marker) = stack.last().map(String::as_str) else {
+            return false;
+        };
+        node.children()
+            .any(|child| child.kind() == SyntaxKind::BlockComment && child.text() == marker)
+    })
+}
+
+pub(crate) fn strip_active_shadow_marker<'a>(text: &'a str) -> Cow<'a, str> {
+    ACTIVE_SHADOW_MARKERS.with(|stack| {
+        let stack = stack.borrow();
+        match stack.last().map(String::as_str) {
+            Some(marker) if text.contains(marker) => Cow::Owned(text.replace(marker, "")),
+            _ => Cow::Borrowed(text),
+        }
+    })
+}
+
+pub(crate) fn clean_context_source(node: &SyntaxNode) -> String {
+    let raw = format!("#{}", SyntaxNode::clone(node).into_text());
+    strip_active_shadow_marker(&raw).into_owned()
+}
+
+pub(crate) fn strip_shadow_marker(output: &mut String, marker: &str) {
+    if output.contains(marker) {
+        *output = output.replace(marker, "");
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShadowPolicy {
+    /// Require the built-in to remain provably unshadowed; any unresolved wildcard marks it shadowed.
+    StrictConfirm,
+    /// Preserve built-in lowering unless shadowed explicitly or by an unknown dynamic import source.
+    ConservativeDynamic,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum WildcardImportState {
+    #[default]
+    None,
+    UnloadedModule,
+    UnknownSource,
+}
+
+struct ShadowRule {
+    syntax_kind: SyntaxKind,
+    builtins: &'static [&'static str],
+    policy: ShadowPolicy,
+    marker_offset: fn(&LinkedNode<'_>) -> Option<usize>,
+}
+
+const SHADOW_RULES: &[ShadowRule] = &[
+    ShadowRule {
+        syntax_kind: SyntaxKind::Contextual,
+        builtins: &["h", "measure"],
+        policy: ShadowPolicy::StrictConfirm,
+        marker_offset: shadowed_contextual_llap_offset,
+    },
+    ShadowRule {
+        syntax_kind: SyntaxKind::FuncCall,
+        builtins: &["terms"],
+        policy: ShadowPolicy::ConservativeDynamic,
+        marker_offset: shadowed_terms_item_marker_offset,
+    },
+];
+
+const STATIC_EVAL_BUILTINS: &[&str] = &["range"];
+
+pub(crate) fn collect_shadowed_builtins(mut is_bound: impl FnMut(&str) -> bool) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for rule in SHADOW_RULES {
+        for &builtin in rule.builtins {
+            if is_bound(builtin) {
+                out.insert(builtin.to_string());
+            }
+        }
+    }
+    for &builtin in STATIC_EVAL_BUILTINS {
+        if is_bound(builtin) {
+            out.insert(builtin.to_string());
+        }
+    }
+    out
+}
 
 fn charge_value_budget(cost: usize, budget: &mut usize) -> bool {
     let Some(remaining) = budget.checked_sub(cost) else {
@@ -61,6 +167,17 @@ impl PartialEq for StaticArray {
 
 impl Eq for StaticArray {}
 
+#[derive(Clone)]
+struct StaticModule(Rc<ModuleExports>);
+
+impl PartialEq for StaticModule {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for StaticModule {}
+
 #[derive(Clone, PartialEq, Eq)]
 enum StaticValue {
     Str(Rc<str>),
@@ -68,6 +185,7 @@ enum StaticValue {
     Int(i64),
     Array(StaticArray),
     Closure(Rc<StaticClosure>),
+    Module(StaticModule),
     Unknown,
 }
 
@@ -116,7 +234,7 @@ impl StaticValue {
         match self {
             Self::Str(s) => 1 + s.len(),
             Self::Array(arr) => arr.weight,
-            Self::Bool(_) | Self::Int(_) | Self::Closure(_) | Self::Unknown => 1,
+            Self::Bool(_) | Self::Int(_) | Self::Closure(_) | Self::Module(_) | Self::Unknown => 1,
         }
     }
 }
@@ -128,153 +246,185 @@ enum ControlFlow {
     Break,
 }
 
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 struct ScopeBindings {
-    h_shadowed: bool,
-    measure_shadowed: bool,
-    terms_shadowed: bool,
-    range_shadowed: bool,
+    bound_names: HashSet<String>,
+    imported_sets: Vec<Rc<HashSet<String>>>,
+    wildcard_state: WildcardImportState,
     values: HashMap<String, StaticValue>,
+}
+
+impl ScopeBindings {
+    fn binds_name(&self, name: &str) -> bool {
+        self.bound_names.contains(name) || self.imported_sets.iter().any(|set| set.contains(name))
+    }
+
+    fn shadows(&self, name: &str, policy: ShadowPolicy) -> bool {
+        if self.binds_name(name) {
+            return true;
+        }
+        match policy {
+            ShadowPolicy::StrictConfirm => self.wildcard_state != WildcardImportState::None,
+            ShadowPolicy::ConservativeDynamic => {
+                self.wildcard_state == WildcardImportState::UnknownSource
+            }
+        }
+    }
+
+    fn add_imported_set(&mut self, set: &Rc<HashSet<String>>) {
+        if set.is_empty()
+            || self
+                .imported_sets
+                .iter()
+                .any(|existing| Rc::ptr_eq(existing, set))
+        {
+            return;
+        }
+        if self.imported_sets.len() < MAX_IMPORTED_SETS_PER_SCOPE {
+            self.imported_sets.push(Rc::clone(set));
+        } else {
+            self.wildcard_state = WildcardImportState::UnknownSource;
+        }
+    }
+
+    fn to_module_exports(&self) -> ModuleExports {
+        let mut exported_sets = self.imported_sets.clone();
+        let mut wildcard_state = self.wildcard_state;
+        if !self.bound_names.is_empty() {
+            if exported_sets.len() < MAX_IMPORTED_SETS_PER_SCOPE {
+                exported_sets.push(Rc::new(self.bound_names.clone()));
+            } else {
+                let mut merged = self.bound_names.clone();
+                let mut flattened = true;
+                for existing in &exported_sets {
+                    if merged.len().saturating_add(existing.len()) > MAX_STATIC_TOTAL_EXPORT_ENTRIES
+                    {
+                        flattened = false;
+                        break;
+                    }
+                    merged.extend(existing.iter().cloned());
+                }
+                if flattened {
+                    exported_sets = vec![Rc::new(merged)];
+                } else {
+                    wildcard_state = WildcardImportState::UnknownSource;
+                }
+            }
+        }
+        ModuleExports {
+            exported_sets,
+            wildcard_state,
+            values: self.values.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
 struct ModuleExports {
-    terms: bool,
-    range: bool,
+    exported_sets: Vec<Rc<HashSet<String>>>,
+    wildcard_state: WildcardImportState,
     values: HashMap<String, StaticValue>,
 }
 
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-#[derive(Clone, Copy)]
-struct ImportBaseDirs<'a> {
-    project_root: &'a Path,
-    /// Logical (virtual) directory path relative to `project_root` (empty at project root).
-    current_rel: &'a Path,
+impl ModuleExports {
+    fn exports_name(&self, name: &str) -> bool {
+        self.exported_sets.iter().any(|set| set.contains(name))
+    }
 }
 
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[derive(Clone, Copy)]
+struct BudgetPair<T> {
+    live: T,
+    dead: T,
+}
+
+impl<T> BudgetPair<T> {
+    fn new(live: T, dead: T) -> Self {
+        Self { live, dead }
+    }
+
+    fn get(&self, in_dead_branch: bool) -> &T {
+        if in_dead_branch {
+            &self.dead
+        } else {
+            &self.live
+        }
+    }
+
+    fn get_mut(&mut self, in_dead_branch: bool) -> &mut T {
+        if in_dead_branch {
+            &mut self.dead
+        } else {
+            &mut self.live
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LocalBudgets {
+    loop_steps: usize,
+    value_bytes: usize,
+}
+
+impl LocalBudgets {
+    fn new() -> Self {
+        Self {
+            loop_steps: MAX_STATIC_LOOP_STEPS,
+            value_bytes: MAX_STATIC_TOTAL_VALUE_BYTES,
+        }
+    }
+}
+
+struct SharedImportBudgets {
+    import_bytes: BudgetPair<usize>,
+    export_entries: BudgetPair<usize>,
+}
+
+impl SharedImportBudgets {
+    fn new() -> Self {
+        Self {
+            import_bytes: BudgetPair::new(
+                MAX_STATIC_TOTAL_IMPORT_BYTES,
+                MAX_STATIC_TOTAL_IMPORT_BYTES,
+            ),
+            export_entries: BudgetPair::new(
+                MAX_STATIC_TOTAL_EXPORT_ENTRIES,
+                MAX_STATIC_TOTAL_EXPORT_ENTRIES,
+            ),
+        }
+    }
+}
+
 struct WalkState<'a> {
     offsets: Option<&'a mut Vec<usize>>,
-    source_dir: Option<ImportBaseDirs<'a>>,
-    visited: &'a mut HashSet<PathBuf>,
-    module_cache: &'a mut HashMap<PathBuf, Option<Rc<ModuleExports>>>,
+    vfs: &'a dyn VirtualFileSystem,
+    current_file: Option<&'a str>,
+    visited: &'a mut HashSet<String>,
+    module_cache: &'a mut HashMap<String, Option<Rc<ModuleExports>>>,
+    shared_budgets: &'a mut SharedImportBudgets,
+    local_budgets: BudgetPair<LocalBudgets>,
     import_depth: usize,
-    import_byte_budget: &'a mut usize,
-    dead_import_byte_budget: &'a mut usize,
-    export_entry_budget: &'a mut usize,
-    dead_export_entry_budget: &'a mut usize,
-    step_budget: usize,
-    dead_step_budget: usize,
-    value_budget: usize,
-    dead_value_budget: usize,
     in_dead_branch: bool,
     export_incomplete: bool,
 }
 
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 impl WalkState<'_> {
-    fn active_import_byte_budget(&mut self) -> &mut usize {
-        if self.in_dead_branch {
-            self.dead_import_byte_budget
-        } else {
-            self.import_byte_budget
-        }
-    }
-
-    fn active_export_entry_budget(&mut self) -> &mut usize {
-        if self.in_dead_branch {
-            self.dead_export_entry_budget
-        } else {
-            self.export_entry_budget
-        }
-    }
-
     fn active_value_budget(&mut self) -> &mut usize {
-        if self.in_dead_branch {
-            &mut self.dead_value_budget
-        } else {
-            &mut self.value_budget
-        }
+        &mut self.local_budgets.get_mut(self.in_dead_branch).value_bytes
     }
 
     fn remaining_loop_steps(&self) -> usize {
-        if self.in_dead_branch {
-            self.dead_step_budget
-        } else {
-            self.step_budget
-        }
+        self.local_budgets.get(self.in_dead_branch).loop_steps
     }
 
     fn consume_loop_step(&mut self) -> bool {
-        let budget = if self.in_dead_branch {
-            &mut self.dead_step_budget
-        } else {
-            &mut self.step_budget
-        };
+        let budget = &mut self.local_budgets.get_mut(self.in_dead_branch).loop_steps;
         if *budget == 0 {
             return false;
         }
         *budget -= 1;
         true
     }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn resolve_initial_import_dirs(source_dir: &Path) -> Option<(PathBuf, PathBuf)> {
-    let effective_source = if source_dir.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        source_dir
-    };
-    if let Some(typst_root) = std::env::var_os("TYPST_ROOT") {
-        if !typst_root.is_empty() {
-            let canon_root = std::fs::canonicalize(typst_root).ok()?;
-            if !canon_root.is_dir() {
-                return None;
-            }
-            let canon_source = std::fs::canonicalize(effective_source).ok()?;
-            let rel = canon_source.strip_prefix(&canon_root).ok()?.to_path_buf();
-            return Some((canon_root, rel));
-        }
-    }
-    let root =
-        std::fs::canonicalize(effective_source).unwrap_or_else(|_| effective_source.to_path_buf());
-    Some((root, PathBuf::new()))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn push_relative_components(rel: &mut PathBuf, path: &Path, allow_root_dir: bool) -> Option<()> {
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => rel.push(part),
-            Component::CurDir => {}
-            Component::RootDir if allow_root_dir => {}
-            Component::RootDir | Component::Prefix(_) => return None,
-            Component::ParentDir => {
-                if !rel.pop() {
-                    return None;
-                }
-            }
-        }
-    }
-    Some(())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn resolve_typst_import_rel_path(dirs: ImportBaseDirs<'_>, import_path: &str) -> Option<PathBuf> {
-    if import_path.is_empty() || import_path.starts_with('@') {
-        return None;
-    }
-    let (mut rel, path_to_walk, allow_root_dir) =
-        if let Some(root_rel) = import_path.strip_prefix('/') {
-            (PathBuf::new(), root_rel, true)
-        } else {
-            let mut base = PathBuf::new();
-            push_relative_components(&mut base, dirs.current_rel, false)?;
-            (base, import_path, false)
-        };
-    push_relative_components(&mut rel, Path::new(path_to_walk), allow_root_dir)?;
-    (!rel.as_os_str().is_empty()).then_some(rel)
 }
 
 pub(crate) fn unique_shadowed_marker(input: &str) -> String {
@@ -290,11 +440,12 @@ pub(crate) fn unique_shadowed_marker(input: &str) -> String {
     }
 }
 
-pub(crate) fn annotate_shadowed_builtins_in_dir(
+pub(crate) fn annotate_shadowed_builtins(
     input: &str,
     math_only: bool,
     marker: &str,
-    source_dir: Option<&Path>,
+    vfs: &dyn VirtualFileSystem,
+    current_file: Option<&str>,
 ) -> String {
     let root = if math_only {
         typst_syntax::parse_math(input)
@@ -302,86 +453,58 @@ pub(crate) fn annotate_shadowed_builtins_in_dir(
         typst_syntax::parse(input)
     };
     let linked = LinkedNode::new(&root);
-    annotate_shadowed_builtins_in_linked(&linked, input, false, false, false, marker, source_dir)
+    annotate_shadowed_builtins_in_linked(&linked, input, &HashSet::new(), marker, vfs, current_file)
         .unwrap_or_else(|| input.to_string())
 }
 
 pub(crate) fn annotate_shadowed_builtins_in_node(
     node: &SyntaxNode,
-    h_shadowed: bool,
-    measure_shadowed: bool,
-    terms_shadowed: bool,
+    initial_shadowed: &HashSet<String>,
     marker: &str,
+    vfs: &dyn VirtualFileSystem,
+    current_file: Option<&str>,
 ) -> Option<String> {
     let source = SyntaxNode::clone(node).into_text().to_string();
     let linked = LinkedNode::new(node);
     annotate_shadowed_builtins_in_linked(
         &linked,
         &source,
-        h_shadowed,
-        measure_shadowed,
-        terms_shadowed,
+        initial_shadowed,
         marker,
-        None,
+        vfs,
+        current_file,
     )
     .map(|annotated| format!("#{annotated}"))
-}
-
-pub(crate) fn is_shadowed_node(node: &SyntaxNode) -> bool {
-    super::math_ir::is_shadowed_node(node)
 }
 
 fn annotate_shadowed_builtins_in_linked(
     root: &LinkedNode<'_>,
     source: &str,
-    h_shadowed: bool,
-    measure_shadowed: bool,
-    terms_shadowed: bool,
+    initial_shadowed: &HashSet<String>,
     marker: &str,
-    source_dir: Option<&Path>,
+    vfs: &dyn VirtualFileSystem,
+    current_file: Option<&str>,
 ) -> Option<String> {
     let mut scopes = vec![Rc::new(ScopeBindings {
-        h_shadowed,
-        measure_shadowed,
-        terms_shadowed,
-        range_shadowed: false,
-        values: HashMap::new(),
+        bound_names: initial_shadowed.clone(),
+        ..Default::default()
     })];
     let mut offsets = Vec::new();
     let mut visited = HashSet::new();
+    if let Some(file) = current_file {
+        visited.insert(file.to_string());
+    }
     let mut module_cache = HashMap::new();
-    let mut import_byte_budget = MAX_STATIC_TOTAL_IMPORT_BYTES;
-    let mut dead_import_byte_budget = MAX_STATIC_TOTAL_IMPORT_BYTES;
-    let mut export_entry_budget = MAX_STATIC_TOTAL_EXPORT_ENTRIES;
-    let mut dead_export_entry_budget = MAX_STATIC_TOTAL_EXPORT_ENTRIES;
-    #[cfg(not(target_arch = "wasm32"))]
-    let resolved_dirs = source_dir.and_then(resolve_initial_import_dirs);
-    #[cfg(not(target_arch = "wasm32"))]
-    let import_dirs = resolved_dirs
-        .as_ref()
-        .map(|(project_root, current_rel)| ImportBaseDirs {
-            project_root: project_root.as_path(),
-            current_rel: current_rel.as_path(),
-        });
-    #[cfg(target_arch = "wasm32")]
-    let import_dirs = source_dir.map(|dir| ImportBaseDirs {
-        project_root: dir,
-        current_rel: Path::new(""),
-    });
+    let mut shared_budgets = SharedImportBudgets::new();
     let mut state = WalkState {
         offsets: Some(&mut offsets),
-        source_dir: import_dirs,
+        vfs,
+        current_file,
         visited: &mut visited,
         module_cache: &mut module_cache,
+        shared_budgets: &mut shared_budgets,
+        local_budgets: BudgetPair::new(LocalBudgets::new(), LocalBudgets::new()),
         import_depth: 0,
-        import_byte_budget: &mut import_byte_budget,
-        dead_import_byte_budget: &mut dead_import_byte_budget,
-        export_entry_budget: &mut export_entry_budget,
-        dead_export_entry_budget: &mut dead_export_entry_budget,
-        step_budget: MAX_STATIC_LOOP_STEPS,
-        dead_step_budget: MAX_STATIC_LOOP_STEPS,
-        value_budget: MAX_STATIC_TOTAL_VALUE_BYTES,
-        dead_value_budget: MAX_STATIC_TOTAL_VALUE_BYTES,
         in_dead_branch: false,
         export_incomplete: false,
     };
@@ -409,28 +532,31 @@ fn splice_marker_at_offsets(source: &str, offsets: &[usize], marker: &str) -> St
     out
 }
 
-fn is_llap_shadowed(scopes: &[Rc<ScopeBindings>]) -> bool {
-    scopes
-        .iter()
-        .any(|scope| scope.h_shadowed || scope.measure_shadowed)
+fn is_builtin_shadowed(scopes: &[Rc<ScopeBindings>], name: &str, policy: ShadowPolicy) -> bool {
+    scopes.iter().any(|scope| scope.shadows(name, policy))
 }
 
-fn is_terms_shadowed(scopes: &[Rc<ScopeBindings>]) -> bool {
-    scopes.iter().any(|scope| scope.terms_shadowed)
-}
-
-fn is_range_shadowed(scopes: &[Rc<ScopeBindings>]) -> bool {
-    scopes.iter().any(|scope| scope.range_shadowed)
+fn apply_shadow_rules(
+    node: &LinkedNode<'_>,
+    scopes: &[Rc<ScopeBindings>],
+    offsets: &mut Vec<usize>,
+) {
+    for rule in SHADOW_RULES {
+        if rule.syntax_kind == node.kind()
+            && rule
+                .builtins
+                .iter()
+                .any(|builtin| is_builtin_shadowed(scopes, builtin, rule.policy))
+        {
+            if let Some(offset) = (rule.marker_offset)(node) {
+                offsets.push(offset);
+            }
+        }
+    }
 }
 
 fn mark_binding(name: &str, scope: &mut ScopeBindings) {
-    match name {
-        "h" => scope.h_shadowed = true,
-        "measure" => scope.measure_shadowed = true,
-        "terms" => scope.terms_shadowed = true,
-        "range" => scope.range_shadowed = true,
-        _ => {}
-    }
+    scope.bound_names.insert(name.to_string());
     scope.values.insert(name.to_string(), StaticValue::Unknown);
 }
 
@@ -477,17 +603,6 @@ fn record_params_bindings(params: ast::Params<'_>, scope: &mut ScopeBindings) {
     }
 }
 
-fn default_import_binding_name(source: &str) -> Option<&str> {
-    if source.starts_with('@') {
-        let name = source.split('/').nth(1)?.split(':').next()?;
-        (!name.is_empty()).then_some(name)
-    } else {
-        let file = source.rsplit(['/', '\\']).next()?;
-        let stem = file.strip_suffix(".typ").unwrap_or(file);
-        (!stem.is_empty()).then_some(stem)
-    }
-}
-
 fn simple_pattern_ident(pattern: ast::Pattern<'_>) -> Option<&str> {
     match pattern {
         ast::Pattern::Normal(ast::Expr::Ident(ident)) => Some(ident.get().as_str()),
@@ -504,14 +619,19 @@ fn capture_closure_env(
     collect_ident_names(closure.to_untyped(), &mut referenced);
 
     let mut captured = ScopeBindings {
-        h_shadowed: is_llap_shadowed(scopes),
-        measure_shadowed: false,
-        terms_shadowed: is_terms_shadowed(scopes),
-        range_shadowed: is_range_shadowed(scopes),
+        wildcard_state: scopes
+            .iter()
+            .map(|scope| scope.wildcard_state)
+            .max()
+            .unwrap_or_default(),
         values: HashMap::with_capacity(referenced.len()),
+        ..Default::default()
     };
 
     for name in referenced {
+        if scopes.iter().any(|scope| scope.binds_name(&name)) {
+            captured.bound_names.insert(name.clone());
+        }
         if let Some(val) = scopes
             .iter()
             .rev()
@@ -822,11 +942,22 @@ fn eval_static_value_with_depth(
             } else if matches!(
                 ungroup_expr(call.callee()),
                 ast::Expr::Ident(ident) if ident.get().as_str() == "range"
-            ) && !is_range_shadowed(scopes)
+            ) && !is_builtin_shadowed(scopes, "range", ShadowPolicy::StrictConfirm)
             {
                 eval_builtin_range_call(call, scopes, depth, budget)
             } else {
                 StaticValue::Unknown
+            }
+        }
+        ast::Expr::FieldAccess(access) => {
+            match eval_static_value_with_depth(access.target(), scopes, depth + 1, budget) {
+                StaticValue::Module(m) => {
+                    m.0.values
+                        .get(access.field().get().as_str())
+                        .cloned()
+                        .unwrap_or(StaticValue::Unknown)
+                }
+                _ => StaticValue::Unknown,
             }
         }
         _ => StaticValue::Unknown,
@@ -852,17 +983,6 @@ fn static_for_iterable_values(
                     .collect(),
             )
         }
-        _ => None,
-    }
-}
-
-fn resolve_import_source_string(
-    expr: ast::Expr<'_>,
-    scopes: &[Rc<ScopeBindings>],
-    budget: &mut usize,
-) -> Option<String> {
-    match eval_static_value(expr, scopes, budget) {
-        StaticValue::Str(s) => Some(s.to_string()),
         _ => None,
     }
 }
@@ -1014,13 +1134,20 @@ fn merge_scope_stacks(
             merged_values.insert(key, merged);
         }
 
-        base[i] = Rc::new(ScopeBindings {
-            h_shadowed: left[i].h_shadowed || right[i].h_shadowed,
-            measure_shadowed: left[i].measure_shadowed || right[i].measure_shadowed,
-            terms_shadowed: left[i].terms_shadowed || right[i].terms_shadowed,
-            range_shadowed: left[i].range_shadowed || right[i].range_shadowed,
+        let mut merged_bound_names = left[i].bound_names.clone();
+        merged_bound_names.extend(right[i].bound_names.iter().cloned());
+
+        let mut merged_scope = ScopeBindings {
+            bound_names: merged_bound_names,
+            imported_sets: left[i].imported_sets.clone(),
+            wildcard_state: left[i].wildcard_state.max(right[i].wildcard_state),
             values: merged_values,
-        });
+        };
+        for set in &right[i].imported_sets {
+            merged_scope.add_imported_set(set);
+        }
+
+        base[i] = Rc::new(merged_scope);
     }
 }
 
@@ -1087,155 +1214,108 @@ fn find_linked_child<'a>(node: &LinkedNode<'a>, target: &SyntaxNode) -> Option<L
         .find(|child| std::ptr::eq(child.get(), target_ptr))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn read_bounded_regular_file(path: &Path, byte_budget: &mut usize) -> (Option<String>, bool) {
-    use std::io::Read;
-
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return (None, false);
-    };
-    if !metadata.is_file() {
-        return (None, false);
-    }
-    if metadata.len() > MAX_STATIC_IMPORT_BYTES as u64 {
-        return (None, false);
-    }
-    if *byte_budget == 0 || metadata.len() > *byte_budget as u64 {
+fn read_vfs_bounded(
+    vfs: &dyn VirtualFileSystem,
+    path: &str,
+    byte_budget: &mut usize,
+) -> (Option<String>, bool) {
+    if *byte_budget == 0 {
         return (None, true);
     }
-    let per_file_cap = MAX_STATIC_IMPORT_BYTES.min(*byte_budget);
-    let Ok(file) = std::fs::File::open(path) else {
+    let Ok(source) = vfs.read_text(path) else {
         return (None, false);
     };
-    let Ok(opened_meta) = file.metadata() else {
-        return (None, false);
-    };
-    if !opened_meta.is_file() {
+    if source.len() > MAX_STATIC_IMPORT_BYTES {
         return (None, false);
     }
-    let mut buf = Vec::new();
-    if file
-        .take((per_file_cap as u64).saturating_add(1))
-        .read_to_end(&mut buf)
-        .is_err()
-    {
-        return (None, false);
-    }
-    if buf.len() > MAX_STATIC_IMPORT_BYTES {
-        return (None, false);
-    }
-    if buf.len() > *byte_budget {
+    if source.len() > *byte_budget {
         return (None, true);
     }
-    *byte_budget -= buf.len();
-    (String::from_utf8(buf).ok(), false)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn module_file_exports(
-    dirs: ImportBaseDirs<'_>,
-    import_path: &str,
-    state: &mut WalkState<'_>,
-) -> Option<Rc<ModuleExports>> {
-    if state.import_depth >= MAX_STATIC_IMPORT_DEPTH {
-        state.export_incomplete = true;
-        return None;
-    }
-    let rel_path = resolve_typst_import_rel_path(dirs, import_path)?;
-    let canon_root = std::fs::canonicalize(dirs.project_root).ok()?;
-    let candidate = canon_root.join(&rel_path);
-    let canon_candidate = std::fs::canonicalize(&candidate).ok()?;
-    if !canon_candidate.starts_with(&canon_root) {
-        return None;
-    }
-    if state.visited.contains(&rel_path) {
-        state.export_incomplete = true;
-        return None;
-    }
-    if let Some(cached) = state.module_cache.get(&rel_path) {
-        return cached.as_ref().map(Rc::clone);
-    }
-    let (maybe_source, budget_exhausted) =
-        read_bounded_regular_file(&canon_candidate, state.active_import_byte_budget());
-    if budget_exhausted {
-        state.export_incomplete = true;
-        return None;
-    }
-    let Some(source) = maybe_source else {
-        state.module_cache.insert(rel_path, None);
-        return None;
-    };
-
-    state.visited.insert(rel_path.clone());
-    let (result, subtree_incomplete) = {
-        let root = typst_syntax::parse(&source);
-        let linked = LinkedNode::new(&root);
-        let mut scopes = vec![Rc::new(ScopeBindings::default())];
-        let module_rel_dir = rel_path.parent().unwrap_or(Path::new(""));
-        let module_dirs = ImportBaseDirs {
-            project_root: &canon_root,
-            current_rel: module_rel_dir,
-        };
-        let mut module_state = WalkState {
-            offsets: None,
-            source_dir: Some(module_dirs),
-            visited: state.visited,
-            module_cache: state.module_cache,
-            import_depth: state.import_depth + 1,
-            import_byte_budget: state.import_byte_budget,
-            dead_import_byte_budget: state.dead_import_byte_budget,
-            export_entry_budget: state.export_entry_budget,
-            dead_export_entry_budget: state.dead_export_entry_budget,
-            step_budget: MAX_STATIC_LOOP_STEPS,
-            dead_step_budget: MAX_STATIC_LOOP_STEPS,
-            value_budget: MAX_STATIC_TOTAL_VALUE_BYTES,
-            dead_value_budget: MAX_STATIC_TOTAL_VALUE_BYTES,
-            in_dead_branch: state.in_dead_branch,
-            export_incomplete: false,
-        };
-        let _ = walk_scopes(&linked, &mut scopes, &mut module_state);
-        let incomplete = module_state.export_incomplete;
-        let exports = scopes.first().map(|scope| {
-            Rc::new(ModuleExports {
-                terms: scope.terms_shadowed,
-                range: scope.range_shadowed,
-                values: scope.values.clone(),
-            })
-        });
-        (exports, incomplete)
-    };
-    state.visited.remove(&rel_path);
-    state.export_incomplete |= subtree_incomplete;
-    if !subtree_incomplete {
-        if let Some(exports) = result.as_ref() {
-            if charge_value_budget(exports.values.len(), state.active_export_entry_budget()) {
-                state
-                    .module_cache
-                    .insert(rel_path, Some(Rc::clone(exports)));
-            } else {
-                state.export_incomplete = true;
-            }
-        } else {
-            state.module_cache.insert(rel_path, None);
-        }
-    }
-    result
+    *byte_budget -= source.len();
+    (Some(source), false)
 }
 
 fn resolve_module_exports(
     resolved_source: Option<&str>,
     state: &mut WalkState<'_>,
 ) -> Option<Rc<ModuleExports>> {
-    let (dirs, source) = (state.source_dir?, resolved_source?);
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        module_file_exports(dirs, source, state)
+    let source = resolved_source?;
+    if state.import_depth >= MAX_STATIC_IMPORT_DEPTH {
+        state.export_incomplete = true;
+        return None;
     }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = (dirs, source);
-        None
+    let base = state.current_file.unwrap_or("");
+    let resolved_path = state.vfs.resolve(base, source).ok()?;
+    if state.visited.contains(&resolved_path) {
+        state.export_incomplete = true;
+        return None;
     }
+    if let Some(cached) = state.module_cache.get(&resolved_path) {
+        return cached.as_ref().map(Rc::clone);
+    }
+    let (maybe_source, budget_exhausted) = read_vfs_bounded(
+        state.vfs,
+        &resolved_path,
+        state
+            .shared_budgets
+            .import_bytes
+            .get_mut(state.in_dead_branch),
+    );
+    if budget_exhausted {
+        state.export_incomplete = true;
+        return None;
+    }
+    let Some(module_source) = maybe_source else {
+        state.module_cache.insert(resolved_path, None);
+        return None;
+    };
+
+    state.visited.insert(resolved_path.clone());
+    let (result, subtree_incomplete) = {
+        let root = typst_syntax::parse(&module_source);
+        let linked = LinkedNode::new(&root);
+        let mut scopes = vec![Rc::new(ScopeBindings::default())];
+        let mut module_state = WalkState {
+            offsets: None,
+            vfs: state.vfs,
+            current_file: Some(&resolved_path),
+            visited: state.visited,
+            module_cache: state.module_cache,
+            shared_budgets: state.shared_budgets,
+            local_budgets: BudgetPair::new(LocalBudgets::new(), LocalBudgets::new()),
+            import_depth: state.import_depth + 1,
+            in_dead_branch: state.in_dead_branch,
+            export_incomplete: false,
+        };
+        let _ = walk_scopes(&linked, &mut scopes, &mut module_state);
+        let incomplete = module_state.export_incomplete;
+        let exports = scopes
+            .first()
+            .map(|scope| Rc::new(scope.to_module_exports()));
+        (exports, incomplete)
+    };
+    state.visited.remove(&resolved_path);
+    state.export_incomplete |= subtree_incomplete;
+    if !subtree_incomplete {
+        if let Some(exports) = result.as_ref() {
+            if charge_value_budget(
+                exports.values.len(),
+                state
+                    .shared_budgets
+                    .export_entries
+                    .get_mut(state.in_dead_branch),
+            ) {
+                state
+                    .module_cache
+                    .insert(resolved_path, Some(Rc::clone(exports)));
+            } else {
+                state.export_incomplete = true;
+            }
+        } else {
+            state.module_cache.insert(resolved_path, None);
+        }
+    }
+    result
 }
 
 fn record_import_bindings(
@@ -1243,29 +1323,59 @@ fn record_import_bindings(
     scopes: &mut [Rc<ScopeBindings>],
     state: &mut WalkState<'_>,
 ) {
-    let resolved_source =
-        resolve_import_source_string(import.source(), scopes, state.active_value_budget());
-    let exports = match import.imports() {
-        Some(ast::Imports::Wildcard) | Some(ast::Imports::Items(_)) => {
-            resolve_module_exports(resolved_source.as_deref(), state)
-        }
-        None => None,
-    };
+    let mut source_was_static_module = false;
+    let (resolved_source, exports) =
+        match eval_static_value(import.source(), scopes, state.active_value_budget()) {
+            StaticValue::Module(m) => {
+                source_was_static_module = true;
+                (None, Some(m.0))
+            }
+            StaticValue::Str(s) => {
+                let s = s.to_string();
+                let exp = resolve_module_exports(Some(&s), state);
+                (Some(s), exp)
+            }
+            _ => (None, None),
+        };
     let is_wildcard = matches!(import.imports(), Some(ast::Imports::Wildcard));
     let copy_exports = is_wildcard
         && exports.as_ref().is_some_and(|exp| {
-            charge_value_budget(exp.values.len(), state.active_export_entry_budget())
+            charge_value_budget(
+                exp.values.len(),
+                state
+                    .shared_budgets
+                    .export_entries
+                    .get_mut(state.in_dead_branch),
+            )
         });
     if is_wildcard && exports.is_some() && !copy_exports {
         state.export_incomplete = true;
     }
 
+    let need_visible_names = is_wildcard
+        && (!copy_exports
+            || exports
+                .as_ref()
+                .is_none_or(|exp| exp.wildcard_state != WildcardImportState::None));
     let mut visible_names = Vec::new();
-    if is_wildcard && !copy_exports {
+    if need_visible_names {
         for s in scopes.iter() {
             visible_names.extend(s.values.keys().cloned());
         }
     }
+
+    let fallback_name = resolved_source
+        .as_deref()
+        .and_then(default_import_binding_name)
+        .map(str::to_string)
+        .or_else(|| {
+            if source_was_static_module {
+                if let ast::Expr::Ident(ident) = ungroup_expr(import.source()) {
+                    return Some(ident.get().to_string());
+                }
+            }
+            None
+        });
 
     let Some(scope_rc) = scopes.last_mut() else {
         return;
@@ -1273,25 +1383,31 @@ fn record_import_bindings(
     let scope = Rc::make_mut(scope_rc);
 
     if let Some(alias) = import.new_name() {
-        mark_binding(alias.get().as_str(), scope);
+        let alias_name = alias.get().as_str();
+        mark_binding(alias_name, scope);
+        let module_val = exports.as_ref().map_or(StaticValue::Unknown, |exp| {
+            StaticValue::Module(StaticModule(Rc::clone(exp)))
+        });
+        scope.values.insert(alias_name.to_string(), module_val);
     }
 
     if let Some(imports) = import.imports() {
         match imports {
             ast::Imports::Wildcard => {
-                scope.h_shadowed = true;
-                scope.measure_shadowed = true;
                 if let Some(exports) = exports {
-                    if exports.terms {
-                        scope.terms_shadowed = true;
+                    for set in &exports.exported_sets {
+                        scope.add_imported_set(set);
                     }
-                    if exports.range {
-                        scope.range_shadowed = true;
-                        scope
-                            .values
-                            .insert("range".to_string(), StaticValue::Unknown);
-                    }
+                    scope.wildcard_state = scope.wildcard_state.max(exports.wildcard_state);
                     if copy_exports {
+                        for name in visible_names {
+                            if (exports.exports_name(&name)
+                                || exports.wildcard_state != WildcardImportState::None)
+                                && !exports.values.contains_key(&name)
+                            {
+                                scope.values.insert(name, StaticValue::Unknown);
+                            }
+                        }
                         for (name, val) in &exports.values {
                             scope.values.insert(name.clone(), val.clone());
                         }
@@ -1299,42 +1415,56 @@ fn record_import_bindings(
                         for name in visible_names {
                             scope.values.insert(name, StaticValue::Unknown);
                         }
-                        scope.range_shadowed = true;
+                        scope.wildcard_state = scope
+                            .wildcard_state
+                            .max(WildcardImportState::UnloadedModule);
                     }
                 } else {
                     for name in visible_names {
                         scope.values.insert(name, StaticValue::Unknown);
                     }
-                    scope.range_shadowed = true;
-                    if resolved_source.is_none() {
-                        scope.terms_shadowed = true;
-                    }
+                    let fallback_state = if resolved_source.is_some() || source_was_static_module {
+                        WildcardImportState::UnloadedModule
+                    } else {
+                        WildcardImportState::UnknownSource
+                    };
+                    scope.wildcard_state = scope.wildcard_state.max(fallback_state);
                 }
             }
             ast::Imports::Items(items) => {
                 for item in items.iter() {
                     let bound_name = item.bound_name().get().as_str();
                     mark_binding(bound_name, scope);
-                    let orig_name = item.original_name().get().as_str();
-                    if let Some(exports) = exports.as_ref() {
-                        if let Some(val) = exports.values.get(orig_name) {
-                            scope.values.insert(bound_name.to_string(), val.clone());
+                    let segments: Vec<&str> =
+                        item.path().iter().map(|id| id.get().as_str()).collect();
+                    let resolved_val = match (exports.as_ref(), segments.split_first()) {
+                        (Some(root_exp), Some((&first, rest))) => {
+                            let mut current = root_exp.values.get(first).cloned();
+                            for &seg in rest {
+                                current = match current {
+                                    Some(StaticValue::Module(sub)) => {
+                                        sub.0.values.get(seg).cloned()
+                                    }
+                                    _ => None,
+                                };
+                            }
+                            current.unwrap_or(StaticValue::Unknown)
                         }
-                    }
+                        _ => StaticValue::Unknown,
+                    };
+                    scope.values.insert(bound_name.to_string(), resolved_val);
                 }
             }
         }
     } else if import.new_name().is_none() {
-        if let Some(name) = resolved_source
-            .as_deref()
-            .and_then(default_import_binding_name)
-        {
-            mark_binding(name, scope);
+        if let Some(name) = fallback_name {
+            mark_binding(&name, scope);
+            let module_val = exports.as_ref().map_or(StaticValue::Unknown, |exp| {
+                StaticValue::Module(StaticModule(Rc::clone(exp)))
+            });
+            scope.values.insert(name, module_val);
         } else {
-            scope.h_shadowed = true;
-            scope.measure_shadowed = true;
-            scope.terms_shadowed = true;
-            scope.range_shadowed = true;
+            scope.wildcard_state = WildcardImportState::UnknownSource;
         }
     }
 }
@@ -1476,14 +1606,7 @@ fn walk_scopes(
         SyntaxKind::LoopContinue => ControlFlow::Continue,
         SyntaxKind::Contextual => {
             if let Some(offsets) = state.offsets.as_deref_mut() {
-                if is_llap_shadowed(scopes) && llap_body(node.get()).is_some() {
-                    if let Some(kw) = node
-                        .children()
-                        .find(|child| child.kind() == SyntaxKind::Context)
-                    {
-                        offsets.push(kw.range().end);
-                    }
-                }
+                apply_shadow_rules(node, scopes, offsets);
                 walk_children_with_flow(node, scopes, state)
             } else {
                 ControlFlow::Normal
@@ -1853,16 +1976,19 @@ fn walk_scopes(
         }
         SyntaxKind::FuncCall => {
             if let Some(offsets) = state.offsets.as_deref_mut() {
-                if is_terms_shadowed(scopes) {
-                    if let Some(offset) = shadowed_terms_item_marker_offset(node) {
-                        offsets.push(offset);
-                    }
-                }
+                apply_shadow_rules(node, scopes, offsets);
             }
             walk_children_with_flow(node, scopes, state)
         }
         _ => walk_children_with_flow(node, scopes, state),
     }
+}
+
+fn shadowed_contextual_llap_offset(node: &LinkedNode<'_>) -> Option<usize> {
+    llap_body(node.get())?;
+    node.children()
+        .find(|child| child.kind() == SyntaxKind::Context)
+        .map(|kw| kw.range().end)
 }
 
 fn shadowed_terms_item_marker_offset(node: &LinkedNode<'_>) -> Option<usize> {
