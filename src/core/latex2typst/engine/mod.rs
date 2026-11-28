@@ -19,6 +19,7 @@
 
 #[allow(clippy::module_inception)]
 pub mod engine;
+mod input;
 pub mod lexer;
 pub mod primitives;
 pub mod token;
@@ -160,7 +161,7 @@ pub fn expand_latex(input: &str) -> String {
     let mut engine = Engine::new();
 
     // Tokenize
-    let tokens = tokenize(input);
+    let tokens = lexer::tokenize_marked(input);
 
     // Parse definitions and expand
     let expanded = engine.process(tokens);
@@ -195,7 +196,7 @@ pub fn expand_latex_with_warnings(input: &str, math_mode: bool) -> ExpandResult 
     };
 
     // Tokenize
-    let tokens = tokenize(input);
+    let tokens = lexer::tokenize_marked(input);
 
     // Parse definitions and expand
     let expanded = engine.process(tokens);

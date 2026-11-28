@@ -3,12 +3,15 @@
 //! This is the core expansion logic that processes a token stream,
 //! recognizes macro invocations, and expands them recursively.
 
+use super::input::{Checkpoint, Collect, Expansion, Frame, InputStack, Place, Runs, BOUNDARY};
 use super::primitives::{self, DefinitionKind, MacroSignature, PatternPart};
 use super::token::{TexToken, TokenList};
-use super::utils;
+use super::utils::{self, TokenSource};
 use super::ArgumentErrorType;
 use super::EngineWarning;
 use std::collections::HashMap;
+use std::ops::Range;
+use std::rc::Rc;
 
 /// Errors that can occur during macro argument parsing
 #[derive(Debug, Clone)]
@@ -86,6 +89,8 @@ pub struct MacroDb {
     // Stack of scopes. The last element is the current (innermost) scope.
     // The first element is the global scope.
     scopes: Vec<HashMap<String, MacroDef>>,
+    // Changes whenever a lookup may give a different result.
+    generation: u64,
 }
 
 impl Default for MacroDb {
@@ -99,6 +104,7 @@ impl MacroDb {
     pub fn new() -> Self {
         MacroDb {
             scopes: vec![HashMap::new()],
+            generation: 0,
         }
     }
 
@@ -109,13 +115,14 @@ impl MacroDb {
 
     /// Pop the current local scope
     pub fn pop_scope(&mut self) {
-        if self.scopes.len() > 1 {
-            self.scopes.pop();
+        if self.scopes.len() > 1 && self.scopes.pop().is_some_and(|scope| !scope.is_empty()) {
+            self.generation += 1;
         }
     }
 
     /// Define a macro in the current scope
     pub fn define(&mut self, name: String, def: MacroDef) {
+        self.generation += 1;
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name, def);
         }
@@ -123,6 +130,7 @@ impl MacroDb {
 
     /// Define a global macro (at the bottom of the stack)
     pub fn define_global(&mut self, name: String, def: MacroDef) {
+        self.generation += 1;
         if let Some(global_scope) = self.scopes.first_mut() {
             global_scope.insert(name, def);
         }
@@ -145,6 +153,7 @@ impl MacroDb {
 
     /// Remove a macro definition
     pub fn undefine(&mut self, name: &str) {
+        self.generation += 1;
         if let Some(scope) = self.scopes.last_mut() {
             scope.remove(name);
         }
@@ -154,6 +163,38 @@ impl MacroDb {
 // ============================================================================
 // Engine Constants
 // ============================================================================
+
+/// The arguments of a macro use.
+struct Args {
+    list: Vec<TokenList>,
+    /// The first argument is the default of an omitted optional argument.
+    default_used: bool,
+    /// For each argument, the places its tokens were read at (none for a
+    /// default argument).
+    places: Vec<Vec<Place>>,
+    /// Nesting level of the replacement text.
+    level: usize,
+    /// The expansion the replacement text is nested in.
+    parent: Option<Rc<Expansion>>,
+}
+
+/// Why arguments could not be read, and the tokens read for them.
+type ArgsError = (MacroError, Vec<TexToken>);
+
+/// Where the tokens of an argument are among the places recorded while
+/// reading the arguments (`None` for a default argument).
+type Span = Option<Range<usize>>;
+
+/// Read an argument (see [`utils::read_argument_in`]); also returns where
+/// its tokens are among the places recorded.
+fn read_recorded_argument(input: &mut InputStack) -> (TokenList, Range<usize>) {
+    utils::skip_spaces_in(input);
+    let braced = input.peek_token() == Some(&TexToken::BeginGroup);
+    let start = input.recorded_len() + usize::from(braced);
+    let arg = utils::read_argument_in(input);
+    let span = start..start + arg.len();
+    (arg, span)
+}
 
 /// Default maximum expansion depth (prevents stack overflow on recursive macros).
 const DEFAULT_MAX_DEPTH: usize = 200;
@@ -359,29 +400,116 @@ impl Engine {
         self.expand(tokens, 0)
     }
 
-    /// Expand macros in a token list
+    /// Expand macros in a token list whose tokens are at nesting level
+    /// `depth`.
+    ///
+    /// Depth is the nesting of expansions, not the number of macros used: a
+    /// macro read at level `d` puts its replacement text in at level `d + 1`
+    /// (environment begin/end code and `\edef` bodies likewise open one
+    /// level). Tokens that are put back unchanged (conditional branches,
+    /// `\expandafter`, the result of `\csname`) keep their level, so a
+    /// recursive call nests deeper however it is reached, while macros used
+    /// one after another stay at the level of the text that uses them. A
+    /// macro whose arguments take document text from a lower level, like a
+    /// TeX loop over the document, is nested only in that text, and a tail
+    /// call that goes on through pending input (a loop over a list held in a
+    /// macro) only at its caller's level (see [`Engine::read_arguments`]). A
+    /// macro may be expanded while its replacement text nests at most
+    /// `max_depth` deep, so a chain of macros nested exactly `max_depth` deep
+    /// expands fully; one level more is refused (see [`Engine::may_expand`]).
+    ///
+    /// Each document token read (text given to the engine, also when a macro
+    /// passes it on as the first copy of an argument, or takes it from a
+    /// lower level as an argument) starts a new top-level expansion with the
+    /// whole `max_tokens` budget for itself and everything nested in it (see
+    /// [`Engine::charge`]).
+    ///
+    /// Whenever no expansion is pending, and at every document token, the
+    /// engine takes a checkpoint, so that an expansion that exceeds the
+    /// token limit can be undone as a whole (see [`Engine::undo`]).
+    ///
+    /// Expansion uses an explicit input stack instead of recursion, so the
+    /// Rust stack does not grow with the length of the input, the nesting
+    /// depth or the number of macros, definitions, environments,
+    /// `\expandafter`s or `\csname`s in it. Environment code and `\edef`
+    /// bodies are pushed as collecting frames, whose expansion is written to
+    /// an output of its own; so is the name of a `\csname`, read from the
+    /// input up to its `\endcsname` (see [`Engine::finish_name`]).
     fn expand(&mut self, tokens: TokenList, depth: usize) -> TokenList {
-        if depth > self.config.max_depth {
-            self.push_warning(EngineWarning::DepthExceeded {
-                max_depth: self.config.max_depth,
-            });
-            return tokens;
-        }
+        let mut input = InputStack::new(tokens.into_inner(), depth);
+        self.expand_input(&mut input)
+    }
 
+    fn expand_input(&mut self, input: &mut InputStack) -> TokenList {
+        // Output of the innermost collecting frame (or of the whole input)
         let mut result = Vec::new();
-        let mut iter = tokens.into_inner().into_iter().peekable();
+        // Outputs of the enclosing collecting frames
+        let mut saved: Vec<Vec<TexToken>> = Vec::new();
 
-        while let Some(token) = iter.next() {
-            // Check token limit to prevent exponential expansion
-            self.context.current_token_count += 1;
-            if self.context.current_token_count > self.config.max_tokens {
-                self.push_warning(EngineWarning::TokenLimitExceeded {
-                    max_tokens: self.config.max_tokens,
-                });
-                // Return what we have so far plus remaining tokens
-                result.push(token);
-                result.extend(iter);
-                return TokenList::from_vec(result);
+        loop {
+            // A collecting frame was pushed: its expansion is written apart
+            while saved.len() < input.collectors() {
+                saved.push(std::mem::take(&mut result));
+            }
+            if std::mem::take(&mut input.exceeded) {
+                self.undo(input, &mut result, &mut saved);
+            } else {
+                input.refusing = false;
+            }
+            // Nothing to undo before this point
+            let fresh = !input.pending();
+            if fresh {
+                input.commit(self.checkpoint(&result, &saved), None);
+            }
+            // `@` is read as a letter only while \makeatletter is in effect
+            input.set_at_letter(self.state.at_is_letter);
+            let Some(token) = input.next() else {
+                // The end of the input, or of a collecting frame. A `\csname`
+                // name still being read in it has no `\endcsname`: it is
+                // written out after `\csname` as read so far
+                if input.in_name() {
+                    let content = std::mem::replace(&mut result, saved.pop().unwrap_or_default());
+                    if let Some((_, then)) = input.close_name() {
+                        result.push(TexToken::ControlSeq("csname".to_string()));
+                        result.extend(content);
+                        then.iter().for_each(|(_, place)| place.unhold());
+                        input.push_leveled(then);
+                    }
+                    continue;
+                }
+                let Some(frame) = input.finish_collector() else {
+                    break;
+                };
+                let content = std::mem::replace(&mut result, saved.pop().unwrap_or_default());
+                self.finish(frame, content, input, &mut result);
+                continue;
+            };
+            let place = input.place();
+            if place.doc {
+                // A new top-level expansion (undone as a whole with the
+                // `\csname` whose name it is in, if any)
+                input.start_top_level();
+                self.context.current_token_count = 0;
+                if fresh {
+                    input.checkpoint.count = 0;
+                    input.checkpoint.refused = 0;
+                } else if !input.reading_name() {
+                    input.commit(self.checkpoint(&result, &saved), Some(&token));
+                }
+            }
+            if let TexToken::ControlSeq(name) = &token {
+                let generation = self.state.db.generation;
+                if !input.refusing {
+                    if let Some(runaway) = input.was_undone(name, generation, self.config.math_mode)
+                    {
+                        // The same expansion exceeded the token limit before
+                        self.warn_token_limit(input);
+                        if runaway {
+                            self.warn_depth(input);
+                        }
+                        input.refusing = true;
+                    }
+                }
             }
             match &token {
                 TexToken::BeginGroup => {
@@ -395,9 +523,9 @@ impl Engine {
                 // Track $ and $$ to update math_mode for \ifmmode
                 TexToken::MathShift => {
                     // Check if this is $$ (display math) by peeking at next token
-                    if matches!(iter.peek(), Some(TexToken::MathShift)) {
+                    if matches!(input.peek_token(), Some(TexToken::MathShift)) {
                         // Consume the second $ for $$
-                        iter.next();
+                        input.next();
                         result.push(TexToken::MathShift);
                         result.push(TexToken::MathShift);
                     } else {
@@ -424,74 +552,54 @@ impl Engine {
                 }
                 TexToken::ControlSeq(name) if name == "global" => {
                     // Handle \global prefix
-                    if let Some(TexToken::ControlSeq(next_name)) = iter.peek() {
-                        if primitives::is_definition_command(next_name) {
-                            if let Some(TexToken::ControlSeq(cmd_name)) = iter.next() {
-                                let rest =
-                                    self.handle_definition(&cmd_name, &mut iter, true, depth);
-                                result.extend(rest.into_inner());
-                            }
-                        } else {
-                            result.push(token.clone());
+                    let definition = match input.peek_token() {
+                        Some(TexToken::ControlSeq(next_name))
+                            if primitives::is_definition_command(next_name) =>
+                        {
+                            Some(next_name.clone())
                         }
+                        _ => None,
+                    };
+                    if let Some(cmd_name) = definition {
+                        input.next();
+                        self.handle_definition(&cmd_name, input, true, &place);
                     } else {
                         result.push(token.clone());
                     }
                 }
                 TexToken::ControlSeq(name) if primitives::is_definition_command(name) => {
-                    let rest = self.handle_definition(name, &mut iter, false, depth);
-                    result.extend(rest.into_inner());
+                    self.handle_definition(name, input, false, &place);
                 }
                 TexToken::ControlSeq(name) if name == "begin" => {
-                    if let Some(env_name) = self.read_env_name(&mut iter) {
-                        let (tokens, _scope_pushed) =
-                            self.handle_begin_environment(&env_name, &mut iter, depth);
-                        result.extend(tokens);
+                    if let Some(env_name) = self.read_env_name(input) {
+                        self.handle_begin_environment(&env_name, input, &place, &mut result);
                     } else {
                         result.push(token);
                     }
                 }
                 TexToken::ControlSeq(name) if name == "end" => {
-                    if let Some(env_name) = self.read_env_name(&mut iter) {
-                        let tokens = self.handle_end_environment(&env_name, &mut iter, depth);
-                        result.extend(tokens);
+                    if let Some(env_name) = self.read_env_name(input) {
+                        self.handle_end_environment(&env_name, input, &place, &mut result);
                     } else {
                         result.push(token.clone());
                     }
                 }
                 TexToken::ControlSeq(name) if name == "expandafter" => {
-                    if let Some(t1) = iter.next() {
-                        if let Some(t2) = iter.next() {
-                            // Expand t2 ONCE
-                            let expanded_t2 = if let Some(exp) =
-                                self.expand_token_once(t2.clone(), &mut iter, depth)
-                            {
-                                exp
-                            } else {
-                                TokenList::from_vec(vec![t2])
-                            };
-
-                            // Reconstruct stream: t1 + expanded_t2 + Rest
-                            let mut new_tokens = vec![t1];
-                            new_tokens.extend(expanded_t2.into_inner());
-                            new_tokens.extend(iter); // Consumes the rest
-
-                            // Continue expansion
-                            return self.expand(TokenList::from_vec(new_tokens), depth);
-                        } else {
-                            result.push(t1);
-                        }
+                    if !self.expand_after(input) {
+                        // Only one token follows: nothing to expand
+                        result.extend(input.next());
                     }
                 }
                 TexToken::ControlSeq(name) if name == "csname" => {
-                    if let Some(expanded_cs) = self.process_csname(&mut iter, depth) {
-                        // Reconstruct stream: [expanded_cs] + Rest
-                        let mut new_tokens = vec![expanded_cs];
-                        new_tokens.extend(iter);
-                        return self.expand(TokenList::from_vec(new_tokens), depth);
-                    } else {
+                    if self.may_expand(&place, None, false, input) {
+                        input.open_name(place.clone(), Vec::new());
+                    } else if place.doc {
                         result.push(token.clone());
                     }
+                }
+                TexToken::ControlSeq(name) if name == "endcsname" && input.in_name() => {
+                    let content = std::mem::replace(&mut result, saved.pop().unwrap_or_default());
+                    self.finish_name(content, input);
                 }
                 TexToken::ControlSeq(name) if name == "makeatletter" => {
                     // Enable @ as a letter in control sequence names
@@ -505,7 +613,7 @@ impl Engine {
                 }
                 // Handle LaTeX3 ExplSyntax blocks - skip entirely with warning
                 TexToken::ControlSeq(name) if name == "ExplSyntaxOn" => {
-                    let skipped_content = self.skip_explsyntax_block(&mut iter);
+                    let skipped_content = self.skip_explsyntax_block(input);
                     self.push_warning(EngineWarning::LaTeX3Skipped {
                         token_count: skipped_content.len(),
                     });
@@ -518,59 +626,42 @@ impl Engine {
                     // Output as a comment to preserve visibility
                     result.push(TexToken::Comment(format!(" Unsupported: \\{} ", name)));
                     // Try to consume any arguments to prevent cascading issues
-                    self.skip_primitive_args(name, &mut iter);
+                    self.skip_primitive_args(name, input);
                 }
+                // Under \makeatletter the input stack has already glued `@`
+                // and the letters after it onto the name
                 TexToken::ControlSeq(name) => {
-                    // If at_is_letter is true, try to merge @ and subsequent letters
-                    let merged_name = if self.state.at_is_letter {
-                        self.merge_at_letters(name.clone(), &mut iter)
-                    } else {
-                        name.clone()
-                    };
-
-                    if let Some(macro_def) = self.state.db.get(&merged_name).cloned() {
-                        match self.parse_arguments(&mut iter, &macro_def) {
-                            Ok(args) => {
-                                // Check depth limit BEFORE recursing - output args directly if exceeded
-                                if depth + 1 > self.config.max_depth {
-                                    self.push_warning(EngineWarning::DepthExceeded {
-                                        max_depth: self.config.max_depth,
-                                    });
-                                    // Output arguments directly to preserve content (e.g., "x")
-                                    for arg in args {
-                                        result.extend(arg.into_inner());
-                                    }
-                                    continue;
+                    if let Some(macro_def) = self.state.db.get(name).cloned() {
+                        match self.read_use(input, &macro_def, &place, name) {
+                            // A refused use is dropped and its arguments stay
+                            // in the input; document text stays as it is
+                            None => {
+                                if place.doc {
+                                    result.push(token.clone());
                                 }
-
-                                let expanded_body = self.substitute_args(&macro_def.body, &args);
-                                // TeX semantics: insert expanded tokens at front of input stream
-                                // and continue processing. This is crucial for macros that expand
-                                // to special commands like \iftrue, \iffalse, etc.
-                                let mut new_tokens = expanded_body.into_inner();
-                                new_tokens.extend(iter);
-                                let fully_expanded =
-                                    self.expand(TokenList::from_vec(new_tokens), depth + 1);
-                                result.extend(fully_expanded.into_inner());
-                                return TokenList::from_vec(result);
                             }
-                            Err((err, consumed)) => {
-                                // Push warning and rollback: output macro name and consumed tokens as raw text
-                                self.handle_macro_error(&merged_name, &err, consumed, &mut result);
-                                // Continue processing remaining tokens
+                            // TeX semantics: insert expanded tokens at front of input stream
+                            // and continue processing. This is crucial for macros that expand
+                            // to special commands like \iftrue, \iffalse, etc.
+                            Some((Ok(args), _)) => {
+                                self.push_replacement(name, &macro_def, args, &place, input)
+                            }
+                            // Push warning and rollback: output macro name and consumed tokens as raw text
+                            Some((Err((err, consumed)), _)) => {
+                                self.handle_macro_error(name, &err, consumed, &mut result)
                             }
                         }
                     } else if let Some(special_result) =
-                        self.handle_special_macro(&merged_name, &mut iter)
+                        self.handle_special_macro(name, input, &place)
                     {
-                        let fully_expanded = self.expand(special_result, depth + 1);
-                        result.extend(fully_expanded.into_inner());
+                        // TeX semantics: the selected tokens are read next
+                        input.push_leveled(special_result);
                     } else {
-                        result.push(TexToken::ControlSeq(merged_name));
+                        result.push(token.clone());
                     }
                 }
                 _ => {
-                    result.push(token.clone());
+                    result.push(token);
                 }
             }
         }
@@ -578,179 +669,434 @@ impl Engine {
         TokenList::from_vec(result)
     }
 
-    /// Try to expand a single token once. Consumes args from iter if needed.
-    fn expand_token_once<I>(
+    /// Use the expansion of a collecting frame, `content`; `result` is the
+    /// output of the enclosing frame.
+    fn finish(
         &mut self,
-        token: TexToken,
-        iter: &mut std::iter::Peekable<I>,
-        depth: usize,
-    ) -> Option<TokenList>
-    where
-        I: Iterator<Item = TexToken>,
-    {
-        match token {
-            TexToken::ControlSeq(ref name) if name == "expandafter" => {
-                // Recurse expandafter
-                if let Some(t1) = iter.next() {
-                    if let Some(t2) = iter.next() {
-                        let expanded_t2 =
-                            if let Some(exp) = self.expand_token_once(t2.clone(), iter, depth) {
-                                exp
-                            } else {
-                                TokenList::from_vec(vec![t2])
-                            };
-                        let mut result = vec![t1];
-                        result.extend(expanded_t2.into_inner());
-                        Some(TokenList::from_vec(result))
-                    } else {
-                        Some(TokenList::from_vec(vec![t1]))
-                    }
+        frame: Frame,
+        content: Vec<TexToken>,
+        input: &mut InputStack,
+        result: &mut Vec<TexToken>,
+    ) {
+        match frame.collect {
+            Some(Collect::Edef {
+                name,
+                signature,
+                global,
+            }) => {
+                let def = MacroDef::from_signature(signature, TokenList::from_vec(content));
+                if global {
+                    self.state.db.define_global(name, def);
                 } else {
-                    Some(TokenList::new())
+                    self.state.db.define(name, def);
                 }
             }
-            TexToken::ControlSeq(ref name) if name == "csname" => self
-                .process_csname(iter, depth)
-                .map(|cs| TokenList::from_vec(vec![cs])),
-            TexToken::ControlSeq(ref name) => {
-                if let Some(macro_def) = self.state.db.get(name).cloned() {
-                    match self.parse_arguments(iter, &macro_def) {
-                        Ok(args) => Some(self.substitute_args(&macro_def.body, &args)),
-                        Err((err, consumed)) => {
-                            // Push warning and return original token + consumed as unexpanded
-                            self.push_warning(EngineWarning::ArgumentParsingFailed {
-                                macro_name: name.clone(),
-                                error_kind: ArgumentErrorType::Other(format!(
-                                    "{:?} (in expandafter)",
-                                    err
-                                )),
-                            });
-                            let mut result = vec![token.clone()];
-                            result.extend(consumed);
-                            Some(TokenList::from_vec(result))
-                        }
-                    }
-                } else {
-                    self.handle_special_macro(name, iter)
-                }
+            Some(Collect::BeginEnv) => {
+                self.state.db.push_scope();
+                result.push(TexToken::BeginGroup);
+                result.extend(content);
             }
-            _ => None,
+            Some(Collect::EndEnv { name }) => {
+                // Only the group of an open environment of that name is
+                // closed (with those opened inside it and left open)
+                result.extend(content);
+                self.close_env(&name, input, result);
+            }
+            None => {}
         }
     }
 
-    /// Merge @ and subsequent letters into a control sequence name when at_is_letter is true.
-    /// This reconstructs `\foo@bar` from tokens `\foo`, `@`, `b`, `a`, `r`.
-    fn merge_at_letters<I>(&self, mut name: String, iter: &mut std::iter::Peekable<I>) -> String
-    where
-        I: Iterator<Item = TexToken>,
-    {
-        // Keep consuming @ and alphabetic characters
-        loop {
-            match iter.peek() {
-                Some(TexToken::Char('@')) => {
-                    name.push('@');
-                    iter.next();
-                }
-                Some(TexToken::Char(c)) if c.is_ascii_alphabetic() => {
-                    name.push(*c);
-                    iter.next();
-                }
-                _ => break,
-            }
-        }
-        name
-    }
-
-    /// Pre-process a token list to merge @ characters into control sequences.
-    /// Used when at_is_letter is true to handle definitions like \def\foo@bar{...}
-    fn merge_at_in_tokens(&self, tokens: Vec<TexToken>) -> TokenList {
-        let mut result = Vec::new();
-        let mut iter = tokens.into_iter().peekable();
-
-        while let Some(token) = iter.next() {
-            match token {
-                TexToken::ControlSeq(mut name) => {
-                    // Try to merge subsequent @ and letters
-                    loop {
-                        match iter.peek() {
-                            Some(TexToken::Char('@')) => {
-                                name.push('@');
-                                iter.next();
-                            }
-                            Some(TexToken::Char(c)) if c.is_ascii_alphabetic() => {
-                                name.push(*c);
-                                iter.next();
-                            }
-                            _ => break,
-                        }
-                    }
-                    result.push(TexToken::ControlSeq(name));
-                }
-                _ => result.push(token),
-            }
-        }
-
-        TokenList::from_vec(result)
-    }
-
-    /// Process \csname ... \endcsname and return the resulting control sequence token
-    fn process_csname<I>(&mut self, iter: &mut I, depth: usize) -> Option<TexToken>
-    where
-        I: Iterator<Item = TexToken>,
-    {
-        let mut cs_tokens = Vec::new();
-        let mut found_end = false;
-
-        for t in iter.by_ref() {
-            if let TexToken::ControlSeq(ref n) = t {
-                if n == "endcsname" {
-                    found_end = true;
-                    break;
-                }
-            }
-            cs_tokens.push(t);
-        }
-
-        if found_end {
-            // Expand the content
-            let expanded_cs = self.expand(TokenList::from_vec(cs_tokens), depth + 1);
-            let mut cs_name = String::new();
-            for t in expanded_cs.into_inner() {
-                match t {
-                    TexToken::Char(c) => cs_name.push(c),
-                    TexToken::Space => cs_name.push(' '),
-                    TexToken::ControlSeq(n) => cs_name.push_str(&n),
-                    _ => {}
-                }
-            }
-            Some(TexToken::ControlSeq(cs_name))
-        } else {
-            None
+    /// The engine's state now, for a checkpoint; `result` is the output
+    /// being written and `saved` the outputs of the enclosing collecting
+    /// frames.
+    fn checkpoint(&self, result: &[TexToken], saved: &[Vec<TexToken>]) -> Checkpoint {
+        Checkpoint {
+            out_len: result.len(),
+            saved_len: saved.len(),
+            scopes: self.state.db.scopes.len(),
+            generation: self.state.db.generation,
+            count: self.context.current_token_count,
+            math_mode: self.config.math_mode,
+            at_letter: self.state.at_is_letter,
+            refused: 0,
         }
     }
 
-    /// Helper to handle definition commands
-    fn handle_definition<I>(
+    /// Undo the expansion that exceeded the token limit (see
+    /// [`Engine::charge`]) back to the last checkpoint, which was taken
+    /// before it started: what it wrote and pushed is dropped, the scopes it
+    /// opened are closed, the math mode, `@` setting and token count it
+    /// changed are reset, and the tokens it read from the input are put back
+    /// (see [`InputStack::undo`]). Its first token is then read again with
+    /// every expansion refused (see [`Engine::may_expand`]): a use of a
+    /// macro written in the document stays as it is, and its arguments and
+    /// the text after it are expanded. Definitions it made stay.
+    fn undo(
+        &mut self,
+        input: &mut InputStack,
+        result: &mut Vec<TexToken>,
+        saved: &mut Vec<Vec<TexToken>>,
+    ) {
+        let checkpoint = input.checkpoint;
+        if saved.len() > checkpoint.saved_len {
+            *result = saved
+                .drain(checkpoint.saved_len..)
+                .next()
+                .unwrap_or_default();
+        }
+        result.truncate(checkpoint.out_len);
+        while self.state.db.scopes.len() > checkpoint.scopes.max(1) {
+            self.state.db.pop_scope();
+        }
+        while self.state.db.scopes.len() < checkpoint.scopes {
+            self.state.db.push_scope();
+        }
+        self.config.math_mode = checkpoint.math_mode;
+        self.state.at_is_letter = checkpoint.at_letter;
+        self.context.current_token_count = checkpoint.count;
+        input.undo();
+    }
+
+    /// Push the replacement text of macro `name`, read at `place`, whose
+    /// arguments have been read, in front of the remaining input, unless the
+    /// token limit stops it (see [`Engine::charge`]).
+    fn push_replacement(
         &mut self,
         name: &str,
-        iter: &mut std::iter::Peekable<I>,
-        is_global: bool,
-        depth: usize,
-    ) -> TokenList
-    where
-        I: Iterator<Item = TexToken>,
-    {
-        let remaining: Vec<TexToken> = iter.collect();
+        macro_def: &MacroDef,
+        args: Args,
+        place: &Place,
+        input: &mut InputStack,
+    ) {
+        let cost = Self::expansion_cost(&macro_def.body, &args.list, args.default_used);
+        if self.charge(cost, name, place, input) {
+            let body = self.substitute_args(&macro_def.body, &args);
+            let expansion = input.new_expansion(Some(name), place.level, args.parent);
+            input.push_expansion(body, args.level, expansion, None);
+        }
+    }
 
-        // If at_is_letter is true, pre-process tokens to merge @ into control sequences
-        let remaining_list = if self.state.at_is_letter {
-            self.merge_at_in_tokens(remaining)
-        } else {
-            TokenList::from_vec(remaining)
+    /// Whether `name` (a macro or an environment's code; `None` for an
+    /// `\edef` body or a `\csname` name), read at `place`, may be expanded.
+    ///
+    /// Refused are:
+    /// - every expansion while the first token of an undone expansion is
+    ///   read again (see [`Engine::undo`]);
+    /// - expansion whose replacement text would nest deeper than
+    ///   `max_depth` (a runaway recursion, or nesting too deep), with a
+    ///   [`EngineWarning::DepthExceeded`] reported once per top-level
+    ///   expansion. A use read at `max_depth` from an expansion whose text
+    ///   has all been read may be a tail call that adds no depth (see
+    ///   [`Engine::read_arguments`]): with `tail`, it is allowed here and
+    ///   decided once its arguments have been read (see
+    ///   [`Engine::read_use`]). If the name is being expanded already (a
+    ///   runaway recursion), it is then refused deeper than its outermost
+    ///   expansion until that expansion is over, else deeper in the
+    ///   expansion it was read from (see [`InputStack::refuse`]); so is the
+    ///   name of an expansion that read nothing but refused uses. A
+    ///   recursion that branches (`\def\a{\a\a}`) thus stops at once, while
+    ///   the text pending around it, and a later use of the same macro, are
+    ///   still expanded.
+    ///
+    /// A refused use is dropped, and its arguments stay in the input;
+    /// document text is written out as it is.
+    fn may_expand(
+        &mut self,
+        place: &Place,
+        name: Option<&str>,
+        tail: bool,
+        input: &mut InputStack,
+    ) -> bool {
+        if input.refusing {
+            return false;
+        }
+        let Some(name) = name else {
+            return true;
         };
+        if !input.is_refused(name, place.level, place.src.as_ref()) {
+            if place.level < self.config.max_depth {
+                return true;
+            }
+            let caller = place.src.as_ref();
+            if tail && caller.is_some_and(|e| e.is_exhausted() && !e.had_refusal()) {
+                return true;
+            }
+            self.refuse_too_deep(name, place, input);
+        }
+        input.note_refusal();
+        place.note_refused();
+        false
+    }
 
-        match primitives::parse_definition(name, remaining_list) {
-            Ok((def_kind, rest)) => {
+    /// Refuse `name`, read at `place`, for nesting deeper than `max_depth`.
+    fn refuse_too_deep(&mut self, name: &str, place: &Place, input: &mut InputStack) {
+        self.warn_depth(input);
+        input.refuse(name, place.level, place.src.as_ref());
+    }
+
+    /// Read the arguments of a use of macro (or environment) `name`, read at
+    /// `place`, if it may be expanded (see [`Engine::may_expand`]); `None` if
+    /// it is refused, with its arguments left in the input. A use at
+    /// `max_depth` is refused once its arguments are read unless its
+    /// replacement text nests no deeper than `max_depth` (a tail call).
+    fn read_use(
+        &mut self,
+        input: &mut InputStack,
+        macro_def: &MacroDef,
+        place: &Place,
+        name: &str,
+    ) -> Option<(Result<Args, ArgsError>, Vec<Place>)> {
+        if !self.may_expand(place, Some(name), true, input) {
+            return None;
+        }
+        if place.level < self.config.max_depth {
+            return Some(self.read_arguments(input, macro_def, place));
+        }
+        input.keep_tokens();
+        let (parsed, places) = self.read_arguments(input, macro_def, place);
+        let tokens = input.take_kept_tokens();
+        if matches!(&parsed, Ok(args) if args.level <= self.config.max_depth) {
+            return Some((parsed, places));
+        }
+        self.refuse_too_deep(name, place, input);
+        place.note_refused();
+        input.push_leveled(tokens.into_iter().zip(places).collect());
+        None
+    }
+
+    /// Report [`EngineWarning::DepthExceeded`], once per top-level
+    /// expansion.
+    fn warn_depth(&mut self, input: &mut InputStack) {
+        if !std::mem::replace(&mut input.depth_warned, true) {
+            self.push_warning(EngineWarning::DepthExceeded {
+                max_depth: self.config.max_depth,
+            });
+        }
+    }
+
+    /// Charge an expansion of `name`, read at `place`, that adds `cost`
+    /// tokens to the current top-level expansion. Returns `false` if it must
+    /// not happen.
+    ///
+    /// Only tokens produced by expansion count against `max_tokens` (see
+    /// [`Engine::expansion_cost`]): macro bodies, environment code and
+    /// default arguments. Document text never does, as the count starts
+    /// again with each top-level expansion. The limit thus bounds what a
+    /// single use expands to (e.g. exponential expansion), not the length of
+    /// the document. An expansion that would exceed it is undone back to the
+    /// last checkpoint (see [`Engine::undo`]), and a
+    /// [`EngineWarning::TokenLimitExceeded`] is reported once per top-level
+    /// expansion; if a macro is being expanded inside an expansion of itself
+    /// there (a runaway recursion with a large body), a
+    /// [`EngineWarning::DepthExceeded`] is reported too.
+    fn charge(&mut self, cost: usize, name: &str, place: &Place, input: &mut InputStack) -> bool {
+        let total = self.context.current_token_count.saturating_add(cost);
+        if total > self.config.max_tokens {
+            self.warn_token_limit(input);
+            if Expansion::is_runaway(place.src.as_ref(), name) {
+                self.warn_depth(input);
+                input.runaway = true;
+            }
+            input.exceeded = true;
+            return false;
+        }
+        self.context.current_token_count = total;
+        true
+    }
+
+    /// Report [`EngineWarning::TokenLimitExceeded`], once per top-level
+    /// expansion.
+    fn warn_token_limit(&mut self, input: &mut InputStack) {
+        if !std::mem::replace(&mut input.token_warned, true) {
+            self.push_warning(EngineWarning::TokenLimitExceeded {
+                max_tokens: self.config.max_tokens,
+            });
+        }
+    }
+
+    /// Number of tokens a macro expansion adds to the input, for `max_tokens`.
+    ///
+    /// Arguments read from the input were already there, as document text or
+    /// as the output of an earlier expansion that was counted then, so the
+    /// first copy of each only moves those tokens. The body's own tokens,
+    /// every further copy of an argument and every copy of a default
+    /// argument (`default_used`: the optional first argument was not given)
+    /// are new, and are counted. The cost is thus at least what the expansion
+    /// grows the input by: document text passed as an argument is free
+    /// however deeply it is nested, while a body that repeats its arguments
+    /// (`\def\a#1{#1#1}` nested) is caught.
+    fn expansion_cost(body: &TokenList, args: &[TokenList], default_used: bool) -> usize {
+        let mut copied = vec![false; args.len()];
+        if let Some(first) = copied.first_mut() {
+            *first = default_used;
+        }
+        body.as_slice()
+            .iter()
+            .map(|token| match token {
+                TexToken::Param(n) => {
+                    let idx = (*n as usize).saturating_sub(1);
+                    match args.get(idx) {
+                        Some(arg) if std::mem::replace(&mut copied[idx], true) => arg.len(),
+                        _ => 0,
+                    }
+                }
+                _ if *token == BOUNDARY => 0,
+                _ => 1,
+            })
+            .sum()
+    }
+
+    /// `\expandafter`: read the next two tokens, expand the second one once
+    /// and put the first back in front of the result. Returns `false`, with
+    /// the token put back, if only one token follows.
+    ///
+    /// When the second token is itself `\expandafter`, it acts on the tokens
+    /// after it in the same way, and so on: the first tokens are set aside on
+    /// a stack and put back, in order, once the last token of the chain has
+    /// been expanded. A chain of any length thus takes no Rust recursion.
+    /// Every token put back keeps its own place.
+    fn expand_after(&mut self, input: &mut InputStack) -> bool {
+        let mut set_aside = Vec::new();
+        let expanded = loop {
+            let Some(t1) = input.next() else {
+                break true;
+            };
+            let place = input.place();
+            place.hold();
+            set_aside.push((t1, place));
+            let Some(t2) = input.next() else {
+                break set_aside.len() > 1;
+            };
+            let place = input.place();
+            if matches!(&t2, TexToken::ControlSeq(name) if name == "expandafter") {
+                continue;
+            }
+            if !self.expand_once(&t2, &place, input, &mut set_aside) {
+                input.push(vec![t2], place);
+            }
+            break true;
+        };
+        for (token, place) in set_aside.into_iter().rev() {
+            place.unhold();
+            input.push(vec![token], place);
+        }
+        expanded
+    }
+
+    /// Expand `token`, read at `place`, once, consuming its arguments from
+    /// `input` and putting the result back in front of it. Returns `false` if
+    /// the token is not expandable, or is document text whose expansion is
+    /// refused (it is then read again, and refused again, as it is). The
+    /// tokens in `set_aside` are put back after a `\csname` name has been
+    /// read.
+    fn expand_once(
+        &mut self,
+        token: &TexToken,
+        place: &Place,
+        input: &mut InputStack,
+        set_aside: &mut Vec<(TexToken, Place)>,
+    ) -> bool {
+        let TexToken::ControlSeq(name) = token else {
+            return false;
+        };
+        if name == "csname" {
+            if !self.may_expand(place, None, false, input) {
+                return !place.doc;
+            }
+            input.open_name(place.clone(), std::mem::take(set_aside));
+            return true;
+        }
+        if let Some(macro_def) = self.state.db.get(name).cloned() {
+            let Some((parsed, places)) = self.read_use(input, &macro_def, place, name) else {
+                return !place.doc;
+            };
+            match parsed {
+                Ok(args) => self.push_replacement(name, &macro_def, args, place, input),
+                Err((err, consumed)) => {
+                    // Push warning and put original token + consumed back
+                    // unexpanded, each token at the place it was read at
+                    self.push_warning(EngineWarning::ArgumentParsingFailed {
+                        macro_name: name.clone(),
+                        error_kind: ArgumentErrorType::Other(format!("{:?} (in expandafter)", err)),
+                    });
+                    let places = places.into_iter().chain(std::iter::repeat(place.clone()));
+                    let consumed = consumed.into_iter().zip(places);
+                    input.push_leveled(
+                        std::iter::once((token.clone(), place.clone()))
+                            .chain(consumed)
+                            .collect(),
+                    );
+                }
+            }
+            return true;
+        }
+        match self.handle_special_macro(name, input, place) {
+            Some(tokens) => {
+                input.push_leveled(tokens);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// End the `\csname` name being read, whose expansion is `content`: the
+    /// control sequence it names is put in front of the input, at the
+    /// deepest place of the tokens it was read from (document text if they
+    /// all are), followed by the tokens `\expandafter` set aside.
+    ///
+    /// As in TeX, the name is read from the input with expansion until the
+    /// `\endcsname` that ends it, so a `\csname` or macro inside it is
+    /// expanded first; names nest on the input stack, not in Rust recursion.
+    fn finish_name(&mut self, content: Vec<TexToken>, input: &mut InputStack) {
+        let Some((place, then)) = input.close_name() else {
+            return;
+        };
+        let mut cs_name = String::new();
+        for t in content {
+            match t {
+                TexToken::Char(c) => cs_name.push(c),
+                TexToken::Space => cs_name.push(' '),
+                TexToken::ControlSeq(n) => cs_name.push_str(&n),
+                _ => {}
+            }
+        }
+        input.push(vec![TexToken::ControlSeq(cs_name)], place);
+        for (token, place) in then.into_iter().rev() {
+            place.unhold();
+            input.push(vec![token], place);
+        }
+    }
+
+    /// Close the group of environment `name` (see [`InputStack::close_env`]).
+    fn close_env(&mut self, name: &str, input: &mut InputStack, result: &mut Vec<TexToken>) {
+        for _ in 0..input.close_env(name) {
+            result.push(TexToken::EndGroup);
+            self.state.db.pop_scope();
+        }
+    }
+
+    /// Helper to handle definition commands (read at `place`)
+    ///
+    /// Only the definition itself (name, parameter text and body) is read
+    /// from the input; the input after it is left in place for the main loop.
+    /// Its bodies keep where a space separated a control word from an `@`
+    /// (see [`TokenSource::boundary`]).
+    fn handle_definition(
+        &mut self,
+        name: &str,
+        input: &mut InputStack,
+        is_global: bool,
+        place: &Place,
+    ) {
+        input.start_recording();
+        input.marking = true;
+        let read = primitives::read_definition(name, input);
+        input.marking = false;
+        // Recording only lets an argument given back at the end of the
+        // input return to its own places.
+        input.take_recorded();
+        match read {
+            Some(def_kind) => {
                 match def_kind {
                     DefinitionKind::NewCommand {
                         name,
@@ -798,8 +1144,24 @@ impl Engine {
                         signature,
                         body,
                     } => {
-                        let expanded_body = self.expand(body, depth + 1);
-                        let def = MacroDef::from_signature(signature, expanded_body);
+                        // The body is expanded on the input stack (see
+                        // `Engine::finish`) as produced text, so a body
+                        // over the token limit undoes the whole use that
+                        // defined it and its document text is kept. A
+                        // refused body is defined unexpanded.
+                        if self.may_expand(place, None, false, input) {
+                            let collect = Collect::Edef {
+                                name,
+                                signature,
+                                global: is_global,
+                            };
+                            let body = Runs::of(body.into_inner(), false).finish();
+                            let expansion =
+                                input.new_expansion(None, place.level, place.src.clone());
+                            input.push_expansion(body, place.level + 1, expansion, Some(collect));
+                            return;
+                        }
+                        let def = MacroDef::from_signature(signature, body);
                         if is_global {
                             self.state.db.define_global(name, def);
                         } else {
@@ -945,20 +1307,18 @@ impl Engine {
                         }
                     }
                 }
-                self.expand(rest, depth)
             }
-            Err(remaining) => self.expand(remaining, depth),
+            None => {
+                // A malformed definition is dropped, with the tokens read for it
+            }
         }
     }
 
     /// Read an environment name from {envname}
-    fn read_env_name<I>(&self, iter: &mut std::iter::Peekable<I>) -> Option<String>
-    where
-        I: Iterator<Item = TexToken>,
-    {
-        utils::skip_spaces(iter);
+    fn read_env_name<S: TokenSource>(&self, iter: &mut S) -> Option<String> {
+        utils::skip_spaces_in(iter);
 
-        if iter.peek() != Some(&TexToken::BeginGroup) {
+        if iter.peek_token() != Some(&TexToken::BeginGroup) {
             return None;
         }
         iter.next();
@@ -996,65 +1356,87 @@ impl Engine {
     // Environment Handling Helpers
     // ========================================================================
 
-    /// Handle `\begin{envname}` - expands environment start if defined as a macro.
-    ///
-    /// Returns tokens to add to result, and whether a scope was pushed.
-    fn handle_begin_environment<I>(
+    /// Handle `\begin{envname}` (read at `place`) - expands environment start
+    /// if defined as a macro, writing to `result`. The begin code counts as
+    /// a replacement text for the limits; a refused environment is opened
+    /// without it. Either way the environment is recorded as open (see
+    /// [`InputStack::open_env`]).
+    fn handle_begin_environment(
         &mut self,
         env_name: &str,
-        iter: &mut std::iter::Peekable<I>,
-        depth: usize,
-    ) -> (Vec<TexToken>, bool)
-    where
-        I: Iterator<Item = TexToken>,
-    {
-        if let Some(macro_def) = self.state.db.get(env_name).cloned() {
-            match self.parse_arguments(iter, &macro_def) {
-                Ok(args) => {
-                    let expanded_body = self.substitute_args(&macro_def.body, &args);
-                    let fully_expanded = self.expand(expanded_body, depth + 1);
-                    self.state.db.push_scope();
-                    let mut tokens = vec![TexToken::BeginGroup];
-                    tokens.extend(fully_expanded.into_inner());
-                    (tokens, true)
-                }
-                Err((err, consumed)) => {
-                    let error_kind = Self::convert_macro_error(&err);
-                    self.push_warning(EngineWarning::ArgumentParsingFailed {
-                        macro_name: env_name.to_string(),
-                        error_kind,
-                    });
-                    let mut tokens = self.emit_begin_env_tokens(env_name);
-                    tokens.extend(consumed);
-                    (tokens, false)
+        iter: &mut InputStack,
+        place: &Place,
+        result: &mut Vec<TexToken>,
+    ) {
+        let Some(macro_def) = self.state.db.get(env_name).cloned() else {
+            result.extend(self.emit_begin_env_tokens(env_name));
+            return;
+        };
+        let Some((parsed, _)) = self.read_use(iter, &macro_def, place, env_name) else {
+            self.state.db.push_scope();
+            result.push(TexToken::BeginGroup);
+            iter.open_env(env_name);
+            return;
+        };
+        match parsed {
+            Ok(args) => {
+                let cost = Self::expansion_cost(&macro_def.body, &args.list, args.default_used);
+                if self.charge(cost, env_name, place, iter) {
+                    let body = self.substitute_args(&macro_def.body, &args);
+                    let expansion = iter.new_expansion(Some(env_name), place.level, args.parent);
+                    iter.push_expansion(body, args.level, expansion, Some(Collect::BeginEnv));
+                    iter.open_env(env_name);
                 }
             }
-        } else {
-            (self.emit_begin_env_tokens(env_name), false)
+            Err((err, consumed)) => {
+                let error_kind = Self::convert_macro_error(&err);
+                self.push_warning(EngineWarning::ArgumentParsingFailed {
+                    macro_name: env_name.to_string(),
+                    error_kind,
+                });
+                result.extend(self.emit_begin_env_tokens(env_name));
+                result.extend(consumed);
+            }
         }
     }
 
-    /// Handle `\end{envname}` - expands environment end if defined as a macro.
-    fn handle_end_environment<I>(
+    /// Handle `\end{envname}` (read at `place`) - expands environment end if
+    /// defined as a macro, writing to `result`. The end code is limited like
+    /// the begin code; a refused environment is closed without it. Only the
+    /// group of an environment of that name that is open is closed, after
+    /// the end code (as LaTeX checks the name after running it): an `\end`
+    /// that has no `\begin`, such as one that ends itself again in its own
+    /// end code, closes no group.
+    fn handle_end_environment(
         &mut self,
         env_name: &str,
-        iter: &mut std::iter::Peekable<I>,
-        depth: usize,
-    ) -> Vec<TexToken>
-    where
-        I: Iterator<Item = TexToken>,
-    {
-        let _ = iter; // iter not used currently but kept for future extensibility
+        iter: &mut InputStack,
+        place: &Place,
+        result: &mut Vec<TexToken>,
+    ) {
         let end_macro_name = format!("end{}", env_name);
-        if let Some(macro_def) = self.state.db.get(&end_macro_name).cloned() {
-            let expanded_body = macro_def.body.clone();
-            let fully_expanded = self.expand(expanded_body, depth + 1);
-            let mut tokens = fully_expanded.into_inner();
-            tokens.push(TexToken::EndGroup);
-            self.state.db.pop_scope();
-            tokens
-        } else {
-            self.emit_end_env_tokens(env_name)
+        let Some(macro_def) = self.state.db.get(&end_macro_name).cloned() else {
+            result.extend(self.emit_end_env_tokens(env_name));
+            return;
+        };
+        if !self.may_expand(place, Some(&end_macro_name), false, iter) {
+            self.close_env(env_name, iter, result);
+            return;
+        }
+        let cost = macro_def
+            .body
+            .as_slice()
+            .iter()
+            .filter(|t| **t != BOUNDARY)
+            .count();
+        if self.charge(cost, &end_macro_name, place, iter) {
+            let body = Runs::of(macro_def.body.into_inner(), false).finish();
+            let expansion =
+                iter.new_expansion(Some(&end_macro_name), place.level, place.src.clone());
+            let collect = Collect::EndEnv {
+                name: env_name.to_string(),
+            };
+            iter.push_expansion(body, place.level + 1, expansion, Some(collect));
         }
     }
 
@@ -1088,125 +1470,99 @@ impl Engine {
     // Special Macro Handling
     // ========================================================================
 
-    /// Handle special macros that require hardcoded logic (conditionals, etc.)
-    fn handle_special_macro<I>(
+    /// Handle special macros that require hardcoded logic (conditionals,
+    /// etc.), read at `place`. Returns the tokens to read next, each with
+    /// the place it had (or `place` for an inserted space).
+    fn handle_special_macro(
         &self,
         name: &str,
-        iter: &mut std::iter::Peekable<I>,
-    ) -> Option<TokenList>
-    where
-        I: Iterator<Item = TexToken>,
-    {
+        iter: &mut InputStack,
+        place: &Place,
+    ) -> Option<Vec<(TexToken, Place)>> {
         match name {
             "xspace" => {
                 // xspace inserts a space if the next token is alphanumeric
                 let insert_space =
-                    matches!(iter.peek(), Some(TexToken::Char(c)) if c.is_alphanumeric());
+                    matches!(iter.peek_token(), Some(TexToken::Char(c)) if c.is_alphanumeric());
                 if insert_space {
-                    Some(TokenList::from_vec(vec![TexToken::Space]))
+                    Some(vec![(TexToken::Space, place.clone())])
                 } else {
-                    Some(TokenList::new())
+                    Some(Vec::new())
                 }
             }
             "iftrue" => Some(self.handle_if_conditional(true, iter)),
             "iffalse" => Some(self.handle_if_conditional(false, iter)),
             "ifmmode" => Some(self.handle_if_conditional(self.config.math_mode, iter)),
             "ifx" => self.handle_ifx(iter),
-            "ifstrequal" => self.handle_ifstrequal(iter),
-            "else" | "fi" => Some(TokenList::new()),
+            "ifstrequal" => {
+                iter.start_recording();
+                let (branch, span) = self.handle_ifstrequal(iter);
+                let places = iter.take_recorded();
+                // Each token of the branch at the place it was read at
+                let places = places.get(span).unwrap_or_default().iter().cloned();
+                let places = places.chain(std::iter::repeat(place.clone()));
+                Some(branch.into_inner().into_iter().zip(places).collect())
+            }
+            "else" | "fi" => Some(Vec::new()),
             _ => None,
         }
     }
 
-    /// Handle \iftrue or \iffalse (or any boolean conditional)
-    fn handle_if_conditional<I>(&self, condition: bool, iter: &mut I) -> TokenList
-    where
-        I: Iterator<Item = TexToken>,
-    {
-        let mut true_branch = Vec::new();
-        let mut false_branch = Vec::new();
+    /// Handle \iftrue or \iffalse (or any boolean conditional): read up to
+    /// the matching `\fi` and return the selected branch, each token with
+    /// the level it was read at.
+    fn handle_if_conditional(
+        &self,
+        condition: bool,
+        iter: &mut InputStack,
+    ) -> Vec<(TexToken, Place)> {
+        let mut branch = Vec::new();
         let mut depth = 1;
         let mut in_else = false;
 
-        for token in iter.by_ref() {
-            match &token {
-                TexToken::ControlSeq(cmd) => match cmd.as_str() {
+        while let Some(token) = iter.next() {
+            if let TexToken::ControlSeq(cmd) = &token {
+                match cmd.as_str() {
                     "iftrue" | "iffalse" | "ifmmode" | "ifstrequal" | "ifx" | "if" | "ifnum"
                     | "ifdim" | "ifcat" | "ifvoid" | "ifhbox" | "ifvbox" | "ifinner" | "ifcase" => {
                         depth += 1;
-                        if in_else {
-                            false_branch.push(token);
-                        } else {
-                            true_branch.push(token);
-                        }
                     }
                     "else" if depth == 1 => {
                         in_else = true;
-                    }
-                    "else" => {
-                        if in_else {
-                            false_branch.push(token);
-                        } else {
-                            true_branch.push(token);
-                        }
+                        continue;
                     }
                     "fi" => {
                         depth -= 1;
                         if depth == 0 {
                             break;
                         }
-                        if in_else {
-                            false_branch.push(token);
-                        } else {
-                            true_branch.push(token);
-                        }
                     }
-                    _ => {
-                        if in_else {
-                            false_branch.push(token);
-                        } else {
-                            true_branch.push(token);
-                        }
-                    }
-                },
-                _ => {
-                    if in_else {
-                        false_branch.push(token);
-                    } else {
-                        true_branch.push(token);
-                    }
+                    _ => {}
                 }
             }
+            // The true branch is what comes before the `\else`
+            if in_else != condition {
+                branch.push((token, iter.place()));
+            }
         }
-
-        if condition {
-            TokenList::from_vec(true_branch)
-        } else {
-            TokenList::from_vec(false_branch)
-        }
+        branch
     }
 
-    /// Handle \ifstrequal{str1}{str2}{true}{false}
-    fn handle_ifstrequal<I>(&self, iter: &mut std::iter::Peekable<I>) -> Option<TokenList>
-    where
-        I: Iterator<Item = TexToken>,
-    {
-        utils::skip_spaces(iter);
-        let str1 = utils::read_argument(iter);
-        utils::skip_spaces(iter);
-        let str2 = utils::read_argument(iter);
-        utils::skip_spaces(iter);
-        let true_branch = utils::read_argument(iter);
-        utils::skip_spaces(iter);
-        let false_branch = utils::read_argument(iter);
+    /// Handle \ifstrequal{str1}{str2}{true}{false}: the selected branch, and
+    /// where its tokens are among the places recorded.
+    fn handle_ifstrequal(&self, iter: &mut InputStack) -> (TokenList, Range<usize>) {
+        let (str1, _) = read_recorded_argument(iter);
+        let (str2, _) = read_recorded_argument(iter);
+        let true_branch = read_recorded_argument(iter);
+        let false_branch = read_recorded_argument(iter);
 
         let str1_text: String = str1.as_slice().iter().map(|t| format!("{}", t)).collect();
         let str2_text: String = str2.as_slice().iter().map(|t| format!("{}", t)).collect();
 
         if str1_text.trim() == str2_text.trim() {
-            Some(true_branch)
+            true_branch
         } else {
-            Some(false_branch)
+            false_branch
         }
     }
 
@@ -1214,16 +1570,13 @@ impl Engine {
     /// \ifx compares the *next two tokens* for equality.
     /// Two control sequences are equal if they have the same meaning (same macro definition).
     /// Two character tokens are equal if they have the same character and catcode.
-    fn handle_ifx<I>(&self, iter: &mut std::iter::Peekable<I>) -> Option<TokenList>
-    where
-        I: Iterator<Item = TexToken>,
-    {
-        utils::skip_spaces(iter);
+    fn handle_ifx(&self, iter: &mut InputStack) -> Option<Vec<(TexToken, Place)>> {
+        utils::skip_spaces_in(iter);
 
         // Read first token
         let tok1 = iter.next()?;
 
-        utils::skip_spaces(iter);
+        utils::skip_spaces_in(iter);
 
         // Read second token
         let tok2 = iter.next()?;
@@ -1267,10 +1620,7 @@ impl Engine {
 
     /// Skip tokens until \ExplSyntaxOff is found
     /// Returns the skipped tokens for diagnostic purposes
-    fn skip_explsyntax_block<I>(&self, iter: &mut std::iter::Peekable<I>) -> Vec<TexToken>
-    where
-        I: Iterator<Item = TexToken>,
-    {
+    fn skip_explsyntax_block<S: TokenSource>(&self, iter: &mut S) -> Vec<TexToken> {
         let mut skipped = Vec::new();
         let mut depth = 1; // Track nested ExplSyntaxOn/Off
 
@@ -1317,17 +1667,14 @@ impl Engine {
     }
 
     /// Try to skip arguments for known unsupported primitives
-    fn skip_primitive_args<I>(&self, name: &str, iter: &mut std::iter::Peekable<I>)
-    where
-        I: Iterator<Item = TexToken>,
-    {
+    fn skip_primitive_args<S: TokenSource>(&self, name: &str, iter: &mut S) {
         match name {
             // \catcode`\@=11 format - skip until newline or space-separated
             "catcode" | "lccode" | "uccode" | "sfcode" | "mathcode" => {
                 // Skip tokens until we see something that looks like end of assignment
                 // Typically: \catcode`\@=11 or \catcode`@=11
                 let mut found_equals = false;
-                while let Some(token) = iter.peek() {
+                while let Some(token) = iter.peek_token() {
                     match token {
                         TexToken::Char('=') => {
                             iter.next();
@@ -1368,26 +1715,34 @@ impl Engine {
     }
 
     /// Parse macro arguments from the token stream
-    /// Returns Ok(args) on success, or Err((error, consumed_tokens)) on failure
-    fn parse_arguments<I>(
+    /// Returns Ok((args, default_used, spans)) on success, where
+    /// `default_used` tells that the first argument is the default of an
+    /// omitted optional argument and `spans` where each argument's tokens
+    /// are among the places recorded (see [`Engine::read_arguments`]), or
+    /// Err((error, consumed_tokens)) on failure
+    fn parse_arguments(
         &self,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut InputStack,
         macro_def: &MacroDef,
-    ) -> Result<Vec<TokenList>, (MacroError, Vec<TexToken>)>
-    where
-        I: Iterator<Item = TexToken>,
-    {
+    ) -> Result<(Vec<TokenList>, bool, Vec<Span>), ArgsError> {
         match &macro_def.signature {
             MacroSignature::Simple(num_args) => {
                 let mut args = Vec::new();
+                let mut spans = Vec::new();
+                let mut default_used = false;
 
                 let start_idx = if macro_def.default_arg.is_some() {
-                    utils::skip_spaces(iter);
-                    if iter.peek() == Some(&TexToken::Char('[')) {
+                    utils::skip_spaces_in(iter);
+                    if iter.peek_token() == Some(&TexToken::Char('[')) {
                         iter.next();
-                        args.push(utils::read_until_char(iter, ']'));
+                        let start = iter.recorded_len();
+                        let arg = utils::read_until_char_in(iter, ']');
+                        spans.push(Some(start..start + arg.len()));
+                        args.push(arg);
                     } else if let Some(default) = &macro_def.default_arg {
                         args.push(default.clone());
+                        spans.push(None);
+                        default_used = true;
                     }
                     1
                 } else {
@@ -1395,27 +1750,28 @@ impl Engine {
                 };
 
                 for _ in start_idx..*num_args {
-                    utils::skip_spaces(iter);
-                    args.push(utils::read_argument(iter));
+                    let (arg, span) = read_recorded_argument(iter);
+                    spans.push(Some(span));
+                    args.push(arg);
                 }
 
-                Ok(args)
+                Ok((args, default_used, spans))
             }
-            MacroSignature::Pattern(parts) => self.parse_arguments_pattern(iter, parts),
+            MacroSignature::Pattern(parts) => self
+                .parse_arguments_pattern(iter, parts)
+                .map(|(args, spans)| (args, false, spans)),
         }
     }
 
     /// Parse arguments according to a delimited pattern
-    fn parse_arguments_pattern<I>(
+    fn parse_arguments_pattern(
         &self,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut InputStack,
         parts: &[PatternPart],
-    ) -> Result<Vec<TokenList>, (MacroError, Vec<TexToken>)>
-    where
-        I: Iterator<Item = TexToken>,
-    {
+    ) -> Result<(Vec<TokenList>, Vec<Span>), ArgsError> {
         // Pre-allocate args (max 9 arguments in TeX)
         let mut args: Vec<TokenList> = vec![TokenList::new(); 9];
+        let mut spans: Vec<Span> = vec![None; 9];
         let mut consumed: Vec<TexToken> = Vec::new();
         let mut skip_next = false;
 
@@ -1433,7 +1789,7 @@ impl Engine {
                         .first()
                         .is_some_and(|t| matches!(t, TexToken::Space))
                     {
-                        while let Some(t) = iter.peek() {
+                        while let Some(t) = iter.peek_token() {
                             if matches!(t, TexToken::Space | TexToken::Comment(_)) {
                                 // SAFETY: peek() returned Some, so next() is guaranteed to return Some
                                 consumed.push(iter.next().expect("peek succeeded"));
@@ -1463,9 +1819,12 @@ impl Engine {
                         Some(PatternPart::Literal(delimiter)) => {
                             // Delimited argument - read until delimiter
                             // The delimiter is consumed by read_delimited_argument
+                            let start = iter.recorded_len();
                             match self.read_delimited_argument(iter, delimiter, &mut consumed) {
                                 Ok(arg_tokens) => {
                                     if *arg_idx > 0 && (*arg_idx as usize) <= 9 {
+                                        let span = start..start + arg_tokens.len();
+                                        spans[(*arg_idx as usize) - 1] = Some(span);
                                         args[(*arg_idx as usize) - 1] =
                                             TokenList::from_vec(arg_tokens);
                                     }
@@ -1477,9 +1836,18 @@ impl Engine {
                         }
                         _ => {
                             // Undelimited argument (standard brace-delimited or single token)
+                            let start = iter.recorded_len();
                             let (arg_tokens, arg_consumed) = self.read_argument_tracked(iter);
+                            let skipped = arg_consumed
+                                .iter()
+                                .take_while(|t| matches!(t, TexToken::Space | TexToken::Comment(_)))
+                                .count();
+                            let braced = arg_consumed.get(skipped) == Some(&TexToken::BeginGroup);
+                            let start = start + skipped + usize::from(braced);
                             consumed.extend(arg_consumed);
                             if *arg_idx > 0 && (*arg_idx as usize) <= 9 {
+                                spans[(*arg_idx as usize) - 1] =
+                                    Some(start..start + arg_tokens.len());
                                 args[(*arg_idx as usize) - 1] = TokenList::from_vec(arg_tokens);
                             }
                         }
@@ -1488,21 +1856,18 @@ impl Engine {
             }
         }
 
-        Ok(args)
+        Ok((args, spans))
     }
 
     /// Read a single argument and track consumed tokens
-    fn read_argument_tracked<I>(
+    fn read_argument_tracked<S: TokenSource>(
         &self,
-        iter: &mut std::iter::Peekable<I>,
-    ) -> (Vec<TexToken>, Vec<TexToken>)
-    where
-        I: Iterator<Item = TexToken>,
-    {
+        iter: &mut S,
+    ) -> (Vec<TexToken>, Vec<TexToken>) {
         let mut consumed = Vec::new();
 
         // Skip spaces
-        while let Some(t) = iter.peek() {
+        while let Some(t) = iter.peek_token() {
             if matches!(t, TexToken::Space | TexToken::Comment(_)) {
                 // SAFETY: peek() returned Some, so next() is guaranteed to return Some
                 consumed.push(iter.next().expect("peek succeeded"));
@@ -1511,7 +1876,7 @@ impl Engine {
             }
         }
 
-        let content = match iter.peek() {
+        let content = match iter.peek_token() {
             Some(TexToken::BeginGroup) => {
                 // SAFETY: peek() returned Some(BeginGroup), so next() is guaranteed to return Some
                 consumed.push(iter.next().expect("peek succeeded")); // {
@@ -1564,30 +1929,31 @@ impl Engine {
     }
 
     /// Read tokens until delimiter is found (respecting brace depth)
-    fn read_delimited_argument<I>(
+    fn read_delimited_argument<S: TokenSource>(
         &self,
-        iter: &mut std::iter::Peekable<I>,
+        iter: &mut S,
         delimiter: &[TexToken],
         consumed: &mut Vec<TexToken>,
-    ) -> Result<Vec<TexToken>, MacroError>
-    where
-        I: Iterator<Item = TexToken>,
-    {
+    ) -> Result<Vec<TexToken>, MacroError> {
         let mut arg_content = Vec::new();
         let mut depth: i32 = 0;
         let mut count = 0;
-        let max_arg_tokens = 10000; // Safety limit
+        // Where a limited reader gives up (see `TokenSource::unbounded`)
+        let mut cut = None;
 
         loop {
-            if count > max_arg_tokens {
-                return Err(MacroError::RunawayArgument);
+            if count > utils::MAX_ARG_TOKENS {
+                if !iter.unbounded() {
+                    return Err(MacroError::RunawayArgument);
+                }
+                cut.get_or_insert(consumed.len());
             }
 
             // At depth 0, try to match delimiter
             if depth == 0 && !delimiter.is_empty() {
                 // Check if first delimiter token matches
                 if let Some(first_delim) = delimiter.first() {
-                    if let Some(next) = iter.peek() {
+                    if let Some(next) = iter.peek_token() {
                         if next == first_delim {
                             // Potential match - try to match entire delimiter
                             let mut match_buffer = Vec::new();
@@ -1647,21 +2013,94 @@ impl Engine {
                 }
                 count += 1;
             } else {
+                // The input ended: what a limited reader would not have
+                // read is read again
+                if let Some(cut) = cut {
+                    iter.give_back(consumed.split_off(cut));
+                }
                 return Err(MacroError::RunawayArgument);
             }
         }
     }
 
-    /// Substitute parameter tokens with actual arguments
-    fn substitute_args(&self, body: &TokenList, args: &[TokenList]) -> TokenList {
-        let mut result = Vec::new();
+    /// Read the arguments of a use of `macro_def`, read at `place`, from
+    /// `input`. Also returns the places of the tokens read.
+    ///
+    /// The replacement text goes one level deeper than the use, or than the
+    /// lowest document text the arguments take: a macro that goes on through
+    /// the document, a token or group at a time (`\def\x#1{...\x}`), nests
+    /// only in that text, and each such step starts a new top-level
+    /// expansion. A tail call adds no depth either: a use read from an
+    /// expansion whose text has all been read (with these arguments), when
+    /// that expansion has, since it started, read input that was pending
+    /// below it, as a loop over a list stored in a macro does
+    /// (`\expandafter\loop\items`); its text replaces the caller's, at the
+    /// caller's level. Recursion that reads no such input nests deeper.
+    fn read_arguments(
+        &mut self,
+        input: &mut InputStack,
+        macro_def: &MacroDef,
+        place: &Place,
+    ) -> (Result<Args, ArgsError>, Vec<Place>) {
+        let level = place.level;
+        input.start_recording();
+        let parsed = self.parse_arguments(input, macro_def);
+        let places = input.take_recorded();
+        let lower = places
+            .iter()
+            .filter(|p| p.doc && p.level < level)
+            .map(|p| p.level)
+            .min();
+        if lower.is_some() && parsed.is_ok() {
+            input.start_top_level();
+            self.context.current_token_count = 0;
+        }
+        let (level, parent) = match (lower, &place.src) {
+            (Some(lower), _) => (lower + 1, None),
+            (None, Some(caller)) if caller.is_exhausted() && input.progressed(caller) => {
+                (level, caller.parent.clone())
+            }
+            (None, src) => (level + 1, src.clone()),
+        };
+        let places_of = |span: Span| {
+            span.and_then(|span| places.get(span))
+                .unwrap_or_default()
+                .to_vec()
+        };
+        let parsed = parsed.map(|(list, default_used, spans)| Args {
+            list,
+            default_used,
+            places: spans.into_iter().map(places_of).collect(),
+            level,
+            parent,
+        });
+        (parsed, places)
+    }
 
+    /// Substitute parameter tokens with actual arguments. The result is given
+    /// as runs of tokens that are document text or not: in the first copy of
+    /// an argument, its document text stays document text, whatever braces
+    /// or delimiters it was read with (see [`Engine::expansion_cost`]);
+    /// further copies and a default argument are not. Every copy of an
+    /// argument is a run of its own (and so is every part of it read from a
+    /// frame of its own), so `@` is never glued across them.
+    fn substitute_args(&self, body: &TokenList, args: &Args) -> Vec<(Vec<TexToken>, bool)> {
+        let mut copied = vec![false; args.list.len()];
+        let mut runs = Runs::default();
         for token in body.as_slice() {
             match token {
                 TexToken::Param(n) => {
                     let idx = (*n as usize).saturating_sub(1);
-                    if let Some(arg) = args.get(idx) {
-                        result.extend(arg.as_slice().iter().cloned());
+                    if let Some(arg) = args.list.get(idx) {
+                        let places = args.places.get(idx).map_or(&[][..], Vec::as_slice);
+                        let first = !std::mem::replace(&mut copied[idx], true);
+                        runs.split();
+                        for (i, t) in arg.as_slice().iter().enumerate() {
+                            let place = places.get(i);
+                            let doc = first && place.is_some_and(|p| p.doc);
+                            runs.push(t.clone(), doc, place.is_some_and(|p| p.sep));
+                        }
+                        runs.split();
                     }
                 }
                 TexToken::DeferredParam(n) => {
@@ -1669,15 +2108,12 @@ impl Engine {
                     // This is the key mechanism for nested macro definitions:
                     // \def\outer#1{\def\inner##1{##1 and #1}}
                     // When \outer is expanded, ##1 becomes #1 for \inner.
-                    result.push(TexToken::Param(*n));
+                    runs.push(TexToken::Param(*n), false, false);
                 }
-                _ => {
-                    result.push(token.clone());
-                }
+                _ => runs.push(token.clone(), false, false),
             }
         }
-
-        TokenList::from_vec(result)
+        runs.finish()
     }
 }
 

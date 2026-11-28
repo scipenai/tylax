@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **L2T macro expansion**: `with_max_depth` now bounds how deeply expansions nest instead of how many macros a document uses. Documents with 200 or more macro uses no longer lose later user-defined macros, conditionals and environments, nor report a false `DepthExceeded` warning. Tail recursion still reports `DepthExceeded` and the text after it expands.
+- **L2T macro expansion**: `with_max_tokens` counts only tokens produced by expansion, so long documents no longer hit `TokenLimitExceeded` at the bottom of the page; exponential expansion is still stopped with a warning.
+- **L2T macro expansion**: thousands of macro or environment definitions, `\expandafter` or `\csname` uses no longer overflow the stack.
+- **L2T macro expansion**: a macro defined under `\makeatletter` no longer glues letters onto the following command (`\alpha x` came out as `\alphax`).
+
 ## [0.3.8] - 2026-09-14
 
 ### Fixed

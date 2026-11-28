@@ -6,7 +6,7 @@
 //! - `\let`
 
 use super::token::{TexToken, TokenList};
-use super::utils;
+use super::utils::{self, TokenSource};
 
 /// A single part of a macro parameter pattern.
 #[derive(Debug, Clone, PartialEq)]
@@ -160,6 +160,90 @@ pub fn parse_definition(
     }
 }
 
+/// Read a definition directly from a token stream, consuming only the tokens
+/// that belong to it (name, parameter text and body) and leaving the rest of
+/// the stream untouched. Returns `None` if the definition is malformed; the
+/// tokens read so far are consumed either way, as with [`parse_definition`].
+pub(crate) fn read_definition<S: TokenSource>(
+    cmd_name: &str,
+    iter: &mut S,
+) -> Option<DefinitionKind> {
+    match cmd_name {
+        "newcommand" | "renewcommand" | "providecommand" | "DeclareRobustCommand" => {
+            read_newcommand_style(cmd_name, iter)
+        }
+        "NewDocumentCommand" | "RenewDocumentCommand" => read_xparse_style(cmd_name, iter),
+        "DeclareMathOperator" => read_declare_math_operator(iter),
+        "newenvironment" | "renewenvironment" => read_newenvironment(cmd_name, iter),
+        "def" | "gdef" => read_def(iter, false),
+        "edef" | "xdef" => read_def(iter, true),
+        "let" => read_let(iter),
+        "newif" => read_newif(iter),
+        _ => None,
+    }
+}
+
+/// Run a stream reader over a token list, returning the definition and the
+/// tokens it did not consume (or just those tokens if it failed).
+fn parse_from_list<F>(tokens: TokenList, read: F) -> Result<(DefinitionKind, TokenList), TokenList>
+where
+    F: FnOnce(&mut std::iter::Peekable<std::vec::IntoIter<TexToken>>) -> Option<DefinitionKind>,
+{
+    let mut iter = tokens.into_inner().into_iter().peekable();
+    let def = read(&mut iter);
+    let rest = TokenList::from_vec(iter.collect());
+    match def {
+        Some(def) => Ok((def, rest)),
+        None => Err(rest),
+    }
+}
+
+/// Parse \newcommand, \renewcommand, \providecommand
+fn parse_newcommand_style(
+    cmd_name: &str,
+    tokens: TokenList,
+) -> Result<(DefinitionKind, TokenList), TokenList> {
+    parse_from_list(tokens, |iter| read_newcommand_style(cmd_name, iter))
+}
+
+/// Parse xparse-style commands (simplified)
+fn parse_xparse_style(
+    cmd_name: &str,
+    tokens: TokenList,
+) -> Result<(DefinitionKind, TokenList), TokenList> {
+    parse_from_list(tokens, |iter| read_xparse_style(cmd_name, iter))
+}
+
+/// Parse \def\name#1#2{body} or \edef\name#1#2{body}
+fn parse_def(tokens: TokenList, is_edef: bool) -> Result<(DefinitionKind, TokenList), TokenList> {
+    parse_from_list(tokens, |iter| read_def(iter, is_edef))
+}
+
+/// Parse \let\name=\target or \let\name\target
+fn parse_let(tokens: TokenList) -> Result<(DefinitionKind, TokenList), TokenList> {
+    parse_from_list(tokens, read_let)
+}
+
+/// Parse \newif\iffoo
+fn parse_newif(tokens: TokenList) -> Result<(DefinitionKind, TokenList), TokenList> {
+    parse_from_list(tokens, read_newif)
+}
+
+/// Parse \DeclareMathOperator{\name}{text}
+fn parse_declare_math_operator(
+    tokens: TokenList,
+) -> Result<(DefinitionKind, TokenList), TokenList> {
+    parse_from_list(tokens, read_declare_math_operator)
+}
+
+/// Parse \newenvironment{name}[n][default]{begin}{end}
+fn parse_newenvironment(
+    cmd_name: &str,
+    tokens: TokenList,
+) -> Result<(DefinitionKind, TokenList), TokenList> {
+    parse_from_list(tokens, |iter| read_newenvironment(cmd_name, iter))
+}
+
 /// Parse definitions from a token list and return remaining tokens
 pub fn parse_definitions(tokens: TokenList) -> (Vec<DefinitionKind>, TokenList) {
     let mut definitions = Vec::new();
@@ -192,34 +276,29 @@ pub fn parse_definitions(tokens: TokenList) -> (Vec<DefinitionKind>, TokenList) 
     (definitions, TokenList::from_vec(result))
 }
 
-/// Parse \newcommand, \renewcommand, \providecommand
-fn parse_newcommand_style(
-    cmd_name: &str,
-    tokens: TokenList,
-) -> Result<(DefinitionKind, TokenList), TokenList> {
-    let mut iter = tokens.into_inner().into_iter().peekable();
-
+/// Read \newcommand, \renewcommand, \providecommand from a token stream
+fn read_newcommand_style<S: TokenSource>(cmd_name: &str, iter: &mut S) -> Option<DefinitionKind> {
     // Skip spaces
-    utils::skip_spaces(&mut iter);
+    utils::skip_spaces_in(iter);
 
     // Check for star variant (ignored for now)
-    if matches!(iter.peek(), Some(TexToken::Char('*'))) {
+    if matches!(iter.peek_token(), Some(TexToken::Char('*'))) {
         iter.next();
-        utils::skip_spaces(&mut iter);
+        utils::skip_spaces_in(iter);
     }
 
     // Parse command name: either {\cmd} or \cmd
-    let macro_name = match iter.peek() {
+    let macro_name = match iter.peek_token() {
         Some(TexToken::BeginGroup) => {
             iter.next();
-            let name = match utils::read_control_seq_name(&mut iter) {
+            let name = match utils::read_control_seq_name_in(iter) {
                 Ok(n) => n,
-                Err(_) => return Err(TokenList::from_vec(iter.collect())),
+                Err(_) => return None,
             };
             // Consume closing brace
             match iter.next() {
                 Some(TexToken::EndGroup) => {}
-                _ => return Err(TokenList::from_vec(iter.collect())),
+                _ => return None,
             }
             name
         }
@@ -227,44 +306,44 @@ fn parse_newcommand_style(
             if let Some(TexToken::ControlSeq(name)) = iter.next() {
                 name
             } else {
-                return Err(TokenList::from_vec(iter.collect()));
+                return None;
             }
         }
-        _ => return Err(TokenList::from_vec(iter.collect())),
+        _ => return None,
     };
 
-    utils::skip_spaces(&mut iter);
+    utils::skip_spaces_in(iter);
 
     // Parse optional argument count [n]
-    let num_args = if matches!(iter.peek(), Some(TexToken::Char('['))) {
+    let num_args = if matches!(iter.peek_token(), Some(TexToken::Char('['))) {
         iter.next();
-        let num = utils::read_number(&mut iter).unwrap_or_default();
+        let num = utils::read_number_in(iter).unwrap_or_default();
         // Consume closing bracket
-        utils::skip_until_char(&mut iter, ']');
+        utils::skip_until_char(iter, ']');
         num
     } else {
         0
     };
 
-    utils::skip_spaces(&mut iter);
+    utils::skip_spaces_in(iter);
 
     // Parse optional default value [default]
-    let default = if matches!(iter.peek(), Some(TexToken::Char('['))) {
+    let default = if matches!(iter.peek_token(), Some(TexToken::Char('['))) {
         iter.next();
-        let def_tokens = utils::read_until_char(&mut iter, ']');
+        let def_tokens = utils::read_until_char_in(iter, ']');
         Some(def_tokens)
     } else {
         None
     };
 
-    utils::skip_spaces(&mut iter);
+    utils::skip_spaces_in(iter);
 
     // Parse body {body}
-    let body = if matches!(iter.peek(), Some(TexToken::BeginGroup)) {
+    let body = if matches!(iter.peek_token(), Some(TexToken::BeginGroup)) {
         iter.next();
-        utils::read_balanced_group(&mut iter)
+        utils::read_balanced_group_in(iter)
     } else {
-        return Err(TokenList::from_vec(iter.collect()));
+        return None;
     };
 
     let def = match cmd_name {
@@ -295,29 +374,24 @@ fn parse_newcommand_style(
         _ => unreachable!(),
     };
 
-    Ok((def, TokenList::from_vec(iter.collect())))
+    Some(def)
 }
 
-/// Parse xparse-style commands (simplified)
-fn parse_xparse_style(
-    cmd_name: &str,
-    tokens: TokenList,
-) -> Result<(DefinitionKind, TokenList), TokenList> {
-    let mut iter = tokens.into_inner().into_iter().peekable();
-
-    utils::skip_spaces(&mut iter);
+/// Read xparse-style commands (simplified) from a token stream
+fn read_xparse_style<S: TokenSource>(cmd_name: &str, iter: &mut S) -> Option<DefinitionKind> {
+    utils::skip_spaces_in(iter);
 
     // Parse command name
-    let macro_name = match iter.peek() {
+    let macro_name = match iter.peek_token() {
         Some(TexToken::BeginGroup) => {
             iter.next();
-            let name = match utils::read_control_seq_name(&mut iter) {
+            let name = match utils::read_control_seq_name_in(iter) {
                 Ok(n) => n,
-                Err(_) => return Err(TokenList::from_vec(iter.collect())),
+                Err(_) => return None,
             };
             match iter.next() {
                 Some(TexToken::EndGroup) => {}
-                _ => return Err(TokenList::from_vec(iter.collect())),
+                _ => return None,
             }
             name
         }
@@ -325,31 +399,31 @@ fn parse_xparse_style(
             if let Some(TexToken::ControlSeq(name)) = iter.next() {
                 name
             } else {
-                return Err(TokenList::from_vec(iter.collect()));
+                return None;
             }
         }
-        _ => return Err(TokenList::from_vec(iter.collect())),
+        _ => return None,
     };
 
-    utils::skip_spaces(&mut iter);
+    utils::skip_spaces_in(iter);
 
     // Parse argument specification {mmm} - count 'm' for mandatory args
-    let num_args = if matches!(iter.peek(), Some(TexToken::BeginGroup)) {
+    let num_args = if matches!(iter.peek_token(), Some(TexToken::BeginGroup)) {
         iter.next();
-        let spec = utils::read_balanced_group(&mut iter);
+        let spec = utils::read_balanced_group_in(iter);
         count_mandatory_args(&spec)
     } else {
         0
     };
 
-    utils::skip_spaces(&mut iter);
+    utils::skip_spaces_in(iter);
 
     // Parse body
-    let body = if matches!(iter.peek(), Some(TexToken::BeginGroup)) {
+    let body = if matches!(iter.peek_token(), Some(TexToken::BeginGroup)) {
         iter.next();
-        utils::read_balanced_group(&mut iter)
+        utils::read_balanced_group_in(iter)
     } else {
-        return Err(TokenList::from_vec(iter.collect()));
+        return None;
     };
 
     let def = match cmd_name {
@@ -368,19 +442,17 @@ fn parse_xparse_style(
         _ => unreachable!(),
     };
 
-    Ok((def, TokenList::from_vec(iter.collect())))
+    Some(def)
 }
 
-/// Parse \def\name#1#2{body} or \edef\name#1#2{body}
-fn parse_def(tokens: TokenList, is_edef: bool) -> Result<(DefinitionKind, TokenList), TokenList> {
-    let mut iter = tokens.into_inner().into_iter().peekable();
-
-    utils::skip_spaces(&mut iter);
+/// Read \def\name#1#2{body} or \edef\name#1#2{body} from a token stream
+fn read_def<S: TokenSource>(iter: &mut S, is_edef: bool) -> Option<DefinitionKind> {
+    utils::skip_spaces_in(iter);
 
     // Parse macro name
     let macro_name = match iter.next() {
         Some(TexToken::ControlSeq(name)) => name,
-        _ => return Err(TokenList::from_vec(iter.collect())),
+        _ => return None,
     };
 
     // Parse parameter text until '{'
@@ -388,7 +460,7 @@ fn parse_def(tokens: TokenList, is_edef: bool) -> Result<(DefinitionKind, TokenL
     let mut parts: Vec<PatternPart> = Vec::new();
     let mut literal_acc: Vec<TexToken> = Vec::new();
 
-    while let Some(token) = iter.peek() {
+    while let Some(token) = iter.peek_token() {
         match token {
             TexToken::BeginGroup => break,
             TexToken::Param(n) => {
@@ -402,7 +474,7 @@ fn parse_def(tokens: TokenList, is_edef: bool) -> Result<(DefinitionKind, TokenL
             _ => {
                 // Accumulate as literal (including spaces - we keep them EXACTLY as defined)
                 // SAFETY: iter.next() is guaranteed to return Some because we're inside
-                // `while let Some(_) = iter.peek()` - the loop condition ensures the iterator
+                // `while let Some(_) = iter.peek_token()` - the loop condition ensures the iterator
                 // is non-empty when we reach this point.
                 literal_acc.push(
                     iter.next()
@@ -431,11 +503,11 @@ fn parse_def(tokens: TokenList, is_edef: bool) -> Result<(DefinitionKind, TokenL
     };
 
     // Parse body
-    let body = if matches!(iter.peek(), Some(TexToken::BeginGroup)) {
+    let body = if matches!(iter.peek_token(), Some(TexToken::BeginGroup)) {
         iter.next();
-        utils::read_balanced_group(&mut iter)
+        utils::read_balanced_group_in(iter)
     } else {
-        return Err(TokenList::from_vec(iter.collect()));
+        return None;
     };
 
     let def = if is_edef {
@@ -452,63 +524,56 @@ fn parse_def(tokens: TokenList, is_edef: bool) -> Result<(DefinitionKind, TokenL
         }
     };
 
-    Ok((def, TokenList::from_vec(iter.collect())))
+    Some(def)
 }
 
-/// Parse \let\name=\target or \let\name\target
-fn parse_let(tokens: TokenList) -> Result<(DefinitionKind, TokenList), TokenList> {
-    let mut iter = tokens.into_inner().into_iter().peekable();
-
-    utils::skip_spaces(&mut iter);
+/// Read \let\name=\target or \let\name\target from a token stream
+fn read_let<S: TokenSource>(iter: &mut S) -> Option<DefinitionKind> {
+    utils::skip_spaces_in(iter);
 
     // Parse the new name
     let new_name = match iter.next() {
         Some(TexToken::ControlSeq(name)) => name,
-        _ => return Err(TokenList::from_vec(iter.collect())),
+        _ => return None,
     };
 
-    utils::skip_spaces(&mut iter);
+    utils::skip_spaces_in(iter);
 
     // Optional equals sign
-    if matches!(iter.peek(), Some(TexToken::Char('='))) {
+    if matches!(iter.peek_token(), Some(TexToken::Char('='))) {
         iter.next();
-        utils::skip_spaces(&mut iter);
+        utils::skip_spaces_in(iter);
     }
 
     // Parse the target
     let target = match iter.next() {
         Some(TexToken::ControlSeq(name)) => name,
-        _ => return Err(TokenList::from_vec(iter.collect())),
+        _ => return None,
     };
 
-    Ok((
-        DefinitionKind::Let {
-            name: new_name,
-            target,
-        },
-        TokenList::from_vec(iter.collect()),
-    ))
+    Some(DefinitionKind::Let {
+        name: new_name,
+        target,
+    })
 }
 
-/// Parse \newif\iffoo
+/// Read \newif\iffoo from a token stream
 /// Creates three macros:
 /// - \iffoo -> \iffalse (initial state)
 /// - \footrue -> \def\iffoo{\iftrue}
 /// - \foofalse -> \def\iffoo{\iffalse}
-fn parse_newif(tokens: TokenList) -> Result<(DefinitionKind, TokenList), TokenList> {
-    let mut iter = tokens.into_inner().into_iter().peekable();
-
-    utils::skip_spaces(&mut iter);
+fn read_newif<S: TokenSource>(iter: &mut S) -> Option<DefinitionKind> {
+    utils::skip_spaces_in(iter);
 
     // Parse \iffoo - the name must start with "if"
     let full_name = match iter.next() {
         Some(TexToken::ControlSeq(name)) => name,
-        _ => return Err(TokenList::from_vec(iter.collect())),
+        _ => return None,
     };
 
     // Validate that name starts with "if"
     if !full_name.starts_with("if") {
-        return Err(TokenList::from_vec(iter.collect()));
+        return None;
     }
 
     // Extract base name (e.g., "foo" from "iffoo")
@@ -517,40 +582,33 @@ fn parse_newif(tokens: TokenList) -> Result<(DefinitionKind, TokenList), TokenLi
         .unwrap_or(&full_name)
         .to_string();
 
-    Ok((
-        DefinitionKind::NewIf { base_name },
-        TokenList::from_vec(iter.collect()),
-    ))
+    Some(DefinitionKind::NewIf { base_name })
 }
 
-/// Parse \DeclareMathOperator{\name}{text}
-fn parse_declare_math_operator(
-    tokens: TokenList,
-) -> Result<(DefinitionKind, TokenList), TokenList> {
-    let mut iter = tokens.into_inner().into_iter().peekable();
-
-    utils::skip_spaces(&mut iter);
+/// Read \DeclareMathOperator{\name}{text} from a token stream
+fn read_declare_math_operator<S: TokenSource>(iter: &mut S) -> Option<DefinitionKind> {
+    utils::skip_spaces_in(iter);
 
     // Check for star variant
-    let is_starred = if matches!(iter.peek(), Some(TexToken::Char('*'))) {
+    let is_starred = if matches!(iter.peek_token(), Some(TexToken::Char('*'))) {
         iter.next();
-        utils::skip_spaces(&mut iter);
+        utils::skip_spaces_in(iter);
         true
     } else {
         false
     };
 
     // Parse command name: {\cmd} or \cmd
-    let macro_name = match iter.peek() {
+    let macro_name = match iter.peek_token() {
         Some(TexToken::BeginGroup) => {
             iter.next();
-            let name = match utils::read_control_seq_name(&mut iter) {
+            let name = match utils::read_control_seq_name_in(iter) {
                 Ok(n) => n,
-                Err(_) => return Err(TokenList::from_vec(iter.collect())),
+                Err(_) => return None,
             };
             match iter.next() {
                 Some(TexToken::EndGroup) => {}
-                _ => return Err(TokenList::from_vec(iter.collect())),
+                _ => return None,
             }
             name
         }
@@ -558,51 +616,43 @@ fn parse_declare_math_operator(
             if let Some(TexToken::ControlSeq(name)) = iter.next() {
                 name
             } else {
-                return Err(TokenList::from_vec(iter.collect()));
+                return None;
             }
         }
-        _ => return Err(TokenList::from_vec(iter.collect())),
+        _ => return None,
     };
 
-    utils::skip_spaces(&mut iter);
+    utils::skip_spaces_in(iter);
 
     // Parse body {text}
-    let body = if matches!(iter.peek(), Some(TexToken::BeginGroup)) {
+    let body = if matches!(iter.peek_token(), Some(TexToken::BeginGroup)) {
         iter.next();
-        utils::read_balanced_group(&mut iter)
+        utils::read_balanced_group_in(iter)
     } else {
-        return Err(TokenList::from_vec(iter.collect()));
+        return None;
     };
 
-    Ok((
-        DefinitionKind::DeclareMathOperator {
-            name: macro_name,
-            body,
-            is_starred,
-        },
-        TokenList::from_vec(iter.collect()),
-    ))
+    Some(DefinitionKind::DeclareMathOperator {
+        name: macro_name,
+        body,
+        is_starred,
+    })
 }
 
-/// Parse \newenvironment{name}[n][default]{begin}{end}
-fn parse_newenvironment(
-    cmd_name: &str,
-    tokens: TokenList,
-) -> Result<(DefinitionKind, TokenList), TokenList> {
-    let mut iter = tokens.into_inner().into_iter().peekable();
-
-    utils::skip_spaces(&mut iter);
+/// Read \newenvironment{name}[n][default]{begin}{end} from a token stream
+fn read_newenvironment<S: TokenSource>(cmd_name: &str, iter: &mut S) -> Option<DefinitionKind> {
+    utils::skip_spaces_in(iter);
 
     // Check for star variant (ignored)
-    if matches!(iter.peek(), Some(TexToken::Char('*'))) {
+    if matches!(iter.peek_token(), Some(TexToken::Char('*'))) {
         iter.next();
-        utils::skip_spaces(&mut iter);
+        utils::skip_spaces_in(iter);
     }
 
     // Parse environment name: {envname}
-    let env_name = if matches!(iter.peek(), Some(TexToken::BeginGroup)) {
+    let env_name = if matches!(iter.peek_token(), Some(TexToken::BeginGroup)) {
         iter.next();
-        let name_tokens = utils::read_balanced_group(&mut iter);
+        let name_tokens = utils::read_balanced_group_in(iter);
         // Extract name from tokens (should be plain text)
         name_tokens
             .as_slice()
@@ -613,54 +663,54 @@ fn parse_newenvironment(
             })
             .collect::<String>()
     } else {
-        return Err(TokenList::from_vec(iter.collect()));
+        return None;
     };
 
     if env_name.is_empty() {
-        return Err(TokenList::from_vec(iter.collect()));
+        return None;
     }
 
-    utils::skip_spaces(&mut iter);
+    utils::skip_spaces_in(iter);
 
     // Parse optional argument count [n]
-    let num_args = if matches!(iter.peek(), Some(TexToken::Char('['))) {
+    let num_args = if matches!(iter.peek_token(), Some(TexToken::Char('['))) {
         iter.next();
-        let num = utils::read_number(&mut iter).unwrap_or_default();
-        utils::skip_until_char(&mut iter, ']');
+        let num = utils::read_number_in(iter).unwrap_or_default();
+        utils::skip_until_char(iter, ']');
         num
     } else {
         0
     };
 
-    utils::skip_spaces(&mut iter);
+    utils::skip_spaces_in(iter);
 
     // Parse optional default value [default]
-    let default = if matches!(iter.peek(), Some(TexToken::Char('['))) {
+    let default = if matches!(iter.peek_token(), Some(TexToken::Char('['))) {
         iter.next();
-        let def_tokens = utils::read_until_char(&mut iter, ']');
+        let def_tokens = utils::read_until_char_in(iter, ']');
         Some(def_tokens)
     } else {
         None
     };
 
-    utils::skip_spaces(&mut iter);
+    utils::skip_spaces_in(iter);
 
     // Parse begin body {begin}
-    let begin_body = if matches!(iter.peek(), Some(TexToken::BeginGroup)) {
+    let begin_body = if matches!(iter.peek_token(), Some(TexToken::BeginGroup)) {
         iter.next();
-        utils::read_balanced_group(&mut iter)
+        utils::read_balanced_group_in(iter)
     } else {
-        return Err(TokenList::from_vec(iter.collect()));
+        return None;
     };
 
-    utils::skip_spaces(&mut iter);
+    utils::skip_spaces_in(iter);
 
     // Parse end body {end}
-    let end_body = if matches!(iter.peek(), Some(TexToken::BeginGroup)) {
+    let end_body = if matches!(iter.peek_token(), Some(TexToken::BeginGroup)) {
         iter.next();
-        utils::read_balanced_group(&mut iter)
+        utils::read_balanced_group_in(iter)
     } else {
-        return Err(TokenList::from_vec(iter.collect()));
+        return None;
     };
 
     let def = match cmd_name {
@@ -681,7 +731,7 @@ fn parse_newenvironment(
         _ => unreachable!(),
     };
 
-    Ok((def, TokenList::from_vec(iter.collect())))
+    Some(def)
 }
 
 // Helper functions removed - using utils module
