@@ -210,127 +210,335 @@ fn toml_to_value(toml_val: toml::Value) -> EvalResult<Value> {
 // Fallback simple parsers (no external dependencies)
 // ============================================================================
 
-/// Simple JSON parser for basic cases (no external dependencies).
+/// Maximum nesting depth accepted by the fallback JSON parser.
 #[cfg(not(feature = "data-loading"))]
-fn parse_json_simple(input: &str) -> EvalResult<Value> {
-    let input = input.trim();
+const MAX_JSON_DEPTH: usize = 128;
 
-    if input == "null" {
-        return Ok(Value::None);
-    }
-    if input == "true" {
-        return Ok(Value::Bool(true));
-    }
-    if input == "false" {
-        return Ok(Value::Bool(false));
-    }
-
-    // Try parsing as number
-    if let Ok(i) = input.parse::<i64>() {
-        return Ok(Value::Int(i));
-    }
-    if let Ok(f) = input.parse::<f64>() {
-        return Ok(Value::Float(f));
-    }
-
-    // Try parsing as string
-    if input.starts_with('"') && input.ends_with('"') {
-        let s = &input[1..input.len() - 1];
-        // Basic unescape
-        let s = s
-            .replace("\\\"", "\"")
-            .replace("\\n", "\n")
-            .replace("\\t", "\t");
-        return Ok(Value::Str(s));
-    }
-
-    // Try parsing as array
-    if input.starts_with('[') && input.ends_with(']') {
-        let inner = &input[1..input.len() - 1].trim();
-        if inner.is_empty() {
-            return Ok(Value::Array(Vec::new()));
-        }
-        // Simple comma splitting (doesn't handle nested structures well)
-        let parts = split_json_elements(inner);
-        let values: Result<Vec<_>, _> = parts.iter().map(|s| parse_json_simple(s)).collect();
-        return Ok(Value::Array(values?));
-    }
-
-    // Try parsing as object
-    if input.starts_with('{') && input.ends_with('}') {
-        let inner = &input[1..input.len() - 1].trim();
-        if inner.is_empty() {
-            return Ok(Value::Dict(IndexMap::new()));
-        }
-        let mut dict = IndexMap::new();
-        let pairs = split_json_elements(inner);
-        for pair in pairs {
-            let parts: Vec<&str> = pair.splitn(2, ':').collect();
-            if parts.len() != 2 {
-                return Err(EvalError::other(format!("Invalid JSON pair: {}", pair)));
-            }
-            let key = parts[0].trim();
-            let value = parts[1].trim();
-            // Parse key (remove quotes)
-            let key = if key.starts_with('"') && key.ends_with('"') {
-                key[1..key.len() - 1].to_string()
-            } else {
-                key.to_string()
-            };
-            dict.insert(key, parse_json_simple(value)?);
-        }
-        return Ok(Value::Dict(dict));
-    }
-
-    Err(EvalError::other(format!("Cannot parse JSON: {}", input)))
+#[cfg(not(feature = "data-loading"))]
+struct JsonParser<'a> {
+    input: &'a str,
+    bytes: &'a [u8],
+    pos: usize,
 }
 
-/// Split JSON elements by comma, respecting nesting.
 #[cfg(not(feature = "data-loading"))]
-fn split_json_elements(input: &str) -> Vec<String> {
-    let mut elements = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0;
-    let mut in_string = false;
-    let mut escape = false;
-
-    for c in input.chars() {
-        if escape {
-            current.push(c);
-            escape = false;
-            continue;
-        }
-
-        match c {
-            '\\' if in_string => {
-                current.push(c);
-                escape = true;
-            }
-            '"' => {
-                current.push(c);
-                in_string = !in_string;
-            }
-            '[' | '{' if !in_string => {
-                current.push(c);
-                depth += 1;
-            }
-            ']' | '}' if !in_string => {
-                current.push(c);
-                depth -= 1;
-            }
-            ',' if !in_string && depth == 0 => {
-                elements.push(current.trim().to_string());
-                current = String::new();
-            }
-            _ => current.push(c),
+impl<'a> JsonParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            input,
+            bytes: input.as_bytes(),
+            pos: 0,
         }
     }
 
-    if !current.trim().is_empty() {
-        elements.push(current.trim().to_string());
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
     }
 
-    elements
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.pos += 1;
+        }
+    }
+
+    fn consume_literal(&mut self, lit: &[u8]) -> bool {
+        if self.bytes.get(self.pos..self.pos + lit.len()) == Some(lit) {
+            self.pos += lit.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn parse_hex4(&mut self) -> EvalResult<u16> {
+        let end = self.pos.saturating_add(4);
+        let Some(hex) = self.input.get(self.pos..end) else {
+            return Err(EvalError::other("Incomplete JSON unicode escape"));
+        };
+        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(EvalError::other(format!(
+                "Invalid JSON unicode escape: \\u{hex}"
+            )));
+        }
+        self.pos = end;
+        u16::from_str_radix(hex, 16)
+            .map_err(|_| EvalError::other(format!("Invalid JSON unicode escape: \\u{hex}")))
+    }
+
+    fn parse_string(&mut self) -> EvalResult<String> {
+        if self.peek() != Some(b'"') {
+            return Err(EvalError::other("Expected opening quote in JSON string"));
+        }
+        self.pos += 1;
+        let mut out = String::new();
+
+        while let Some(ch) = self.input[self.pos..].chars().next() {
+            self.pos += ch.len_utf8();
+            match ch {
+                '"' => return Ok(out),
+                c if (c as u32) < 0x20 => {
+                    return Err(EvalError::other(
+                        "Unescaped control character in JSON string",
+                    ));
+                }
+                '\\' => {
+                    let Some(esc) = self.input[self.pos..].chars().next() else {
+                        return Err(EvalError::other("Unterminated JSON escape sequence"));
+                    };
+                    self.pos += esc.len_utf8();
+                    match esc {
+                        '"' | '\\' | '/' => out.push(esc),
+                        'b' => out.push('\u{0008}'),
+                        'f' => out.push('\u{000C}'),
+                        'n' => out.push('\n'),
+                        'r' => out.push('\r'),
+                        't' => out.push('\t'),
+                        'u' => {
+                            let hi = self.parse_hex4()?;
+                            if (0xD800..=0xDBFF).contains(&hi) {
+                                if !self.consume_literal(b"\\u") {
+                                    return Err(EvalError::other(
+                                        "Missing low surrogate in JSON unicode escape",
+                                    ));
+                                }
+                                let lo = self.parse_hex4()?;
+                                if !(0xDC00..=0xDFFF).contains(&lo) {
+                                    return Err(EvalError::other(
+                                        "Invalid low surrogate in JSON unicode escape",
+                                    ));
+                                }
+                                let cp = 0x10000
+                                    + (((hi - 0xD800) as u32) << 10)
+                                    + ((lo - 0xDC00) as u32);
+                                let decoded = char::from_u32(cp).ok_or_else(|| {
+                                    EvalError::other("Invalid JSON surrogate pair")
+                                })?;
+                                out.push(decoded);
+                            } else if (0xDC00..=0xDFFF).contains(&hi) {
+                                return Err(EvalError::other(
+                                    "Unpaired low surrogate in JSON unicode escape",
+                                ));
+                            } else {
+                                let decoded = char::from_u32(hi as u32).ok_or_else(|| {
+                                    EvalError::other("Invalid JSON unicode scalar")
+                                })?;
+                                out.push(decoded);
+                            }
+                        }
+                        other => {
+                            return Err(EvalError::other(format!(
+                                "Invalid JSON escape character: \\{other}"
+                            )));
+                        }
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+
+        Err(EvalError::other("Unterminated JSON string"))
+    }
+
+    fn parse_number(&mut self) -> EvalResult<Value> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        match self.peek() {
+            Some(b'0') => {
+                self.pos += 1;
+                if matches!(self.peek(), Some(b'0'..=b'9')) {
+                    return Err(EvalError::other("Leading zero in JSON number"));
+                }
+            }
+            Some(b'1'..=b'9') => {
+                self.pos += 1;
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            _ => {
+                return Err(EvalError::other(format!(
+                    "Invalid JSON number near byte {}",
+                    self.pos
+                )));
+            }
+        }
+
+        let mut is_float = false;
+        if self.peek() == Some(b'.') {
+            is_float = true;
+            self.pos += 1;
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(EvalError::other(
+                    "Expected fractional digits in JSON number",
+                ));
+            }
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            is_float = true;
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(EvalError::other("Expected exponent digits in JSON number"));
+            }
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+
+        let num_str = &self.input[start..self.pos];
+        if !is_float {
+            if let Ok(i) = num_str.parse::<i64>() {
+                return Ok(Value::Int(i));
+            }
+        }
+        let f: f64 = num_str
+            .parse()
+            .map_err(|_| EvalError::other(format!("Invalid JSON number: {num_str}")))?;
+        if !f.is_finite() {
+            return Err(EvalError::other(format!(
+                "Out-of-range JSON number: {num_str}"
+            )));
+        }
+        Ok(Value::Float(f))
+    }
+
+    fn parse_array(&mut self, depth: usize) -> EvalResult<Value> {
+        self.pos += 1; // '['
+        self.skip_whitespace();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            return Ok(Value::Array(Vec::new()));
+        }
+
+        let mut arr = Vec::new();
+        loop {
+            arr.push(self.parse_value(depth)?);
+            self.skip_whitespace();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b']') => {
+                    self.pos += 1;
+                    return Ok(Value::Array(arr));
+                }
+                _ => {
+                    return Err(EvalError::other(format!(
+                        "Expected ',' or ']' in JSON array near byte {}",
+                        self.pos
+                    )));
+                }
+            }
+        }
+    }
+
+    fn parse_object(&mut self, depth: usize) -> EvalResult<Value> {
+        self.pos += 1; // '{'
+        self.skip_whitespace();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Ok(Value::Dict(IndexMap::new()));
+        }
+
+        let mut dict = IndexMap::new();
+        loop {
+            self.skip_whitespace();
+            if self.peek() != Some(b'"') {
+                return Err(EvalError::other(format!(
+                    "Expected string key in JSON object near byte {}",
+                    self.pos
+                )));
+            }
+            let key = self.parse_string()?;
+            self.skip_whitespace();
+            if self.peek() != Some(b':') {
+                return Err(EvalError::other(format!(
+                    "Expected ':' after JSON key near byte {}",
+                    self.pos
+                )));
+            }
+            self.pos += 1;
+            let value = self.parse_value(depth)?;
+            dict.insert(key, value);
+            self.skip_whitespace();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b'}') => {
+                    self.pos += 1;
+                    return Ok(Value::Dict(dict));
+                }
+                _ => {
+                    return Err(EvalError::other(format!(
+                        "Expected ',' or '}}' in JSON object near byte {}",
+                        self.pos
+                    )));
+                }
+            }
+        }
+    }
+
+    fn parse_value(&mut self, depth: usize) -> EvalResult<Value> {
+        if depth > MAX_JSON_DEPTH {
+            return Err(EvalError::other("JSON nesting depth limit exceeded"));
+        }
+        self.skip_whitespace();
+        match self.peek() {
+            Some(b'n') => {
+                if self.consume_literal(b"null") {
+                    Ok(Value::None)
+                } else {
+                    Err(EvalError::other("Invalid JSON literal"))
+                }
+            }
+            Some(b't') => {
+                if self.consume_literal(b"true") {
+                    Ok(Value::Bool(true))
+                } else {
+                    Err(EvalError::other("Invalid JSON literal"))
+                }
+            }
+            Some(b'f') => {
+                if self.consume_literal(b"false") {
+                    Ok(Value::Bool(false))
+                } else {
+                    Err(EvalError::other("Invalid JSON literal"))
+                }
+            }
+            Some(b'"') => self.parse_string().map(Value::Str),
+            Some(b'[') => self.parse_array(depth + 1),
+            Some(b'{') => self.parse_object(depth + 1),
+            Some(b'-' | b'0'..=b'9') => self.parse_number(),
+            Some(ch) => Err(EvalError::other(format!(
+                "Unexpected character '{}' in JSON at byte {}",
+                ch as char, self.pos
+            ))),
+            None => Err(EvalError::other("Unexpected end of JSON input")),
+        }
+    }
+}
+
+/// RFC 8259 JSON parser for fallback builds without external dependencies.
+#[cfg(not(feature = "data-loading"))]
+fn parse_json_simple(input: &str) -> EvalResult<Value> {
+    let mut parser = JsonParser::new(input);
+    let value = parser.parse_value(0)?;
+    parser.skip_whitespace();
+    if parser.pos != parser.bytes.len() {
+        return Err(EvalError::other(format!(
+            "Trailing JSON content at byte {}",
+            parser.pos
+        )));
+    }
+    Ok(value)
 }
 
 /// Simple CSV parser for basic cases (no external dependencies).
@@ -432,6 +640,55 @@ mod tests {
             }
         } else {
             panic!("Expected array");
+        }
+    }
+
+    #[test]
+    fn test_parse_json_malformed_inputs_return_err_without_panic() {
+        for bad in ["\"", "\"\\", "{\": 1}", "{\"a\": \"}", "", "{", "["] {
+            assert!(
+                parse_json(bad).is_err(),
+                "expected Err for malformed JSON `{bad}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_json_rfc8259_escapes_colons_and_unicode() {
+        let obj = parse_json(r#"{"a:b":"VALUE", "c,d": [1, -2.5, 1e3, true, false, null]}"#)
+            .expect("valid JSON with colon and comma inside key");
+        let Value::Dict(dict) = obj else {
+            panic!("expected dict, got {obj:?}");
+        };
+        assert_eq!(dict.get("a:b"), Some(&Value::Str("VALUE".to_string())));
+        let Some(Value::Array(arr)) = dict.get("c,d") else {
+            panic!("expected array for c,d");
+        };
+        assert_eq!(arr[0], Value::Int(1));
+        assert_eq!(arr[1], Value::Float(-2.5));
+        assert_eq!(arr[2], Value::Float(1000.0));
+        assert_eq!(arr[3], Value::Bool(true));
+        assert_eq!(arr[4], Value::Bool(false));
+        assert_eq!(arr[5], Value::None);
+
+        let slash = parse_json(r#""a\\b""#).expect("escaped backslash JSON string");
+        let Value::Str(slash_str) = slash else {
+            panic!("expected string");
+        };
+        assert_eq!(slash_str, "a\\b");
+        assert_eq!(slash_str.chars().count(), 3);
+
+        let literal_newline = parse_json(r#""\\n""#).expect("escaped \\n literal");
+        assert_eq!(literal_newline, Value::Str("\\n".to_string()));
+
+        let unicode = parse_json(r#""\u0041\uD83D\uDE00""#).expect("unicode surrogate pair");
+        assert_eq!(unicode, Value::Str("A😀".to_string()));
+
+        for invalid in ["1 2", "[1,]", "{\"a\":1,}", "\"\n\"", r#""\uD800""#] {
+            assert!(
+                parse_json(invalid).is_err(),
+                "expected Err for invalid JSON `{invalid}`"
+            );
         }
     }
 }
