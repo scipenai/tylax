@@ -21,9 +21,11 @@
 //! Guessing from the label's name prefix (`sec-`, `fig-`) is deliberately NOT
 //! done: names are free-form and a wrong guess would state something false.
 
-use crate::features::refs::{reference_to_latex, Reference};
+use super::engine::{Arg, ContentNode, Value};
+use crate::core::typst2latex::utils::FuncArgs;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::{core::typst2latex::utils::FuncArgs, features::bibtex::parse_bibtex};
+use crate::features::bibtex::parse_bibtex;
+use crate::features::refs::{reference_to_latex, Reference};
 use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::{fs, path::Path};
@@ -45,20 +47,102 @@ const AT_SUPPLEMENT_SEP: char = '\u{E016}';
 
 /// The kind of element a label is attached to, and the LaTeX word Typst would
 /// have rendered for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TargetKind {
     Section,
     Figure,
     Table,
+    Custom(String),
 }
 
 impl TargetKind {
-    fn supplement(self) -> &'static str {
+    fn supplement(&self) -> &str {
         match self {
             TargetKind::Section => "Section",
             TargetKind::Figure => "Figure",
             TargetKind::Table => "Table",
+            TargetKind::Custom(s) => s.as_str(),
         }
+    }
+}
+
+/// Strip matching balanced outer parentheses from a Typst argument expression.
+pub(crate) fn unwrap_balanced_parens(mut s: &str) -> &str {
+    loop {
+        let trimmed = s.trim();
+        let Some(inner) = trimmed.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
+            return trimmed;
+        };
+        let mut depth = 0usize;
+        let mut in_quote = false;
+        let mut escaped = false;
+        let mut wraps_all = true;
+        for ch in inner.chars() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if in_quote {
+                if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_quote = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_quote = true,
+                '(' => depth += 1,
+                ')' => {
+                    if depth == 0 {
+                        wraps_all = false;
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        if wraps_all && depth == 0 && !in_quote {
+            s = inner;
+        } else {
+            return trimmed;
+        }
+    }
+}
+
+/// Pure-ASCII counter name for a custom `figure(kind: ...)` so TeX macros remain valid
+/// while keeping case sensitivity (e.g. `"Example"` vs `"example"`).
+pub(crate) fn custom_figure_counter_name(kind: &str) -> String {
+    let normalized = kind.trim();
+    if !normalized.is_empty()
+        && normalized.bytes().all(|b| b.is_ascii_alphabetic())
+        && !normalized.starts_with("hex")
+    {
+        return format!("tylaxfig{normalized}");
+    }
+    let mut out = String::from("tylaxfighex");
+    for &b in normalized.as_bytes() {
+        out.push((b'a' + (b >> 4)) as char);
+        out.push((b'a' + (b & 0x0f)) as char);
+    }
+    out
+}
+
+/// Default cross-reference / caption supplement word for a custom `figure(kind: ...)`.
+pub(crate) fn default_custom_figure_supplement(kind: &str) -> String {
+    let trimmed = kind.trim();
+    if trimmed == "raw" {
+        return "Listing".to_string();
+    }
+    let mut chars = trimmed.chars();
+    match chars.next() {
+        Some(first) => {
+            let mut out = first.to_uppercase().collect::<String>();
+            out.push_str(chars.as_str());
+            out
+        }
+        None => "Figure".to_string(),
     }
 }
 
@@ -88,12 +172,27 @@ pub(crate) fn strip_marks(latex: &str) -> String {
 }
 
 /// Resolve both deferred bare references and reference supplements.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn resolve_references(
     root: &SyntaxNode,
     latex: &str,
     bibliography_keys: Option<&HashSet<String>>,
 ) -> String {
-    let index = index_document_targets(root);
+    resolve_references_with_nodes(root, None, latex, bibliography_keys)
+}
+
+/// Resolve deferred bare references and reference supplements using both the
+/// parsed document AST and evaluated content-node anchors.
+pub(crate) fn resolve_references_with_nodes(
+    root: &SyntaxNode,
+    nodes: Option<&[ContentNode]>,
+    latex: &str,
+    bibliography_keys: Option<&HashSet<String>>,
+) -> String {
+    let mut index = index_document_targets(root);
+    if let Some(nodes) = nodes {
+        index_content_node_anchors(nodes, &mut index);
+    }
     let latex = resolve_at_references(latex, &index, bibliography_keys);
     resolve_supplements_with_index(&index, &latex)
 }
@@ -134,8 +233,11 @@ fn resolve_supplements_with_index(index: &DocumentTargets, latex: &str) -> Strin
             // A tie (`~`) matches the usual LaTeX spelling and keeps the word
             // and its number on one line.
             Some(kind) => {
-                out.push_str(kind.supplement());
-                out.push('~');
+                let supp = kind.supplement();
+                if !supp.is_empty() {
+                    out.push_str(supp);
+                    out.push('~');
+                }
                 out.push_str(command);
             }
             // Unknown target: emit the reference unchanged rather than invent a
@@ -235,6 +337,221 @@ fn index_document_targets(root: &SyntaxNode) -> DocumentTargets {
     targets
 }
 
+fn target_kind_from_anchor(kind: &str) -> Option<TargetKind> {
+    match kind {
+        "section" => Some(TargetKind::Section),
+        "figure" => Some(TargetKind::Figure),
+        "table" => Some(TargetKind::Table),
+        other => Some(TargetKind::Custom(other.to_string())),
+    }
+}
+
+pub(crate) fn plain_text_from_eval_nodes(nodes: &[ContentNode]) -> String {
+    let mut out = String::new();
+    for node in nodes {
+        match node {
+            ContentNode::Text(t) | ContentNode::RawSource(t) => out.push_str(t),
+            ContentNode::Space => out.push(' '),
+            ContentNode::Strong(inner) | ContentNode::Emph(inner) => {
+                out.push_str(&plain_text_from_eval_nodes(inner));
+            }
+            _ => out.push_str(&node.to_typst()),
+        }
+    }
+    out.trim().to_string()
+}
+
+fn content_node_has_table_or_grid(node: &ContentNode) -> bool {
+    if let Some((target, _, _, _)) = node.labeled_parts() {
+        return target.iter().any(content_node_has_table_or_grid);
+    }
+    match node {
+        ContentNode::FuncCall { name, args } => {
+            matches!(name.as_str(), "table" | "grid")
+                || args.iter().any(|arg| match arg {
+                    Arg::Pos(Value::Content(nodes))
+                    | Arg::Named(_, Value::Content(nodes))
+                    | Arg::Spread(Value::Content(nodes)) => {
+                        nodes.iter().any(content_node_has_table_or_grid)
+                    }
+                    _ => false,
+                })
+        }
+        ContentNode::Element { name, fields } => {
+            matches!(name.as_str(), "table" | "grid")
+                || fields.values().any(|val| match val {
+                    Value::Content(nodes) => nodes.iter().any(content_node_has_table_or_grid),
+                    Value::Array(items) => items.iter().any(|item| match item {
+                        Value::Content(nodes) => nodes.iter().any(content_node_has_table_or_grid),
+                        _ => false,
+                    }),
+                    _ => false,
+                })
+        }
+        ContentNode::Strong(nodes)
+        | ContentNode::Emph(nodes)
+        | ContentNode::ListItem(nodes)
+        | ContentNode::Heading { content: nodes, .. }
+        | ContentNode::EnumItem { content: nodes, .. } => {
+            nodes.iter().any(content_node_has_table_or_grid)
+        }
+        _ => false,
+    }
+}
+
+fn classify_evaluated_figure(args: &[Arg]) -> TargetKind {
+    let explicit_kind = args.iter().rev().find_map(|arg| match arg {
+        Arg::Named(k, v) if k == "kind" => Some(v),
+        _ => None,
+    });
+    let explicit_supp = args
+        .iter()
+        .rev()
+        .find_map(|arg| match arg {
+            Arg::Named(k, v) if k == "supplement" => Some(v),
+            _ => None,
+        })
+        .and_then(|v| match v {
+            Value::Auto => None,
+            Value::None => Some(String::new()),
+            Value::Str(s) => Some(s.clone()),
+            Value::Content(nodes) => Some(plain_text_from_eval_nodes(nodes)),
+            other => Some(other.display().trim().to_string()),
+        });
+
+    let default_kind = match explicit_kind {
+        None | Some(Value::Auto) => {
+            let is_table = args.iter().any(|arg| match arg {
+                Arg::Pos(Value::Content(nodes)) => nodes.iter().any(content_node_has_table_or_grid),
+                _ => false,
+            });
+            if is_table {
+                TargetKind::Table
+            } else {
+                TargetKind::Figure
+            }
+        }
+        Some(Value::Str(s)) => match s.as_str() {
+            "table" => TargetKind::Table,
+            "image" | "figure" => TargetKind::Figure,
+            other => TargetKind::Custom(default_custom_figure_supplement(other)),
+        },
+        Some(Value::Func(f)) => match f.builtin_name() {
+            Some("table") => TargetKind::Table,
+            Some("image" | "figure") | None => TargetKind::Figure,
+            Some(other) => TargetKind::Custom(default_custom_figure_supplement(other)),
+        },
+        Some(other) => {
+            let raw = other.display();
+            let cleaned = unwrap_balanced_parens(&raw)
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim();
+            match cleaned {
+                "" | "auto" | "image" | "figure" => TargetKind::Figure,
+                "table" => TargetKind::Table,
+                kind_name => TargetKind::Custom(default_custom_figure_supplement(kind_name)),
+            }
+        }
+    };
+    match explicit_supp {
+        Some(s) => TargetKind::Custom(s),
+        None => default_kind,
+    }
+}
+
+fn classify_content_node(node: &ContentNode) -> Option<TargetKind> {
+    match node {
+        ContentNode::Heading { .. } => Some(TargetKind::Section),
+        ContentNode::Element { name, .. } if name == "heading" => Some(TargetKind::Section),
+        ContentNode::FuncCall { name, args } => match name.as_str() {
+            "heading" => Some(TargetKind::Section),
+            "figure" => Some(classify_evaluated_figure(args)),
+            "table" | "grid" => Some(TargetKind::Table),
+            "image" => Some(TargetKind::Figure),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn index_value_anchors(val: &Value, targets: &mut DocumentTargets) {
+    match val {
+        Value::Content(nodes) => index_content_node_anchors(nodes, targets),
+        Value::Array(items) => {
+            for item in items {
+                index_value_anchors(item, targets);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn index_content_node_anchors(nodes: &[ContentNode], targets: &mut DocumentTargets) {
+    for (idx, node) in nodes.iter().enumerate() {
+        if let Some((_, kind, Some(label), _)) = node.ref_anchor_parts() {
+            targets.labels.insert(label.to_string());
+            if let Some(target_kind) = target_kind_from_anchor(kind) {
+                targets.supplements.insert(label.to_string(), target_kind);
+            }
+            continue;
+        }
+        if let Some((target, _, label, _)) = node.labeled_parts() {
+            targets.labels.insert(label.to_string());
+            if let [single] = target {
+                if let Some(kind) = classify_content_node(single) {
+                    targets.supplements.insert(label.to_string(), kind);
+                }
+            }
+            index_content_node_anchors(target, targets);
+            continue;
+        }
+        if matches!(node, ContentNode::Label(_) | ContentNode::LabelDef(_)) {
+            let lbl = match node {
+                ContentNode::Label(l) | ContentNode::LabelDef(l) => l,
+                _ => unreachable!(),
+            };
+            targets.labels.insert(lbl.clone());
+            if let Some(prev) = nodes[..idx]
+                .iter()
+                .rev()
+                .find(|n| !matches!(n, ContentNode::Space | ContentNode::Linebreak))
+            {
+                if let Some(kind) = classify_content_node(prev) {
+                    targets.supplements.insert(lbl.clone(), kind);
+                }
+            }
+            continue;
+        }
+        match node {
+            ContentNode::Strong(children)
+            | ContentNode::Emph(children)
+            | ContentNode::ListItem(children)
+            | ContentNode::Heading {
+                content: children, ..
+            }
+            | ContentNode::EnumItem {
+                content: children, ..
+            } => index_content_node_anchors(children, targets),
+            ContentNode::Element { fields, .. } => {
+                for val in fields.values() {
+                    index_value_anchors(val, targets);
+                }
+            }
+            ContentNode::FuncCall { args, .. } => {
+                for arg in args {
+                    match arg {
+                        Arg::Pos(val) | Arg::Named(_, val) | Arg::Spread(val) => {
+                            index_value_anchors(val, targets);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn visit(node: &SyntaxNode, targets: &mut DocumentTargets) {
     let children: Vec<&SyntaxNode> = node.children().collect();
 
@@ -313,18 +630,73 @@ fn label_name(node: &SyntaxNode) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+fn ast_supplement_text(raw: &str) -> Option<String> {
+    let inner = unwrap_balanced_parens(raw);
+    match inner {
+        "" | "auto" => None,
+        "none" => Some(String::new()),
+        _ if inner.starts_with('[') && inner.ends_with(']') && inner.len() >= 2 => {
+            Some(inner[1..inner.len() - 1].trim().to_string())
+        }
+        _ if ((inner.starts_with('"') && inner.ends_with('"'))
+            || (inner.starts_with('\'') && inner.ends_with('\'')))
+            && inner.len() >= 2 =>
+        {
+            Some(inner[1..inner.len() - 1].to_string())
+        }
+        _ => Some(inner.to_string()),
+    }
+}
+
 /// Which supplement Typst renders for the element this label follows.
 fn classify(node: &SyntaxNode) -> Option<TargetKind> {
     match node.kind() {
         SyntaxKind::Heading => Some(TargetKind::Section),
         SyntaxKind::FuncCall => match callee(node)?.as_str() {
+            "heading" => Some(TargetKind::Section),
             // A `#figure` is a table when its body is one; Typst picks the
             // supplement from the figure's `kind` the same way.
-            "figure" => Some(if contains_call(node, &["table", "grid"]) {
-                TargetKind::Table
-            } else {
-                TargetKind::Figure
-            }),
+            "figure" => {
+                let children: Vec<_> = node.children().collect();
+                let args = FuncArgs::from_func_call(&children);
+                let explicit_supp = args
+                    .iter()
+                    .filter(|arg| arg.name.as_deref() == Some("supplement"))
+                    .last()
+                    .and_then(|arg| ast_supplement_text(&arg.value));
+                let kind_val = args
+                    .iter()
+                    .filter(|arg| arg.name.as_deref() == Some("kind"))
+                    .last()
+                    .map(|arg| {
+                        unwrap_balanced_parens(arg.value.trim())
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .trim()
+                            .to_string()
+                    });
+                let base_kind = match kind_val.as_deref() {
+                    None | Some("" | "auto") => {
+                        if figure_ast_has_table_or_grid(node) {
+                            TargetKind::Table
+                        } else {
+                            TargetKind::Figure
+                        }
+                    }
+                    Some("table") => TargetKind::Table,
+                    Some("image" | "figure") => TargetKind::Figure,
+                    Some(other) => {
+                        return Some(TargetKind::Custom(
+                            explicit_supp
+                                .unwrap_or_else(|| default_custom_figure_supplement(other)),
+                        ));
+                    }
+                };
+                Some(match explicit_supp {
+                    Some(supp) => TargetKind::Custom(supp),
+                    None => base_kind,
+                })
+            }
             "table" | "grid" => Some(TargetKind::Table),
             "image" => Some(TargetKind::Figure),
             _ => None,
@@ -341,11 +713,42 @@ fn callee(node: &SyntaxNode) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
-/// Whether the call's arguments contain a call to one of `names`.
-fn contains_call(node: &SyntaxNode, names: &[&str]) -> bool {
-    node.children().any(|child| {
-        (child.kind() == SyntaxKind::FuncCall
-            && callee(child).is_some_and(|name| names.contains(&name.as_str())))
-            || contains_call(child, names)
-    })
+/// Whether `node` itself or any descendant is a call to one of `names`.
+pub(crate) fn node_contains_call(node: &SyntaxNode, names: &[&str]) -> bool {
+    (node.kind() == SyntaxKind::FuncCall
+        && callee(node).is_some_and(|name| names.contains(&name.as_str())))
+        || node
+            .children()
+            .any(|child| node_contains_call(child, names))
+}
+
+/// Whether a `#figure(...)` AST node's positional body arguments contain a `table` or `grid`.
+pub(crate) fn figure_ast_has_table_or_grid(figure_node: &SyntaxNode) -> bool {
+    let children: Vec<_> = figure_node.children().collect();
+    if let Some(args) = children.get(1) {
+        for child in args.children() {
+            if matches!(
+                child.kind(),
+                SyntaxKind::Named
+                    | SyntaxKind::LeftParen
+                    | SyntaxKind::RightParen
+                    | SyntaxKind::Comma
+                    | SyntaxKind::Space
+                    | SyntaxKind::Linebreak
+                    | SyntaxKind::Parbreak
+                    | SyntaxKind::LineComment
+                    | SyntaxKind::BlockComment
+            ) {
+                continue;
+            }
+            if node_contains_call(child, &["table", "grid"]) {
+                return true;
+            }
+        }
+    }
+    children
+        .iter()
+        .skip(2)
+        .filter(|child| child.kind() == SyntaxKind::ContentBlock)
+        .any(|child| node_contains_call(child, &["table", "grid"]))
 }

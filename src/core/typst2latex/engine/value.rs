@@ -4,6 +4,7 @@
 //! for full macro evaluation support.
 
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::features::images::escape_typst_string;
@@ -423,22 +424,36 @@ impl Selector {
     pub fn matches(&self, node: &ContentNode) -> bool {
         match self {
             Selector::Element(name, filters) => {
+                let target_node = match node.labeled_parts() {
+                    Some((target, _, _, _)) if target.len() == 1 => &target[0],
+                    Some(_) => return false,
+                    None => node,
+                };
                 // First check if the element type matches
-                let type_matches = match (name.as_str(), node) {
+                let type_matches = match (name.as_str(), target_node) {
                     ("heading", ContentNode::Heading { .. }) => true,
                     ("strong", ContentNode::Strong(_)) => true,
                     ("emph", ContentNode::Emph(_)) => true,
                     ("raw", ContentNode::Raw { .. }) => true,
-                    ("math", ContentNode::Math { .. }) => true,
-                    ("list", ContentNode::ListItem(_)) => true,
-                    ("enum", ContentNode::EnumItem { .. }) => true,
+                    ("math" | "math.equation", ContentNode::Math { .. }) => true,
+                    ("list.item", ContentNode::ListItem(_)) => true,
+                    ("enum.item", ContentNode::EnumItem { .. }) => true,
+                    ("terms.item", node) if node.term_item_parts().is_some() => true,
                     ("text", ContentNode::Text(_)) => true,
                     ("cite", ContentNode::Citation { .. }) => true,
                     ("ref", ContentNode::Reference { .. }) => true,
-                    ("label", ContentNode::LabelDef(_)) => true,
+                    ("label", ContentNode::LabelDef(_) | ContentNode::Label(_)) => true,
                     ("bibliography", ContentNode::Bibliography { .. }) => true,
                     // Element variant matches by name
-                    (elem_name, ContentNode::Element { name: n, .. }) if elem_name == n => true,
+                    (elem_name, ContentNode::Element { name: n, .. })
+                        if elem_name == n
+                            && n != LABELED_ELEMENT_NAME
+                            && n != REF_ANCHOR_ELEMENT_NAME
+                            && n != DUP_ELEMENT_NAME
+                            && n != DUP_SNAPSHOT_NAME =>
+                    {
+                        true
+                    }
                     // FuncCall matches by function name
                     (func_name, ContentNode::FuncCall { name, .. }) if func_name == name => true,
                     _ => false,
@@ -462,9 +477,7 @@ impl Selector {
                         .unwrap_or(false)
                 })
             }
-            Selector::Label(label) => {
-                matches!(node, ContentNode::Label(l) if l == label)
-            }
+            Selector::Label(label) => node.labeled_parts().is_some_and(|(_, _, l, _)| l == label),
             Selector::String(s) => {
                 matches!(node, ContentNode::Text(t) if t.contains(s))
             }
@@ -486,8 +499,45 @@ impl Selector {
 
     /// Extract fields from a content node for filter matching.
     fn get_node_fields(&self, node: &ContentNode) -> IndexMap<String, Value> {
+        if let Some((target, _, label, _)) = node.labeled_parts() {
+            let mut fields = if target.len() == 1 {
+                self.get_node_fields(&target[0])
+            } else {
+                IndexMap::new()
+            };
+            fields.insert("label".to_string(), Value::Label(label.to_string()));
+            return fields;
+        }
         match node {
-            ContentNode::Element { fields, .. } => fields.clone(),
+            ContentNode::Element { fields, .. } => fields
+                .iter()
+                .filter(|(k, _)| !k.starts_with("__tylax_"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            ContentNode::FuncCall { name, args } => {
+                let mut fields = IndexMap::new();
+                for arg in args {
+                    if let Arg::Named(k, v) = arg {
+                        if !k.starts_with("__tylax_") {
+                            fields.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                if name == "figure" && fields.get("kind").is_none_or(|v| matches!(v, Value::Auto)) {
+                    let has_table = args.iter().any(|arg| match arg {
+                        Arg::Pos(Value::Content(nodes)) => {
+                            nodes.iter().any(content_node_has_table_or_grid)
+                        }
+                        _ => false,
+                    });
+                    let inferred = if has_table { "table" } else { "image" };
+                    fields.insert(
+                        "kind".to_string(),
+                        Value::Func(Arc::new(Closure::builtin(inferred))),
+                    );
+                }
+                fields
+            }
             ContentNode::Heading { level, content } => {
                 let mut fields = IndexMap::new();
                 fields.insert("level".to_string(), Value::Int(*level as i64));
@@ -512,11 +562,24 @@ impl Selector {
                 fields.insert("block".to_string(), Value::Bool(*block));
                 fields
             }
-            ContentNode::EnumItem { number, .. } => {
+            ContentNode::Strong(content)
+            | ContentNode::Emph(content)
+            | ContentNode::ListItem(content) => {
+                let mut fields = IndexMap::new();
+                fields.insert("body".to_string(), Value::Content(content.clone()));
+                fields
+            }
+            ContentNode::EnumItem { number, content } => {
                 let mut fields = IndexMap::new();
                 if let Some(n) = number {
                     fields.insert("number".to_string(), Value::Int(*n));
                 }
+                fields.insert("body".to_string(), Value::Content(content.clone()));
+                fields
+            }
+            ContentNode::Text(t) => {
+                let mut fields = IndexMap::new();
+                fields.insert("text".to_string(), Value::Str(t.clone()));
                 fields
             }
             ContentNode::Citation {
@@ -603,6 +666,61 @@ impl Selector {
                 Selector::Element(name, filters)
             }
             other => other, // Non-element selectors can't have filters
+        }
+    }
+
+    pub(crate) fn is_textual(&self) -> bool {
+        matches!(self, Selector::String(_) | Selector::Regex(_))
+    }
+
+    pub(crate) fn may_match_container(&self, name: &str) -> bool {
+        match self {
+            Selector::Element(n, _) => n == name,
+            Selector::Or(a, b) | Selector::And(a, b) => {
+                a.may_match_container(name) || b.may_match_container(name)
+            }
+            Selector::Before(a, _) | Selector::After(a, _) => a.may_match_container(name),
+            Selector::String(_) | Selector::Regex(_) | Selector::Label(_) => false,
+        }
+    }
+
+    pub(crate) fn contains_textual(&self) -> bool {
+        match self {
+            Selector::String(_) | Selector::Regex(_) => true,
+            Selector::Or(a, b)
+            | Selector::And(a, b)
+            | Selector::Before(a, b)
+            | Selector::After(a, b) => a.contains_textual() || b.contains_textual(),
+            Selector::Element(_, _) | Selector::Label(_) => false,
+        }
+    }
+
+    pub(crate) fn find_text_match(&self, text: &str) -> Option<(usize, usize)> {
+        match self {
+            Selector::String(pat) if !pat.is_empty() => {
+                text.find(pat.as_str()).map(|pos| (pos, pos + pat.len()))
+            }
+            Selector::Regex(re) => re
+                .find(text)
+                .and_then(|m| (m.end() > m.start()).then_some((m.start(), m.end()))),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn from_value(val: &Value) -> Option<Self> {
+        match val {
+            Value::Selector(s) => Some(s.clone()),
+            Value::Str(s) => Some(Selector::String(s.clone())),
+            Value::Regex(r) => Some(Selector::Regex(r.clone())),
+            Value::Label(l) => Some(Selector::Label(l.clone())),
+            Value::Content(nodes) => match nodes.as_slice() {
+                [ContentNode::Label(l) | ContentNode::LabelDef(l)] => {
+                    Some(Selector::Label(l.clone()))
+                }
+                _ => None,
+            },
+            Value::Func(f) => f.builtin_name().map(Selector::element),
+            _ => None,
         }
     }
 }
@@ -894,7 +1012,13 @@ impl fmt::Debug for Value {
                 }
                 write!(f, ")")
             }
-            Value::Func(c) => write!(f, "<function({})>", c.params.join(", ")),
+            Value::Func(c) => {
+                if let Some(name) = c.builtin_name() {
+                    write!(f, "{name}")
+                } else {
+                    write!(f, "<function({})>", c.params.join(", "))
+                }
+            }
             Value::Content(nodes) => {
                 write!(f, "[")?;
                 for node in nodes {
@@ -948,7 +1072,13 @@ impl PartialEq for Value {
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Array(a), Value::Array(b)) => a == b,
             (Value::Dict(a), Value::Dict(b)) => a == b,
-            (Value::Func(a), Value::Func(b)) => Arc::ptr_eq(a, b),
+            (Value::Func(a), Value::Func(b)) => {
+                Arc::ptr_eq(a, b)
+                    || matches!(
+                        (a.builtin_name(), b.builtin_name()),
+                        (Some(na), Some(nb)) if na == nb
+                    )
+            }
             (Value::Content(a), Value::Content(b)) => a == b,
             (Value::Regex(a), Value::Regex(b)) => a == b,
             (Value::DateTime(a), Value::DateTime(b)) => a == b,
@@ -1141,7 +1271,10 @@ impl Value {
                     .collect();
                 format!("({})", items.join(", "))
             }
-            Value::Func(c) => format!("<function({})>", c.params.join(", ")),
+            Value::Func(c) => c
+                .builtin_name()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("<function({})>", c.params.join(", "))),
             Value::Content(nodes) => nodes.iter().map(|n| n.to_typst()).collect(),
             Value::Regex(r) => format!("regex(\"{}\")", r.as_str()),
             Value::DateTime(dt) => dt.to_typst(),
@@ -1176,6 +1309,7 @@ impl Value {
         match self {
             Value::Content(nodes) => nodes,
             Value::None => vec![],
+            Value::Label(l) => vec![ContentNode::Label(l)],
             other => vec![ContentNode::Text(other.display())],
         }
     }
@@ -1210,6 +1344,28 @@ pub struct Closure {
     pub body_source: String,
     /// Captured variables from the enclosing scope
     pub captures: IndexMap<String, Value>,
+}
+
+impl Closure {
+    /// Construct a wrapper closure representing a builtin Typst function.
+    pub(crate) fn builtin(name: &str) -> Self {
+        Self {
+            name: Some(format!("<builtin:{name}>")),
+            params: vec!["x".to_string()],
+            defaults: vec![None],
+            sink: None,
+            body_source: format!("{name}(x)"),
+            captures: IndexMap::new(),
+        }
+    }
+
+    /// Return the builtin name if this closure wraps a builtin function.
+    pub(crate) fn builtin_name(&self) -> Option<&str> {
+        self.name
+            .as_deref()
+            .and_then(|n| n.strip_prefix("<builtin:"))
+            .and_then(|n| n.strip_suffix('>'))
+    }
 }
 
 // ============================================================================
@@ -1328,6 +1484,15 @@ pub enum MathSegment {
 // Show Rules
 // ============================================================================
 
+static NEXT_SHOW_RULE_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// Scoped style overrides from `show <selector>: set <target>(...)`.
+#[derive(Debug, Clone)]
+pub(crate) struct ShowSetStyle {
+    pub target: String,
+    pub args: IndexMap<String, Value>,
+}
+
 /// A show rule that transforms matched content.
 #[derive(Debug, Clone)]
 pub struct ShowRule {
@@ -1335,6 +1500,12 @@ pub struct ShowRule {
     pub selector: Selector,
     /// The transformation function to apply
     pub transform: Arc<Closure>,
+    /// Static replacement value when rule uses a non-function replacement (`#show X: [Y]`)
+    pub(crate) replacement: Option<Value>,
+    /// Scoped set-rule payload (`#show X: set Y(...)`)
+    pub(crate) set_style: Option<ShowSetStyle>,
+    /// Unique rule identity (for cycle/revocation tracking across rule applications)
+    pub(crate) id: usize,
     /// Priority (rules defined later have higher priority)
     pub priority: usize,
 }
@@ -1345,6 +1516,47 @@ impl ShowRule {
         Self {
             selector,
             transform,
+            replacement: None,
+            set_style: None,
+            id: NEXT_SHOW_RULE_ID.fetch_add(1, Ordering::Relaxed),
+            priority,
+        }
+    }
+
+    /// Create a show rule that replaces matched content with a static value.
+    pub(crate) fn from_value(selector: Selector, replacement: Value, priority: usize) -> Self {
+        Self {
+            selector,
+            transform: Arc::new(Closure {
+                name: None,
+                params: Vec::new(),
+                defaults: Vec::new(),
+                sink: None,
+                body_source: String::new(),
+                captures: IndexMap::new(),
+            }),
+            replacement: Some(replacement),
+            set_style: None,
+            id: NEXT_SHOW_RULE_ID.fetch_add(1, Ordering::Relaxed),
+            priority,
+        }
+    }
+
+    /// Create a show rule that applies scoped `set` styling to matched targets.
+    pub(crate) fn from_set(selector: Selector, style: ShowSetStyle, priority: usize) -> Self {
+        Self {
+            selector,
+            transform: Arc::new(Closure {
+                name: None,
+                params: Vec::new(),
+                defaults: Vec::new(),
+                sink: None,
+                body_source: String::new(),
+                captures: IndexMap::new(),
+            }),
+            replacement: None,
+            set_style: Some(style),
+            id: NEXT_SHOW_RULE_ID.fetch_add(1, Ordering::Relaxed),
             priority,
         }
     }
@@ -1451,25 +1663,32 @@ pub(crate) fn render_math_segments_to_typst_source(segments: &[MathSegment]) -> 
         .collect()
 }
 
-fn render_func_call_source(name: &str, args: &[Arg], prefix_hash: bool, in_math: bool) -> String {
+fn render_func_call_source(
+    name: &str,
+    args: &[Arg],
+    prefix_hash: bool,
+    in_math: bool,
+    emit_anchors: bool,
+) -> String {
     // The arguments of a `#` call are code even inside math: `#box(a/b)` divides,
     // so math content must stay `[$a/b$]`.
     let in_math = in_math && !prefix_hash;
     let args_str: Vec<String> = args
         .iter()
+        .filter(|arg| !matches!(arg, Arg::Named(k, _) if k.starts_with("__tylax_")))
         .map(|arg| match arg {
             Arg::Pos(value) => {
                 if in_math {
                     value_to_typst_math_arg(value)
                 } else {
-                    value_to_typst_arg(value)
+                    value_to_typst_arg_inner(value, emit_anchors)
                 }
             }
             Arg::Named(key, value) => {
                 let rendered = if in_math {
                     value_to_typst_math_arg(value)
                 } else {
-                    value_to_typst_arg(value)
+                    value_to_typst_arg_inner(value, emit_anchors)
                 };
                 format!("{}: {}", key, rendered)
             }
@@ -1477,7 +1696,7 @@ fn render_func_call_source(name: &str, args: &[Arg], prefix_hash: bool, in_math:
                 let rendered = if in_math {
                     value_to_typst_math_arg(value)
                 } else {
-                    value_to_typst_arg(value)
+                    value_to_typst_arg_inner(value, emit_anchors)
                 };
                 format!("..{}", rendered)
             }
@@ -1487,20 +1706,20 @@ fn render_func_call_source(name: &str, args: &[Arg], prefix_hash: bool, in_math:
     format!("{}{}({})", hash, name, args_str.join(", "))
 }
 
-pub(crate) fn func_call_to_typst_source(name: &str, args: &[Arg]) -> String {
-    render_func_call_source(name, args, true, false)
+fn func_call_to_typst_source_inner(name: &str, args: &[Arg], emit_anchors: bool) -> String {
+    render_func_call_source(name, args, true, false, emit_anchors)
 }
 
-fn func_call_to_typst_code_source(name: &str, args: &[Arg]) -> String {
-    render_func_call_source(name, args, false, false)
+fn func_call_to_typst_code_source_inner(name: &str, args: &[Arg], emit_anchors: bool) -> String {
+    render_func_call_source(name, args, false, false, emit_anchors)
 }
 
 pub(crate) fn func_call_to_typst_math_source(name: &str, args: &[Arg]) -> String {
-    render_func_call_source(name, args, true, true)
+    render_func_call_source(name, args, true, true, false)
 }
 
 fn func_call_to_typst_math_code_source(name: &str, args: &[Arg]) -> String {
-    render_func_call_source(name, args, false, true)
+    render_func_call_source(name, args, false, true, false)
 }
 
 pub(crate) fn value_to_typst_math_expr(value: &Value) -> String {
@@ -1532,34 +1751,808 @@ fn value_to_typst_math_arg(value: &Value) -> String {
 }
 
 fn escape_typst_markup_text(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
     let mut escaped = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if matches!(
+    let mut at_line_start = true;
+    let mut line_digits_only = false;
+
+    for (idx, &ch) in chars.iter().enumerate() {
+        let prev = idx.checked_sub(1).and_then(|p| chars.get(p).copied());
+        let prev2 = idx.checked_sub(2).and_then(|p| chars.get(p).copied());
+        let next = chars.get(idx + 1).copied();
+        let next2 = chars.get(idx + 2).copied();
+
+        let is_ellipsis_dot = ch == '.'
+            && ((prev == Some('.') && next == Some('.'))
+                || (prev2 == Some('.') && prev == Some('.'))
+                || (next == Some('.') && next2 == Some('.')));
+
+        let should_escape = matches!(
             ch,
-            '\\' | '$' | '#' | '[' | ']' | '*' | '_' | '`' | '<' | '>' | '@'
-        ) {
+            '\\' | '$'
+                | '#'
+                | '['
+                | ']'
+                | '*'
+                | '_'
+                | '`'
+                | '<'
+                | '>'
+                | '@'
+                | '/'
+                | '~'
+                | '"'
+                | '\''
+        ) || (at_line_start && matches!(ch, '=' | '+' | '-'))
+            || (ch == '-' && (prev == Some('-') || next == Some('-') || next == Some('?')))
+            || (ch == '.'
+                && ((line_digits_only && next.is_none_or(|c| c.is_whitespace()))
+                    || is_ellipsis_dot));
+
+        if should_escape {
             escaped.push('\\');
         }
         escaped.push(ch);
+
+        if matches!(ch, '\n' | '\r') {
+            at_line_start = true;
+            line_digits_only = false;
+        } else if matches!(ch, ' ' | '\t') && at_line_start {
+            // Leading indentation keeps line-start context.
+        } else if ch.is_ascii_digit() && (at_line_start || line_digits_only) {
+            at_line_start = false;
+            line_digits_only = true;
+        } else {
+            at_line_start = false;
+            line_digits_only = false;
+        }
     }
+
     escaped
 }
 
+pub(crate) const LIST_CONTAINER_NAME: &str = "list";
+pub(crate) const ENUM_CONTAINER_NAME: &str = "enum";
+pub(crate) const TERMS_CONTAINER_NAME: &str = "terms";
+pub(crate) const TERM_ITEM_NAME: &str = "terms.item";
+pub(crate) const LABELED_ELEMENT_NAME: &str = "__tylax_labeled";
+pub(crate) const REF_ANCHOR_ELEMENT_NAME: &str = "__tylax_ref_anchor";
+pub(crate) const DUP_ELEMENT_NAME: &str = "__tylax_dup_element";
+pub(crate) const DUP_SNAPSHOT_NAME: &str = "__tylax_dup_snapshot";
+pub(crate) const EXPLICIT_FIELDS_KEY: &str = "__tylax_explicit_fields";
+pub(crate) const EXPLICIT_NUMBERING_ARG: &str = "__tylax_explicit_numbering";
+
+fn content_node_has_table_or_grid(node: &ContentNode) -> bool {
+    if let Some((target, _, _, _)) = node.labeled_parts() {
+        return target.iter().any(content_node_has_table_or_grid);
+    }
+    match node {
+        ContentNode::FuncCall { name, args } => {
+            matches!(name.as_str(), "table" | "grid")
+                || args.iter().any(|arg| match arg {
+                    Arg::Pos(Value::Content(nodes))
+                    | Arg::Named(_, Value::Content(nodes))
+                    | Arg::Spread(Value::Content(nodes)) => {
+                        nodes.iter().any(content_node_has_table_or_grid)
+                    }
+                    _ => false,
+                })
+        }
+        ContentNode::Element { name, fields } => {
+            matches!(name.as_str(), "table" | "grid")
+                || fields
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with("__tylax_"))
+                    .any(|(_, val)| match val {
+                        Value::Content(nodes) => nodes.iter().any(content_node_has_table_or_grid),
+                        Value::Array(items) => items.iter().any(|item| match item {
+                            Value::Content(nodes) => {
+                                nodes.iter().any(content_node_has_table_or_grid)
+                            }
+                            _ => false,
+                        }),
+                        _ => false,
+                    })
+        }
+        ContentNode::Strong(nodes)
+        | ContentNode::Emph(nodes)
+        | ContentNode::ListItem(nodes)
+        | ContentNode::Heading { content: nodes, .. }
+        | ContentNode::EnumItem { content: nodes, .. } => {
+            nodes.iter().any(content_node_has_table_or_grid)
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn mark_explicit_fields(fields: &mut IndexMap<String, Value>, names: &[&str]) {
+    if names.is_empty() {
+        return;
+    }
+    fields.insert(
+        EXPLICIT_FIELDS_KEY.to_string(),
+        Value::Array(names.iter().map(|n| Value::Str((*n).to_string())).collect()),
+    );
+}
+
+pub(crate) fn has_explicit_field(fields: &IndexMap<String, Value>, field: &str) -> bool {
+    matches!(
+        fields.get(EXPLICIT_FIELDS_KEY),
+        Some(Value::Array(items)) if items.iter().any(|v| matches!(v, Value::Str(s) if s == field))
+    )
+}
+
+fn render_term_field_nodes_inner(nodes: &[ContentNode], emit_anchors: bool) -> String {
+    let mut rendered = render_content_nodes_inner(nodes, emit_anchors);
+    if nodes
+        .last()
+        .is_some_and(|n| n.is_plain_block_list() || n.is_heading())
+        && rendered.ends_with('\n')
+    {
+        rendered.pop();
+    }
+    rendered
+}
+
+fn render_content_block_arg_inner(nodes: &[ContentNode], emit_anchors: bool) -> String {
+    let rendered = render_term_field_nodes_inner(nodes, emit_anchors);
+    let starts_with_list = nodes
+        .iter()
+        .find(|node| {
+            !matches!(node, ContentNode::Space | ContentNode::Parbreak)
+                && !matches!(node, ContentNode::Text(text) if text.chars().all(|c| matches!(c, ' ' | '\t')))
+        })
+        .is_some_and(ContentNode::is_plain_block_list);
+    if starts_with_list {
+        format!("[\n{rendered}]")
+    } else {
+        format!("[{rendered}]")
+    }
+}
+
+fn format_list_item_typst_inner(
+    prefix: &str,
+    children: &[ContentNode],
+    emit_anchors: bool,
+) -> String {
+    let inner = render_content_nodes_inner(children, emit_anchors);
+    let inner = inner.strip_suffix('\n').unwrap_or(&inner);
+    let indent = " ".repeat(prefix.len());
+    let mut out = String::new();
+    for (idx, line) in inner.split('\n').enumerate() {
+        if idx == 0 {
+            out.push_str(prefix);
+            out.push_str(line);
+        } else if !line.is_empty() {
+            out.push_str(&indent);
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+pub(crate) fn render_content_nodes(nodes: &[ContentNode]) -> String {
+    render_content_nodes_inner(nodes, false)
+}
+
+fn render_content_nodes_inner(nodes: &[ContentNode], emit_anchors: bool) -> String {
+    let mut output = String::new();
+    let mut text_run = String::new();
+    let flush_text_run = |output: &mut String, text_run: &mut String| {
+        if !text_run.is_empty() {
+            output.push_str(&escape_typst_markup_text(text_run));
+            text_run.clear();
+        }
+    };
+
+    for node in nodes {
+        if let ContentNode::Text(s) = node {
+            text_run.push_str(s);
+            continue;
+        }
+        flush_text_run(&mut output, &mut text_run);
+        if node.is_block_list_like() || node.is_heading() {
+            output.truncate(output.trim_end_matches([' ', '\t']).len());
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+        }
+        output.push_str(&node.to_typst_inner(emit_anchors));
+    }
+    flush_text_run(&mut output, &mut text_run);
+    output
+}
+
+fn unpack_container_children(fields: &IndexMap<String, Value>) -> Option<Vec<ContentNode>> {
+    let Value::Array(children) = fields.get("children")? else {
+        return None;
+    };
+    let mut items = Vec::with_capacity(children.len());
+    for child in children {
+        match child {
+            Value::Content(nodes) => items.extend(nodes.iter().cloned()),
+            other => items.push(ContentNode::Text(other.display())),
+        }
+    }
+    Some(items)
+}
+
 impl ContentNode {
+    pub(crate) fn is_heading(&self) -> bool {
+        matches!(self, Self::Heading { .. })
+            || matches!(self, Self::Element { name, .. } if name == "heading")
+    }
+
+    pub(crate) fn is_ordinary_list_item(&self) -> bool {
+        matches!(self, Self::ListItem(_) | Self::EnumItem { .. })
+    }
+
+    pub(crate) fn is_plain_block_list(&self) -> bool {
+        if self.is_ordinary_list_item() {
+            return true;
+        }
+        match self {
+            Self::Element { name, fields } if name == LIST_CONTAINER_NAME => fields
+                .get("marker")
+                .is_none_or(|v| matches!(v, Value::Auto)),
+            Self::Element { name, fields } if name == ENUM_CONTAINER_NAME => {
+                fields.get("start").is_none_or(|v| matches!(v, Value::Auto))
+                    && fields
+                        .get("numbering")
+                        .is_none_or(|v| matches!(v, Value::Auto))
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn is_block_list_like(&self) -> bool {
+        self.is_ordinary_list_item()
+            || self.term_item_parts().is_some()
+            || matches!(
+                self,
+                Self::Element { name, .. }
+                    if matches!(
+                        name.as_str(),
+                        LIST_CONTAINER_NAME | ENUM_CONTAINER_NAME | TERMS_CONTAINER_NAME
+                    )
+            )
+    }
+
+    pub(crate) fn list_container(
+        items: Vec<ContentNode>,
+        tight: bool,
+        marker: Option<Value>,
+    ) -> Self {
+        let mut fields = IndexMap::new();
+        fields.insert(
+            "children".to_string(),
+            Value::Array(items.into_iter().map(|n| Value::Content(vec![n])).collect()),
+        );
+        fields.insert("tight".to_string(), Value::Bool(tight));
+        if let Some(m) = marker.filter(|v| !matches!(v, Value::Auto)) {
+            fields.insert("marker".to_string(), m);
+        }
+        Self::Element {
+            name: LIST_CONTAINER_NAME.to_string(),
+            fields,
+        }
+    }
+
+    pub(crate) fn enum_container(
+        items: Vec<ContentNode>,
+        tight: bool,
+        start: Option<i64>,
+        numbering: Option<Value>,
+    ) -> Self {
+        let mut fields = IndexMap::new();
+        fields.insert(
+            "children".to_string(),
+            Value::Array(items.into_iter().map(|n| Value::Content(vec![n])).collect()),
+        );
+        fields.insert("tight".to_string(), Value::Bool(tight));
+        fields.insert(
+            "start".to_string(),
+            start.map(Value::Int).unwrap_or(Value::Auto),
+        );
+        if let Some(num) = numbering.filter(|v| !matches!(v, Value::Auto)) {
+            fields.insert("numbering".to_string(), num);
+        }
+        Self::Element {
+            name: ENUM_CONTAINER_NAME.to_string(),
+            fields,
+        }
+    }
+
+    pub(crate) fn terms_container(items: Vec<ContentNode>, tight: bool) -> Self {
+        let mut fields = IndexMap::new();
+        fields.insert(
+            "children".to_string(),
+            Value::Array(items.into_iter().map(|n| Value::Content(vec![n])).collect()),
+        );
+        fields.insert("tight".to_string(), Value::Bool(tight));
+        Self::Element {
+            name: TERMS_CONTAINER_NAME.to_string(),
+            fields,
+        }
+    }
+
+    pub(crate) fn list_container_parts(&self) -> Option<(Vec<ContentNode>, Option<&Value>)> {
+        let Self::Element { name, fields } = self else {
+            return None;
+        };
+        if name != LIST_CONTAINER_NAME {
+            return None;
+        }
+        let items = unpack_container_children(fields)?;
+        let marker = fields.get("marker").filter(|v| !matches!(v, Value::Auto));
+        Some((items, marker))
+    }
+
+    pub(crate) fn enum_container_parts(
+        &self,
+    ) -> Option<(Vec<ContentNode>, Option<i64>, Option<&Value>)> {
+        let Self::Element { name, fields } = self else {
+            return None;
+        };
+        if name != ENUM_CONTAINER_NAME {
+            return None;
+        }
+        let items = unpack_container_children(fields)?;
+        let start = match fields.get("start") {
+            Some(Value::Int(n)) => Some(*n),
+            _ => None,
+        };
+        let numbering = fields
+            .get("numbering")
+            .filter(|v| !matches!(v, Value::Auto));
+        Some((items, start, numbering))
+    }
+
+    pub(crate) fn terms_container_items(&self) -> Option<Vec<ContentNode>> {
+        let Self::Element { name, fields } = self else {
+            return None;
+        };
+        if name != TERMS_CONTAINER_NAME {
+            return None;
+        }
+        unpack_container_children(fields)
+    }
+
+    pub(crate) fn term_item(term: Vec<ContentNode>, description: Vec<ContentNode>) -> Self {
+        Self::Element {
+            name: TERM_ITEM_NAME.to_string(),
+            fields: IndexMap::from([
+                ("term".to_string(), Value::Content(term)),
+                ("description".to_string(), Value::Content(description)),
+            ]),
+        }
+    }
+
+    pub(crate) fn term_item_parts(&self) -> Option<(&[ContentNode], &[ContentNode])> {
+        let Self::Element { name, fields } = self else {
+            return None;
+        };
+        if name != TERM_ITEM_NAME {
+            return None;
+        }
+        let Value::Content(term) = fields.get("term")? else {
+            return None;
+        };
+        let Value::Content(description) = fields.get("description")? else {
+            return None;
+        };
+        Some((term, description))
+    }
+
+    pub(crate) fn into_term_item_parts(self) -> Result<(Vec<ContentNode>, Vec<ContentNode>), Self> {
+        if self.term_item_parts().is_none() {
+            return Err(self);
+        }
+        let Self::Element { mut fields, .. } = self else {
+            unreachable!()
+        };
+        let Some(Value::Content(term)) = fields.shift_remove("term") else {
+            unreachable!()
+        };
+        let Some(Value::Content(description)) = fields.shift_remove("description") else {
+            unreachable!()
+        };
+        Ok((term, description))
+    }
+
+    pub(crate) fn ref_anchor(counter: &str, kind: &str, label: Option<String>, step: bool) -> Self {
+        let mut fields = IndexMap::new();
+        fields.insert("counter".to_string(), Value::Str(counter.to_string()));
+        fields.insert("kind".to_string(), Value::Str(kind.to_string()));
+        fields.insert("step".to_string(), Value::Bool(step));
+        if let Some(lbl) = label {
+            fields.insert("label".to_string(), Value::Label(lbl));
+        }
+        Self::Element {
+            name: REF_ANCHOR_ELEMENT_NAME.to_string(),
+            fields,
+        }
+    }
+
+    pub(crate) fn ref_anchor_parts(&self) -> Option<(&str, &str, Option<&str>, bool)> {
+        let Self::Element { name, fields } = self else {
+            return None;
+        };
+        if name != REF_ANCHOR_ELEMENT_NAME {
+            return None;
+        }
+        let Value::Str(counter) = fields.get("counter")? else {
+            return None;
+        };
+        let Value::Str(kind) = fields.get("kind")? else {
+            return None;
+        };
+        let Value::Bool(step) = fields.get("step")? else {
+            return None;
+        };
+        let label = match fields.get("label") {
+            Some(Value::Label(lbl)) => Some(lbl.as_str()),
+            _ => None,
+        };
+        Some((counter.as_str(), kind.as_str(), label, *step))
+    }
+
+    pub(crate) fn dup_snapshot(counter: &str, origin_id: usize) -> Self {
+        let mut fields = IndexMap::new();
+        fields.insert("counter".to_string(), Value::Str(counter.to_string()));
+        fields.insert("id".to_string(), Value::Int(origin_id as i64));
+        Self::Element {
+            name: DUP_SNAPSHOT_NAME.to_string(),
+            fields,
+        }
+    }
+
+    pub(crate) fn dup_snapshot_parts(&self) -> Option<(&str, usize)> {
+        let Self::Element { name, fields } = self else {
+            return None;
+        };
+        if name != DUP_SNAPSHOT_NAME {
+            return None;
+        }
+        let Value::Str(counter) = fields.get("counter")? else {
+            return None;
+        };
+        let Value::Int(id) = fields.get("id")? else {
+            return None;
+        };
+        Some((counter.as_str(), usize::try_from(*id).ok()?))
+    }
+
+    pub(crate) fn dup_element(
+        counter: &str,
+        id: usize,
+        origin_id: usize,
+        body: Vec<ContentNode>,
+    ) -> Self {
+        let mut fields = IndexMap::new();
+        fields.insert("counter".to_string(), Value::Str(counter.to_string()));
+        fields.insert("id".to_string(), Value::Int(id as i64));
+        fields.insert("origin".to_string(), Value::Int(origin_id as i64));
+        fields.insert("body".to_string(), Value::Content(body));
+        Self::Element {
+            name: DUP_ELEMENT_NAME.to_string(),
+            fields,
+        }
+    }
+
+    pub(crate) fn dup_element_parts(&self) -> Option<(&str, usize, usize, &[ContentNode])> {
+        let Self::Element { name, fields } = self else {
+            return None;
+        };
+        if name != DUP_ELEMENT_NAME {
+            return None;
+        }
+        let Value::Str(counter) = fields.get("counter")? else {
+            return None;
+        };
+        let Value::Int(id) = fields.get("id")? else {
+            return None;
+        };
+        let origin_id = match fields.get("origin") {
+            Some(Value::Int(oid)) => usize::try_from(*oid).unwrap_or(0),
+            _ => 0,
+        };
+        let Value::Content(body) = fields.get("body")? else {
+            return None;
+        };
+        Some((
+            counter.as_str(),
+            usize::try_from(*id).ok()?,
+            origin_id,
+            body.as_slice(),
+        ))
+    }
+
+    pub(crate) fn labeled(
+        target: Vec<ContentNode>,
+        trivia: Vec<ContentNode>,
+        label: String,
+        is_func: bool,
+    ) -> Self {
+        Self::Element {
+            name: LABELED_ELEMENT_NAME.to_string(),
+            fields: IndexMap::from([
+                ("__target".to_string(), Value::Content(target)),
+                ("__trivia".to_string(), Value::Content(trivia)),
+                ("label".to_string(), Value::Label(label)),
+                ("__label_is_func".to_string(), Value::Bool(is_func)),
+            ]),
+        }
+    }
+
+    pub(crate) fn labeled_parts(&self) -> Option<(&[ContentNode], &[ContentNode], &str, bool)> {
+        let Self::Element { name, fields } = self else {
+            return None;
+        };
+        if name != LABELED_ELEMENT_NAME {
+            return None;
+        }
+        let Value::Content(target) = fields.get("__target")? else {
+            return None;
+        };
+        let Value::Content(trivia) = fields.get("__trivia")? else {
+            return None;
+        };
+        let Value::Label(label) = fields.get("label")? else {
+            return None;
+        };
+        let Value::Bool(is_func) = fields.get("__label_is_func")? else {
+            return None;
+        };
+        Some((target, trivia, label, *is_func))
+    }
+
+    pub(crate) fn into_labeled_parts(
+        self,
+    ) -> Result<(Vec<ContentNode>, Vec<ContentNode>, String, bool), Self> {
+        if self.labeled_parts().is_none() {
+            return Err(self);
+        }
+        let Self::Element { mut fields, .. } = self else {
+            unreachable!()
+        };
+        let Some(Value::Content(target)) = fields.shift_remove("__target") else {
+            unreachable!()
+        };
+        let Some(Value::Content(trivia)) = fields.shift_remove("__trivia") else {
+            unreachable!()
+        };
+        let Some(Value::Label(label)) = fields.shift_remove("label") else {
+            unreachable!()
+        };
+        let Some(Value::Bool(is_func)) = fields.shift_remove("__label_is_func") else {
+            unreachable!()
+        };
+        Ok((target, trivia, label, is_func))
+    }
+
     /// Convert this content node back to Typst source code.
     pub fn to_typst(&self) -> String {
+        self.to_typst_inner(false)
+    }
+
+    /// Convert this content node to Typst source code while preserving internal reference anchors
+    /// for the downstream LaTeX emitter.
+    pub(crate) fn to_typst_for_latex(&self) -> String {
+        self.to_typst_inner(true)
+    }
+
+    fn to_typst_inner(&self, emit_anchors: bool) -> String {
+        if let Some((target, trivia, label, is_func)) = self.labeled_parts() {
+            let label_node = if is_func {
+                ContentNode::LabelDef(label.to_string())
+            } else {
+                ContentNode::Label(label.to_string())
+            };
+            if let [single] = target {
+                if let ContentNode::ListItem(body) = single {
+                    let mut combined = body.clone();
+                    combined.extend(
+                        trivia
+                            .iter()
+                            .filter(|n| matches!(n, ContentNode::Space))
+                            .cloned(),
+                    );
+                    combined.push(label_node);
+                    return format_list_item_typst_inner("- ", &combined, emit_anchors);
+                }
+                if let ContentNode::EnumItem { number, content } = single {
+                    let mut combined = content.clone();
+                    combined.extend(
+                        trivia
+                            .iter()
+                            .filter(|n| matches!(n, ContentNode::Space))
+                            .cloned(),
+                    );
+                    combined.push(label_node);
+                    let prefix = number
+                        .map(|n| format!("{n}. "))
+                        .unwrap_or_else(|| "+ ".to_string());
+                    return format_list_item_typst_inner(&prefix, &combined, emit_anchors);
+                }
+                if let Some((term, desc)) = single.term_item_parts() {
+                    let mut combined_desc = desc.to_vec();
+                    combined_desc.extend(
+                        trivia
+                            .iter()
+                            .filter(|n| matches!(n, ContentNode::Space))
+                            .cloned(),
+                    );
+                    combined_desc.push(label_node);
+                    return format!(
+                        "#{TERM_ITEM_NAME}({}, {})",
+                        render_content_block_arg_inner(term, emit_anchors),
+                        render_content_block_arg_inner(&combined_desc, emit_anchors),
+                    );
+                }
+            }
+            let mut nodes = target.to_vec();
+            nodes.extend(trivia.iter().cloned());
+            nodes.push(label_node);
+            return render_content_nodes_inner(&nodes, emit_anchors);
+        }
+        if let Some((counter, kind, label, step)) = self.ref_anchor_parts() {
+            if !emit_anchors {
+                return String::new();
+            }
+            let label_arg = label
+                .map(|lbl| format!(", label: <{lbl}>"))
+                .unwrap_or_default();
+            return format!(
+                "#{REF_ANCHOR_ELEMENT_NAME}(counter: \"{counter}\", kind: \"{kind}\", step: {step}{label_arg})"
+            );
+        }
+        if let Some((counter, origin_id)) = self.dup_snapshot_parts() {
+            if !emit_anchors {
+                return String::new();
+            }
+            return format!("#{DUP_SNAPSHOT_NAME}(counter: \"{counter}\", id: {origin_id})");
+        }
+        if let Some((counter, id, origin_id, body)) = self.dup_element_parts() {
+            if !emit_anchors {
+                return render_content_nodes_inner(body, false);
+            }
+            return format!(
+                "#{DUP_ELEMENT_NAME}(counter: \"{counter}\", id: {id}, origin: {origin_id}){}",
+                render_content_block_arg_inner(body, true)
+            );
+        }
+        if let Some((term, description)) = self.term_item_parts() {
+            // Content blocks preserve colons and paragraphs and can appear inside a list item.
+            return format!(
+                "#{TERM_ITEM_NAME}({}, {})",
+                render_content_block_arg_inner(term, emit_anchors),
+                render_content_block_arg_inner(description, emit_anchors),
+            );
+        }
+        if let Some((items, marker)) = self.list_container_parts() {
+            let Some(m) = marker else {
+                return render_content_nodes_inner(&items, emit_anchors);
+            };
+            let mut args = vec![format!(
+                "marker: {}",
+                value_to_typst_arg_inner(m, emit_anchors)
+            )];
+            for item in &items {
+                match item {
+                    ContentNode::ListItem(body) => {
+                        args.push(render_content_block_arg_inner(body, emit_anchors));
+                    }
+                    other => {
+                        if let Some(([ContentNode::ListItem(body)], trivia, label, is_func)) =
+                            other.labeled_parts()
+                        {
+                            let mut combined = body.clone();
+                            combined.extend(
+                                trivia
+                                    .iter()
+                                    .filter(|n| matches!(n, ContentNode::Space))
+                                    .cloned(),
+                            );
+                            combined.push(if is_func {
+                                ContentNode::LabelDef(label.to_string())
+                            } else {
+                                ContentNode::Label(label.to_string())
+                            });
+                            args.push(render_content_block_arg_inner(&combined, emit_anchors));
+                        } else {
+                            args.push(render_content_block_arg_inner(
+                                std::slice::from_ref(other),
+                                emit_anchors,
+                            ));
+                        }
+                    }
+                }
+            }
+            return format!("#list({})", args.join(", "));
+        }
+        if let Some((items, start, numbering)) = self.enum_container_parts() {
+            if start.is_none() && numbering.is_none() {
+                return render_content_nodes_inner(&items, emit_anchors);
+            }
+            let mut args = Vec::new();
+            if let Some(s) = start {
+                args.push(format!("start: {s}"));
+            }
+            if let Some(num) = numbering {
+                args.push(format!(
+                    "numbering: {}",
+                    value_to_typst_arg_inner(num, emit_anchors)
+                ));
+            }
+            for item in &items {
+                match item {
+                    ContentNode::EnumItem {
+                        number: Some(n),
+                        content,
+                    } => {
+                        args.push(format!(
+                            "enum.item({n}, {})",
+                            render_content_block_arg_inner(content, emit_anchors)
+                        ));
+                    }
+                    ContentNode::EnumItem {
+                        number: None,
+                        content,
+                    } => {
+                        args.push(render_content_block_arg_inner(content, emit_anchors));
+                    }
+                    other => {
+                        if let Some((
+                            [ContentNode::EnumItem { number, content }],
+                            trivia,
+                            label,
+                            is_func,
+                        )) = other.labeled_parts()
+                        {
+                            let mut combined = content.clone();
+                            combined.extend(
+                                trivia
+                                    .iter()
+                                    .filter(|n| matches!(n, ContentNode::Space))
+                                    .cloned(),
+                            );
+                            combined.push(if is_func {
+                                ContentNode::LabelDef(label.to_string())
+                            } else {
+                                ContentNode::Label(label.to_string())
+                            });
+                            let block = render_content_block_arg_inner(&combined, emit_anchors);
+                            if let Some(n) = number {
+                                args.push(format!("enum.item({n}, {block})"));
+                            } else {
+                                args.push(block);
+                            }
+                        } else {
+                            args.push(render_content_block_arg_inner(
+                                std::slice::from_ref(other),
+                                emit_anchors,
+                            ));
+                        }
+                    }
+                }
+            }
+            return format!("#enum({})", args.join(", "));
+        }
+        if let Some(items) = self.terms_container_items() {
+            return render_content_nodes_inner(&items, emit_anchors);
+        }
         match self {
             ContentNode::Text(s) => escape_typst_markup_text(s),
             ContentNode::Space => " ".to_string(),
             ContentNode::Linebreak => "\\\n".to_string(),
             ContentNode::Parbreak => "\n\n".to_string(),
             ContentNode::Strong(children) => {
-                let inner: String = children.iter().map(|c| c.to_typst()).collect();
-                format!("*{}*", inner)
+                format!("*{}*", render_content_nodes_inner(children, emit_anchors))
             }
             ContentNode::Emph(children) => {
-                let inner: String = children.iter().map(|c| c.to_typst()).collect();
-                format!("_{}_", inner)
+                format!("_{}_", render_content_nodes_inner(children, emit_anchors))
             }
             ContentNode::Raw { text, lang, block } => {
                 if *block {
@@ -1579,25 +2572,74 @@ impl ContentNode {
             }
             ContentNode::Heading { level, content } => {
                 let prefix = "=".repeat(*level as usize);
-                let inner: String = content.iter().map(|c| c.to_typst()).collect();
-                format!("{} {}\n", prefix, inner)
+                format!(
+                    "{} {}\n",
+                    prefix,
+                    render_content_nodes_inner(content, emit_anchors)
+                )
             }
             ContentNode::ListItem(children) => {
-                let inner: String = children.iter().map(|c| c.to_typst()).collect();
-                format!("- {}\n", inner)
+                format_list_item_typst_inner("- ", children, emit_anchors)
             }
             ContentNode::EnumItem { number, content } => {
-                let inner: String = content.iter().map(|c| c.to_typst()).collect();
                 if let Some(n) = number {
-                    format!("{}. {}\n", n, inner)
+                    format_list_item_typst_inner(&format!("{n}. "), content, emit_anchors)
                 } else {
-                    format!("+ {}\n", inner)
+                    format_list_item_typst_inner("+ ", content, emit_anchors)
+                }
+            }
+            ContentNode::Element { name, fields } if name == "heading" => {
+                if matches!(fields.get("numbering"), Some(Value::None)) {
+                    let mut args = Vec::new();
+                    let mut body_arg = None;
+                    for (k, v) in fields {
+                        if k == "body" {
+                            body_arg = Some(match v {
+                                Value::Content(nodes) => {
+                                    render_content_block_arg_inner(nodes, emit_anchors)
+                                }
+                                other => render_content_block_arg_inner(
+                                    &[ContentNode::Text(other.display())],
+                                    emit_anchors,
+                                ),
+                            });
+                        } else if !k.starts_with("__tylax_") {
+                            args.push(format!(
+                                "{}: {}",
+                                k,
+                                value_to_typst_arg_inner(v, emit_anchors)
+                            ));
+                        }
+                    }
+                    if let Some(body) = body_arg {
+                        args.push(body);
+                    }
+                    format!("#heading({})", args.join(", "))
+                } else {
+                    let level = fields
+                        .get("level")
+                        .or_else(|| fields.get("depth"))
+                        .and_then(|v| match v {
+                            Value::Int(i) => Some((*i).clamp(1, 6) as usize),
+                            _ => None,
+                        })
+                        .unwrap_or(1);
+                    let prefix = "=".repeat(level);
+                    let body_str = match fields.get("body") {
+                        Some(Value::Content(nodes)) => {
+                            render_content_nodes_inner(nodes, emit_anchors)
+                        }
+                        Some(other) => other.display(),
+                        None => String::new(),
+                    };
+                    format!("{} {}\n", prefix, body_str)
                 }
             }
             ContentNode::Element { name, fields } => {
                 let args: Vec<String> = fields
                     .iter()
-                    .map(|(k, v)| format!("{}: {}", k, value_to_typst_arg(v)))
+                    .filter(|(k, _)| !k.starts_with("__tylax_"))
+                    .map(|(k, v)| format!("{}: {}", k, value_to_typst_arg_inner(v, emit_anchors)))
                     .collect();
                 format!("#{}({})", name, args.join(", "))
             }
@@ -1636,13 +2678,15 @@ impl ContentNode {
                     format!("#bibliography(\"{}\")", file)
                 }
             }
-            ContentNode::FuncCall { name, args } => func_call_to_typst_source(name, args),
+            ContentNode::FuncCall { name, args } => {
+                func_call_to_typst_source_inner(name, args, emit_anchors)
+            }
             ContentNode::RawSource(s) => s.clone(),
             ContentNode::State { key, default } => {
                 format!(
                     "#state({:?}, {}).display()",
                     key,
-                    value_to_typst_arg(default)
+                    value_to_typst_arg_inner(default, emit_anchors)
                 )
             }
             ContentNode::CounterDisplay { key, numbering } => {
@@ -1677,6 +2721,10 @@ impl ContentNode {
 
 /// Convert a value to a Typst argument string.
 pub fn value_to_typst_arg(v: &Value) -> String {
+    value_to_typst_arg_inner(v, false)
+}
+
+fn value_to_typst_arg_inner(v: &Value, emit_anchors: bool) -> String {
     match v {
         Value::None => "none".to_string(),
         Value::Auto => "auto".to_string(),
@@ -1693,27 +2741,32 @@ pub fn value_to_typst_arg(v: &Value) -> String {
         Value::Direction(d) => format!("{:?}", d).to_lowercase(),
         Value::Symbol(s) => s.default.clone(),
         Value::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(value_to_typst_arg).collect();
+            let items: Vec<String> = arr
+                .iter()
+                .map(|item| value_to_typst_arg_inner(item, emit_anchors))
+                .collect();
             format!("({})", items.join(", "))
         }
         Value::Dict(dict) => {
             let items: Vec<String> = dict
                 .iter()
-                .map(|(k, v)| format!("{}: {}", k, value_to_typst_arg(v)))
+                .map(|(k, v)| format!("{}: {}", k, value_to_typst_arg_inner(v, emit_anchors)))
                 .collect();
             format!("({})", items.join(", "))
         }
-        Value::Func(_) => "<function>".to_string(),
+        Value::Func(c) => c
+            .builtin_name()
+            .map(str::to_string)
+            .unwrap_or_else(|| "<function>".to_string()),
         Value::Content(nodes) => {
             // If content contains a single function call, output it directly without []
             // This avoids wrapping like [#table(...)] which breaks nested conversion
             if nodes.len() == 1 {
                 if let ContentNode::FuncCall { name, args } = &nodes[0] {
-                    return func_call_to_typst_code_source(name, args);
+                    return func_call_to_typst_code_source_inner(name, args, emit_anchors);
                 }
             }
-            let inner: String = nodes.iter().map(|n| n.to_typst()).collect();
-            format!("[{}]", inner)
+            render_content_block_arg_inner(nodes, emit_anchors)
         }
         Value::Regex(r) => format!("regex(\"{}\")", r.as_str()),
         Value::DateTime(dt) => dt.to_typst(),
@@ -2083,5 +3136,86 @@ mod tests {
         assert_eq!(flex, "#h(1fr)");
         // The arguments of a `#` call are code, where bare `foo` is a variable.
         assert_eq!(plain, "#h([foo])");
+    }
+
+    #[test]
+    fn test_terms_and_list_selectors_separate_containers_from_items() {
+        let term = vec![ContentNode::Text("Key".to_string())];
+        let desc = vec![ContentNode::Text("Value".to_string())];
+        let term_item = ContentNode::term_item(term.clone(), desc);
+        let terms_box = ContentNode::terms_container(vec![term_item.clone()], true);
+
+        let list_item = ContentNode::ListItem(vec![ContentNode::Text("bullet".to_string())]);
+        let list_box = ContentNode::list_container(vec![list_item.clone()], true, None);
+
+        let enum_item = ContentNode::EnumItem {
+            number: Some(2),
+            content: vec![ContentNode::Text("numbered".to_string())],
+        };
+        let enum_box = ContentNode::enum_container(vec![enum_item.clone()], true, Some(2), None);
+        let text_node = ContentNode::Text("Other".to_string());
+
+        let terms_sel = Selector::element("terms");
+        let term_item_sel = Selector::element("terms.item");
+        let list_sel = Selector::element("list");
+        let list_item_sel = Selector::element("list.item");
+        let enum_sel = Selector::element("enum");
+        let enum_item_sel = Selector::element("enum.item");
+        let filtered_sel = Selector::Element(
+            "terms.item".to_string(),
+            vec![("term".to_string(), Value::Content(term))],
+        );
+        let wrong_filter_sel = Selector::Element(
+            "terms.item".to_string(),
+            vec![(
+                "term".to_string(),
+                Value::Content(vec![ContentNode::Text("Missing".to_string())]),
+            )],
+        );
+
+        assert!(terms_sel.matches(&terms_box));
+        assert!(!terms_sel.matches(&term_item));
+        assert!(term_item_sel.matches(&term_item));
+        assert!(!term_item_sel.matches(&terms_box));
+
+        assert!(list_sel.matches(&list_box));
+        assert!(!list_sel.matches(&list_item));
+        assert!(list_item_sel.matches(&list_item));
+        assert!(!list_item_sel.matches(&list_box));
+
+        assert!(enum_sel.matches(&enum_box));
+        assert!(!enum_sel.matches(&enum_item));
+        assert!(enum_item_sel.matches(&enum_item));
+        assert!(!enum_item_sel.matches(&enum_box));
+
+        assert!(!terms_sel.matches(&text_node));
+        assert!(!term_item_sel.matches(&text_node));
+        assert!(filtered_sel.matches(&term_item));
+        assert!(!wrong_filter_sel.matches(&term_item));
+    }
+
+    #[test]
+    fn test_escape_typst_markup_text_escapes_comment_slashes() {
+        assert_eq!(escape_typst_markup_text("A // B"), r"A \/\/ B");
+        assert_eq!(escape_typst_markup_text("A /* B */ C"), r"A \/\* B \*\/ C");
+        assert_eq!(escape_typst_markup_text("= literal"), r"\= literal");
+        assert_eq!(escape_typst_markup_text("- literal"), r"\- literal");
+        assert_eq!(escape_typst_markup_text("+ literal"), r"\+ literal");
+        assert_eq!(escape_typst_markup_text("1. literal"), r"1\. literal");
+        assert_eq!(escape_typst_markup_text("A -- B"), r"A \-\- B");
+        assert_eq!(escape_typst_markup_text("A --- B"), r"A \-\-\- B");
+        assert_eq!(escape_typst_markup_text("A ... B"), r"A \.\.\. B");
+        assert_eq!(escape_typst_markup_text("A ~ B"), r"A \~ B");
+        assert_eq!(escape_typst_markup_text("'a' \"b\""), r#"\'a\' \"b\""#);
+        assert_eq!(escape_typst_markup_text("1-2-3"), "1-2-3");
+        assert_eq!(escape_typst_markup_text("a = b"), "a = b");
+        assert_eq!(escape_typst_markup_text("Hello."), "Hello.");
+        assert_eq!(escape_typst_markup_text("3.14"), "3.14");
+
+        let item = ContentNode::term_item(
+            vec![ContentNode::Text("Key".to_string())],
+            vec![ContentNode::Text("A // B".to_string())],
+        );
+        assert_eq!(item.to_typst(), r"#terms.item([Key], [A \/\/ B])");
     }
 }

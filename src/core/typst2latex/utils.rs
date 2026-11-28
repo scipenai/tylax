@@ -98,6 +98,7 @@ lazy_static! {
         m.insert('÷', "\\div");
         m.insert('±', "\\pm");
         m.insert('∓', "\\mp");
+        m.insert('\u{2212}', "-");
         m.insert('·', "\\cdot");
         m.insert('∘', "\\circ");
         m.insert('⊕', "\\oplus");
@@ -212,9 +213,24 @@ pub fn escape_latex_text(text: &str) -> String {
             '\\' => escaped.push_str("\\textbackslash{}"),
             '~' => escaped.push_str("\\textasciitilde{}"),
             '^' => escaped.push_str("\\textasciicircum{}"),
+            '\u{00A0}' => escaped.push('~'),
+            '\u{2013}' => escaped.push_str("--"),
+            '\u{2014}' => escaped.push_str("---"),
+            '\u{2026}' => escaped.push_str("\\ldots{}"),
+            '\u{00AD}' => escaped.push_str("\\-"),
+            '\u{2212}' => escaped.push_str("$-$"),
             '&' | '%' | '$' | '#' | '_' | '{' | '}' => {
                 escaped.push('\\');
                 escaped.push(ch);
+            }
+            // Typst en/em dashes in markup parse as `SyntaxKind::Shorthand`, so adjacent
+            // `-` characters reaching `escape_latex_text` come from literal text (such as
+            // strings or escaped characters) and must break TeX `--`/`---` ligatures.
+            '-' => {
+                if escaped.ends_with('-') {
+                    escaped.push_str("{}");
+                }
+                escaped.push('-');
             }
             other => escaped.push(other),
         }
@@ -223,7 +239,8 @@ pub fn escape_latex_text(text: &str) -> String {
 }
 
 pub(crate) fn preserve_typst_source(source: &str, ctx: &mut ConvertContext) {
-    for line in source.split(['\n', '\r']) {
+    let cleaned = super::scope_analysis::strip_active_shadow_marker(source);
+    for line in cleaned.split(['\n', '\r']) {
         ctx.push_line(&format!("% {line}"));
     }
     // Keep following braces and math delimiters outside the last comment.
@@ -1181,6 +1198,9 @@ mod tests {
         assert_eq!(escape_latex_text("$100"), "\\$100");
         assert_eq!(escape_latex_text("a_b"), "a\\_b");
         assert_eq!(escape_latex_text(r"a\b"), r"a\textbackslash{}b");
+        assert_eq!(escape_latex_text("A -- B"), "A -{}- B");
+        assert_eq!(escape_latex_text("A --- B"), "A -{}-{}- B");
+        assert_eq!(escape_latex_text("1-2-3"), "1-2-3");
     }
 
     #[test]

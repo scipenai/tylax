@@ -55,6 +55,7 @@ regex = "1.10"
 rowan = "0.15"
 chrono = "0.4"
 indexmap = "2.2"
+unicode-segmentation = "1.12"
 
 # WASM dependencies
 wasm-bindgen = { version = "0.2", optional = true }

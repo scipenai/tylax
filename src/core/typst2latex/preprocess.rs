@@ -121,8 +121,9 @@ impl<'a> MacroExpander<'a> {
         match node.kind() {
             // Context-dependent expressions retain their local scope and source.
             SyntaxKind::Contextual => get_node_full_text(node),
-            // Skip let bindings and set/show rules in output
-            SyntaxKind::LetBinding | SyntaxKind::SetRule | SyntaxKind::ShowRule => String::new(),
+            // Skip let bindings and show rules in output
+            SyntaxKind::LetBinding | SyntaxKind::ShowRule => String::new(),
+            SyntaxKind::Named => self.expand_named_arg(node),
 
             // Function call - check if it's a defined macro
             SyntaxKind::FuncCall => self.expand_func_call(node),
@@ -354,14 +355,21 @@ impl<'a> MacroExpander<'a> {
         while i < children.len() {
             let child = &children[i];
 
-            // Check for Hash followed by SetRule/ShowRule/LetBinding - skip both
+            // Check for Hash followed by ShowRule/LetBinding - skip both
             if child.kind() == SyntaxKind::Hash && i + 1 < children.len() {
                 let next = &children[i + 1];
+                if matches!(next.kind(), SyntaxKind::ShowRule | SyntaxKind::LetBinding) {
+                    // Skip both Hash and the rule
+                    i += 2;
+                    continue;
+                }
+
                 if matches!(
                     next.kind(),
-                    SyntaxKind::SetRule | SyntaxKind::ShowRule | SyntaxKind::LetBinding
+                    SyntaxKind::SetRule | SyntaxKind::ContentBlock | SyntaxKind::CodeBlock
                 ) {
-                    // Skip both Hash and the rule
+                    result.push('#');
+                    result.push_str(&self.expand_node(next));
                     i += 2;
                     continue;
                 }
@@ -371,6 +379,18 @@ impl<'a> MacroExpander<'a> {
                     result.push_str(&get_node_full_text(next));
                     i += 2;
                     continue;
+                }
+
+                if next.kind() == SyntaxKind::Ident {
+                    let name = next.text().to_string();
+                    if let Some(val) = self.lookup(&name) {
+                        if val.starts_with('[') || val.starts_with('{') {
+                            result.push('#');
+                        }
+                        result.push_str(&val);
+                        i += 2;
+                        continue;
+                    }
                 }
 
                 // Check for Hash followed by FuncCall - handle specially
@@ -399,6 +419,23 @@ impl<'a> MacroExpander<'a> {
         }
 
         result
+    }
+
+    /// Expand a `Named` argument (`key: value`) without rewriting the parameter name.
+    fn expand_named_arg(&mut self, node: &SyntaxNode) -> String {
+        let mut out = String::new();
+        let mut seen_colon = false;
+        for child in node.children() {
+            if !seen_colon {
+                if child.kind() == SyntaxKind::Colon {
+                    seen_colon = true;
+                }
+                out.push_str(&get_node_full_text(child));
+            } else {
+                out.push_str(&self.expand_node(child));
+            }
+        }
+        out
     }
 }
 
@@ -568,13 +605,23 @@ fn extract_variable_definition(node: &SyntaxNode, db: &mut TypstDefDb) {
             | SyntaxKind::Math
             | SyntaxKind::Equation => {
                 if name.is_some() && value.is_none() {
-                    value = Some(child.text().to_string());
+                    value = Some(get_node_full_text(child));
                 }
             }
             _ => {
                 // For complex expressions, use the text representation
-                if name.is_some() && value.is_none() {
-                    let text = child.text().to_string();
+                if name.is_some()
+                    && value.is_none()
+                    && !matches!(
+                        child.kind(),
+                        SyntaxKind::Let
+                            | SyntaxKind::Eq
+                            | SyntaxKind::Space
+                            | SyntaxKind::Semicolon
+                            | SyntaxKind::Hash
+                    )
+                {
+                    let text = get_node_full_text(child);
                     if !text.trim().is_empty() && text != "=" && text != "#" && text != "let" {
                         value = Some(text);
                     }
@@ -649,7 +696,7 @@ fn extract_function_definition(node: &SyntaxNode, db: &mut TypstDefDb) {
             | SyntaxKind::FuncCall
                 if name.is_some() && body.is_none() =>
             {
-                body = Some(child.text().to_string());
+                body = Some(get_node_full_text(child));
             }
             _ => {}
         }

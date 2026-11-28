@@ -59,15 +59,19 @@ mod value;
 mod vfs;
 
 pub use data::{parse_csv, parse_json, parse_toml, parse_yaml};
-pub(crate) use eval::expand_macros_with_shadowed_context_marker;
+pub(crate) use eval::expand_macros_with_vfs;
 pub use eval::{expand_macros, expand_macros_with_warnings, EvalWarning, ExpandResult, MiniEval};
 pub use scope::{Scope, Scopes};
-pub(crate) use value::render_math_segments_to_typst_source;
+pub(crate) use value::{
+    render_math_segments_to_typst_source, DUP_ELEMENT_NAME, DUP_SNAPSHOT_NAME,
+    REF_ANCHOR_ELEMENT_NAME,
+};
 pub use value::{
     Alignment, Arg, Arguments, Closure, Color, ContentNode, Counter, DateTime, Direction,
     EvalError, EvalErrorKind, EvalResult, HorizAlign, Length, LengthUnit, MathSegment, Selector,
     SourceSpan, Symbol, ValType, Value, VertAlign, WrappedRegex,
 };
+pub(crate) use vfs::default_import_binding_name;
 #[cfg(not(target_arch = "wasm32"))]
 pub use vfs::RealVfs;
 pub use vfs::{MemoryVfs, NoopVfs, VfsError, VfsResult, VirtualFileSystem};

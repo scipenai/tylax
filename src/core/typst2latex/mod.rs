@@ -10,6 +10,7 @@ mod math;
 mod math_emit;
 mod math_ir;
 mod preprocess;
+mod scope_analysis;
 mod supplement;
 mod table;
 mod utils;
@@ -17,7 +18,6 @@ mod utils;
 pub use context::{ConvertContext, DocumentWrapperMode, EnvironmentContext, T2LOptions, TokenType};
 use engine::ContentNode;
 use std::collections::HashSet;
-#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use typst_syntax::{parse, parse_math};
 
@@ -254,7 +254,7 @@ pub fn typst_to_latex(input: &str) -> String {
 
 /// Convert Typst code to LaTeX with options
 pub fn typst_to_latex_with_options(input: &str, options: &T2LOptions) -> String {
-    typst_to_latex_with_options_and_bibliography_keys(input, options, None)
+    typst_to_latex_with_options_and_bibliography_keys(input, options, None, None)
 }
 
 /// Convert a Typst source file to LaTeX, resolving bare `@key` citations from
@@ -269,32 +269,56 @@ pub fn typst_file_to_latex_with_options(
     options: &T2LOptions,
 ) -> String {
     let bibliography_keys = supplement::load_bibliography_keys(input, source_path);
-    typst_to_latex_with_options_and_bibliography_keys(input, options, Some(&bibliography_keys))
+    typst_to_latex_with_options_and_bibliography_keys(
+        input,
+        options,
+        Some(&bibliography_keys),
+        Some(source_path),
+    )
+}
+
+fn build_conversion_vfs(
+    source_path: Option<&Path>,
+) -> (
+    std::sync::Arc<dyn engine::VirtualFileSystem>,
+    Option<String>,
+) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some((vfs, entry_file)) = source_path.and_then(engine::RealVfs::for_source_file) {
+        return (std::sync::Arc::new(vfs), Some(entry_file));
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = source_path;
+    (std::sync::Arc::new(engine::NoopVfs), None)
 }
 
 fn typst_to_latex_with_options_and_bibliography_keys(
     input: &str,
     options: &T2LOptions,
     bibliography_keys: Option<&HashSet<String>>,
+    source_path: Option<&Path>,
 ) -> String {
     let mut ctx = ConvertContext::new();
     ctx.options = options.clone();
 
     // Preprocess: strip `//! tylax:` ignore directives, then handle imports, etc.
     let input = preprocess::strip_tylax_ignores(input);
-    let shadowed_marker = math_ir::unique_shadowed_context_marker(&input);
-    let annotated_input =
-        math_ir::annotate_shadowed_llap_contexts(&input, options.math_only, &shadowed_marker);
+    let shadowed_marker = scope_analysis::unique_shadowed_marker(&input);
+    let (vfs, entry_file) = build_conversion_vfs(source_path);
+    let annotated_input = scope_analysis::annotate_shadowed_builtins(
+        &input,
+        options.math_only,
+        &shadowed_marker,
+        vfs.as_ref(),
+        entry_file.as_deref(),
+    );
     let processed_input = preprocess::preprocess_typst(&annotated_input);
 
     // The AST is kept so the reference finalizer can look up what each label
     // points at; Typst renders that supplement automatically and LaTeX does
     // not (issue #43).
-    let document_root = math_ir::with_math_build_env(
-        math_ir::MathBuildEnv {
-            shadowed_context_marker: Some(shadowed_marker.clone()),
-        },
-        || {
+    let document_root = scope_analysis::with_shadow_session(&shadowed_marker, || {
+        markup::with_fresh_markup_styles(|| {
             if options.math_only {
                 let root = parse_math(&processed_input);
                 math::convert_math_node(&root, &mut ctx);
@@ -304,13 +328,11 @@ fn typst_to_latex_with_options_and_bibliography_keys(
                 markup::convert_markup_node(&root, &mut ctx);
                 Some(root)
             }
-        },
-    );
+        })
+    });
 
     let mut result = ctx.finalize();
-    if result.contains(&shadowed_marker) {
-        result = result.replace(&shadowed_marker, "");
-    }
+    scope_analysis::strip_shadow_marker(&mut result, &shadowed_marker);
     result = match document_root.as_ref() {
         Some(root) => supplement::resolve_references(root, &result, bibliography_keys),
         None => supplement::strip_marks(&result),
@@ -355,7 +377,7 @@ pub fn typst_document_to_latex(input: &str) -> String {
 /// }
 /// ```
 pub fn typst_to_latex_with_diagnostics(input: &str, options: &T2LOptions) -> ConversionResult {
-    typst_to_latex_with_diagnostics_and_bibliography_keys(input, options, None)
+    typst_to_latex_with_diagnostics_and_bibliography_keys(input, options, None, None)
 }
 
 /// File-oriented variant of [`typst_to_latex_with_diagnostics`]: resolves bare
@@ -368,13 +390,19 @@ pub fn typst_file_to_latex_with_diagnostics(
     options: &T2LOptions,
 ) -> ConversionResult {
     let bibliography_keys = supplement::load_bibliography_keys(input, source_path);
-    typst_to_latex_with_diagnostics_and_bibliography_keys(input, options, Some(&bibliography_keys))
+    typst_to_latex_with_diagnostics_and_bibliography_keys(
+        input,
+        options,
+        Some(&bibliography_keys),
+        Some(source_path),
+    )
 }
 
 fn typst_to_latex_with_diagnostics_and_bibliography_keys(
     input: &str,
     options: &T2LOptions,
     bibliography_keys: Option<&HashSet<String>>,
+    source_path: Option<&Path>,
 ) -> ConversionResult {
     let mut warnings = Vec::new();
 
@@ -385,12 +413,17 @@ fn typst_to_latex_with_diagnostics_and_bibliography_keys(
     // MiniEval parses documents; keep bare math in its math context.
     let math_input = options.math_only.then(|| format!("${input}\n$"));
     let eval_input = math_input.as_deref().unwrap_or(input);
-    let shadowed_marker = math_ir::unique_shadowed_context_marker(input);
+    let shadowed_marker = scope_analysis::unique_shadowed_marker(input);
+    let (vfs, entry_file) = build_conversion_vfs(source_path);
 
     // Step 1: Expand macros using MiniEval (with show rules applied)
     let (expanded_input, expanded_nodes): (String, Option<Vec<ContentNode>>) =
-        match engine::expand_macros_with_shadowed_context_marker(eval_input, Some(&shadowed_marker))
-        {
+        match engine::expand_macros_with_vfs(
+            eval_input,
+            vfs.clone(),
+            entry_file.as_deref(),
+            Some(&shadowed_marker),
+        ) {
             Ok(result) => {
                 warnings.extend(result.warnings.into_iter().map(ConversionWarning::from));
                 let expanded = match result.nodes.as_slice() {
@@ -403,10 +436,12 @@ fn typst_to_latex_with_diagnostics_and_bibliography_keys(
             }
             Err(e) => {
                 warnings.push(ConversionWarning::from_eval_error(&e));
-                let annotated = math_ir::annotate_shadowed_llap_contexts(
+                let annotated = scope_analysis::annotate_shadowed_builtins(
                     input,
                     options.math_only,
                     &shadowed_marker,
+                    vfs.as_ref(),
+                    entry_file.as_deref(),
                 );
                 (preprocess::preprocess_typst(&annotated), None)
             }
@@ -417,11 +452,8 @@ fn typst_to_latex_with_diagnostics_and_bibliography_keys(
     ctx.options = options.clone();
 
     // As above: keep the parsed document so reference supplements resolve.
-    let document_root = math_ir::with_math_build_env(
-        math_ir::MathBuildEnv {
-            shadowed_context_marker: Some(shadowed_marker.clone()),
-        },
-        || {
+    let document_root = scope_analysis::with_shadow_session(&shadowed_marker, || {
+        markup::with_fresh_markup_styles(|| {
             if options.math_only {
                 let root = parse_math(&expanded_input);
                 math::convert_math_node(&root, &mut ctx);
@@ -434,8 +466,8 @@ fn typst_to_latex_with_diagnostics_and_bibliography_keys(
                 markup::convert_markup_node(&root, &mut ctx);
                 Some(root)
             }
-        },
-    );
+        })
+    });
 
     warnings.extend(
         std::mem::take(&mut ctx.warnings)
@@ -443,11 +475,14 @@ fn typst_to_latex_with_diagnostics_and_bibliography_keys(
             .map(|message| ConversionWarning::new(WarningKind::Other, message)),
     );
     let mut output = ctx.finalize();
-    if output.contains(&shadowed_marker) {
-        output = output.replace(&shadowed_marker, "");
-    }
+    scope_analysis::strip_shadow_marker(&mut output, &shadowed_marker);
     output = match document_root.as_ref() {
-        Some(root) => supplement::resolve_references(root, &output, bibliography_keys),
+        Some(root) => supplement::resolve_references_with_nodes(
+            root,
+            expanded_nodes.as_deref(),
+            &output,
+            bibliography_keys,
+        ),
         None => supplement::strip_marks(&output),
     };
 

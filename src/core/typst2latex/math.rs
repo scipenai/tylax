@@ -4,18 +4,14 @@
 
 use super::context::{ConvertContext, T2LOptions};
 use super::math_emit::emit_math_ir;
-use super::math_ir::{
-    build_math_ir_with_env, collect_math_warnings, current_math_build_env, normalize_math_ir,
-    MathBuildEnv, MathIr,
-};
+use super::math_ir::{build_math_ir, collect_math_warnings, normalize_math_ir, MathIr};
 use super::utils::{is_content_node, FuncArgs};
 use crate::data::maps::DELIMITER_MAP;
 use typst_syntax::{SyntaxKind, SyntaxNode};
 
 /// Convert a math node to LaTeX.
 pub fn convert_math_node(node: &SyntaxNode, ctx: &mut ConvertContext) {
-    let env = current_math_build_env();
-    let ir = normalize_math_ir(build_math_ir_with_env(node, &ctx.options, &env));
+    let ir = normalize_math_ir(build_math_ir(node, &ctx.options));
     collect_math_warnings(&ir, &mut ctx.warnings);
     emit_math_ir(&ir, ctx);
 }
@@ -51,20 +47,16 @@ fn get_latex_delimiter(text: &str, is_left: bool) -> &'static str {
 // =============================================================================
 
 /// Keep lr contents in the IR so nested diagnostics survive.
-pub(crate) fn build_lr_ir(
-    args_node: &SyntaxNode,
-    options: &T2LOptions,
-    env: &MathBuildEnv,
-) -> MathIr {
+pub(crate) fn build_lr_ir(args_node: &SyntaxNode, options: &T2LOptions) -> MathIr {
     let raw_args: Vec<&SyntaxNode> = args_node.children().collect();
     let args = FuncArgs::from_args_node(args_node);
     let parsed = parse_lr_args(&raw_args, &args);
 
     if parsed.has_unknown_named_args {
-        return build_lr_content(&parsed.alternate_content_nodes, None, options, env);
+        return build_lr_content(&parsed.alternate_content_nodes, None, options);
     }
 
-    build_lr_content(&parsed.content_nodes, parsed.size, options, env)
+    build_lr_content(&parsed.content_nodes, parsed.size, options)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,7 +217,6 @@ fn build_lr_content(
     content: &[&SyntaxNode],
     size: Option<LrDelimiterSize>,
     options: &T2LOptions,
-    env: &MathBuildEnv,
 ) -> MathIr {
     let left_delim = find_lr_edge_delimiter(content, true);
     let right_delim = find_lr_edge_delimiter(content, false);
@@ -248,7 +239,7 @@ fn build_lr_content(
                 .filter(|(idx, _)| {
                     !should_skip_lr_index(*idx, left_delim.as_ref(), right_delim.as_ref())
                 })
-                .map(|(_, child)| build_math_ir_with_env(child, options, env))
+                .map(|(_, child)| build_math_ir(child, options))
                 .collect(),
         )),
         close: lr_delimiter(right_text, false, size),

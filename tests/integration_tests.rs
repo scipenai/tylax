@@ -4806,6 +4806,41 @@ mod t2l_document {
             result
         );
     }
+
+    #[test]
+    fn test_issue_66_term_list_becomes_description() {
+        // Issue #66: `/ term: description` lines were dropped entirely. Both
+        // entry points must emit a `description` environment, the reverse of
+        // the l2t mapping in `test_description_environment_term_list_colons`.
+        let typst = "/ Ligature: A merged glyph.\n\
+                     / Kerning: A spacing adjustment between two adjacent letters.\n\
+                     / : No term.\n\
+                     / *Strong* [x]: Markup in the term.\n";
+        let expected = [
+            "\\begin{description}",
+            "\\item[Ligature] A merged glyph.",
+            "\\item[Kerning] A spacing adjustment between two adjacent letters.",
+            "\\item No term.",
+            "\\item[{\\textbf{Strong} [x]}] Markup in the term.",
+            "\\end{description}",
+        ];
+
+        let plain = typst_to_latex(typst);
+        let evaluated = typst_to_latex_with_diagnostics(typst, &T2LOptions::default()).output;
+        for result in [&plain, &evaluated] {
+            for line in expected {
+                assert!(
+                    result.contains(line),
+                    "expected `{line}` in the output, got:\n{result}"
+                );
+            }
+            assert_eq!(
+                result.matches("\\begin{description}").count(),
+                1,
+                "consecutive term items must share one environment, got:\n{result}"
+            );
+        }
+    }
 }
 
 // ============================================================================
