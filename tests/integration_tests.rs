@@ -2792,7 +2792,12 @@ mod l2t_document {
                 let Some((name, arity)) = entry.split_once(':') else {
                     continue;
                 };
-                let name = name.trim().trim_matches('"');
+                // `'"'` is how the generator spells the umlaut command `\"`.
+                let name = name.trim();
+                let name = name
+                    .strip_prefix('\'')
+                    .and_then(|n| n.strip_suffix('\''))
+                    .unwrap_or_else(|| name.trim_matches('"'));
                 let Ok(arity) = arity.trim().parse::<usize>() else {
                     continue;
                 };
@@ -2826,6 +2831,7 @@ mod l2t_document {
             let Some((name, rest)) = chunk.split_once("\".to_string(), ") else {
                 continue;
             };
+            let name = name.replace("\\\"", "\"");
             if let Some((shorthand, arity)) = FIXED_ARITY_SHORTHANDS
                 .iter()
                 .find(|(shorthand, _)| rest.starts_with(&format!("{shorthand}()")))
@@ -3179,7 +3185,7 @@ mod l2t_document {
             .split("m.insert(\"")
             .skip(1)
             .filter_map(|chunk| chunk.split_once("\".to_string(), ").map(|(name, _)| name))
-            .filter(|name| !declared.contains(name))
+            .filter(|name| !declared.contains(name.replace("\\\"", "\"").as_str()))
             .collect();
         missing.sort_unstable();
         missing.dedup();

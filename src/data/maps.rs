@@ -1526,6 +1526,8 @@ lazy_static! {
         }));
 
         // Commands with required arguments
+        m.insert("\"".to_string(), cmd1());
+        m.insert("'".to_string(), cmd1());
         m.insert("Acf".to_string(), cmd1());
         m.insert("Acl".to_string(), cmd1());
         m.insert("Acs".to_string(), cmd1());
@@ -1539,6 +1541,8 @@ lazy_static! {
         m.insert("Res".to_string(), cmd1());
         m.insert("Residue".to_string(), cmd1());
         m.insert("Set".to_string(), cmd1());
+        m.insert("^".to_string(), cmd1());
+        m.insert("`".to_string(), cmd1());
         m.insert("abs".to_string(), cmd1());
         m.insert("abs*".to_string(), cmd1());
         m.insert("absolutevalue".to_string(), cmd1());
@@ -1570,6 +1574,7 @@ lazy_static! {
         m.insert("braket".to_string(), cmd2());
         m.insert("braket*".to_string(), cmd2());
         m.insert("breve".to_string(), cmd1());
+        m.insert("c".to_string(), cmd1());
         m.insert("cancel".to_string(), cmd1());
         m.insert("cfrac".to_string(), cmd2());
         m.insert("check".to_string(), cmd1());
