@@ -8,6 +8,41 @@ use mitex_parser::syntax::{SyntaxElement, SyntaxKind, SyntaxNode};
 // Text Processing Utilities
 // =============================================================================
 
+/// Raw text shows every character, so the LaTeX escapes in a `\texttt` argument
+/// are resolved before it goes between backticks.
+pub fn unescape_texttt(text: &str) -> String {
+    const WORDS: [(&str, char); 3] = [
+        ("textbackslash", '\\'),
+        ("textasciitilde", '~'),
+        ("textasciicircum", '^'),
+    ];
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find('\\') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        if let Some((word, c)) = WORDS.iter().find(|(word, _)| after.starts_with(word)) {
+            out.push(*c);
+            // LaTeX drops the spaces after a command word
+            let tail = &after[word.len()..];
+            rest = tail
+                .strip_prefix("{}")
+                .unwrap_or_else(|| tail.trim_start_matches(' '));
+        } else if let Some(c) = after.chars().next().filter(|c| "_%&#${}".contains(*c)) {
+            out.push(c);
+            rest = &after[1..];
+        } else if let Some(c @ ('~' | '^')) = after.chars().next() {
+            out.push(c);
+            rest = after[1..].strip_prefix("{}").unwrap_or(&after[1..]);
+        } else {
+            out.push('\\');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Sanitize a label name for Typst compatibility
 /// Converts colons to hyphens since Typst labels work better with hyphens
 pub fn sanitize_label(label: &str) -> String {
@@ -517,7 +552,7 @@ pub fn convert_caption_text(text: &str) -> String {
                 "texttt" => {
                     result.push('`');
                     if let Some(content) = arg_content {
-                        result.push_str(&content); // Don't recurse for monospace
+                        result.push_str(&unescape_texttt(&content)); // Don't recurse for monospace
                     }
                     result.push('`');
                 }
